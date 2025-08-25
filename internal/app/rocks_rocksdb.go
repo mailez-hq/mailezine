@@ -1,6 +1,6 @@
 //go:build rocksdb
 
-package main
+package app
 
 import (
 	"log/slog"

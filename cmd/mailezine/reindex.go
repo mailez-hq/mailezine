@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 
+	"mailezine/internal/app"
 	"mailezine/internal/config"
 	"mailezine/internal/fts"
 )
@@ -56,7 +57,7 @@ func runReindex(args []string) int {
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	st, err := newStorage(cfg, logger)
+	st, err := app.NewStorage(cfg, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reindex: open storage: %v\n", err)
 		return 2
@@ -76,26 +77,26 @@ func runReindex(args []string) int {
 	defer func() { _ = ix.Close() }()
 
 	ctx := context.Background()
-	accounts, err := st.facade.ListAccounts(ctx)
+	accounts, err := st.Facade().ListAccounts(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "reindex: list accounts: %v\n", err)
 		return 2
 	}
 	total := 0
 	for _, account := range accounts {
-		boxes, err := st.mailbox.ListMailboxes(ctx, account)
+		boxes, err := st.Mailbox().ListMailboxes(ctx, account)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "reindex: list mailboxes %s: %v\n", account, err)
 			return 2
 		}
 		for _, box := range boxes {
-			msgs, err := st.mailbox.ListMessages(ctx, account, box.Name)
+			msgs, err := st.Mailbox().ListMessages(ctx, account, box.Name)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "reindex: list %s/%s: %v\n", account, box.Name, err)
 				return 2
 			}
 			for _, msg := range msgs {
-				rc, err := st.mailbox.OpenMessage(ctx, account, box.Name, msg.UID)
+				rc, err := st.Mailbox().OpenMessage(ctx, account, box.Name, msg.UID)
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "reindex: open %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
 					return 2

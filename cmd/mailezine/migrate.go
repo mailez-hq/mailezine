@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"mailezine/internal/app"
 	"mailezine/internal/config"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/store"
@@ -85,7 +86,7 @@ func (f s3Flags) storageConfig(backend, path string) config.StorageConfig {
 }
 
 func migrateMaildirToKV(src, to, dst string, dryRun bool, s3 s3Flags, logger *slog.Logger) int {
-	kv, blob, err := openKVBlob(config.Config{
+	kv, blob, err := app.OpenKVBlob(config.Config{
 		Storage: s3.storageConfig(to, dst),
 	}, logger)
 	if err != nil {
@@ -170,7 +171,7 @@ func migrateMaildirToKV(src, to, dst string, dryRun bool, s3 s3Flags, logger *sl
 // migrateKVToMaildir exports every account/mailbox of a KV store into a
 // maildir root (one directory per account, Maildir++ layout).
 func migrateKVToMaildir(from, src, dst string, dryRun bool, s3 s3Flags, logger *slog.Logger) int {
-	kv, blob, err := openKVBlob(config.Config{
+	kv, blob, err := app.OpenKVBlob(config.Config{
 		Storage: s3.storageConfig(from, src),
 	}, logger)
 	if err != nil {
