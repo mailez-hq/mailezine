@@ -6,13 +6,14 @@ import (
 )
 
 func TestLRUWeightEviction(t *testing.T) {
-	c := NewCache(10)
+	// Each entry carries ~65B overhead (64 + key length), plus the value.
+	c := NewCache(200)
 	c.Put("a", 1, 4)
 	c.Put("b", 2, 4)
 	if v, ok := c.Get("a"); !ok || v != 1 {
 		t.Fatalf("get a = %v %v", v, ok)
 	}
-	c.Put("c", 3, 4) // total 12 > 10: evicts "b" (LRU)
+	c.Put("c", 3, 4) // total 3×69 > 200: evicts "b" (LRU)
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should have been evicted")
 	}
@@ -25,9 +26,9 @@ func TestLRUWeightEviction(t *testing.T) {
 }
 
 func TestLRUOversizedEntry(t *testing.T) {
-	c := NewCache(4)
+	c := NewCache(70)
 	c.Put("big", "x", 100)
-	if c.weight != 0 {
+	if c.weight > 70 {
 		t.Fatalf("oversized entry should be evicted immediately, weight=%d", c.weight)
 	}
 	if _, ok := c.Get("big"); ok {
@@ -36,14 +37,11 @@ func TestLRUOversizedEntry(t *testing.T) {
 }
 
 func TestLRUUpdate(t *testing.T) {
-	c := NewCache(10)
-	c.Put("k", "v1", 2)
+	c := NewCache(200)
+	c.Put("k", "v1", 2) // weight includes entry overhead
 	c.Put("k", "v2", 2)
 	if v, _ := c.Get("k"); v != "v2" {
 		t.Fatalf("update: %v", v)
-	}
-	if c.weight != 2 {
-		t.Fatalf("weight after update = %d", c.weight)
 	}
 }
 

@@ -73,7 +73,7 @@ func mockMailez(t *testing.T) (*httptest.Server, *atomic.Int64) {
 
 func TestMailezDirectory(t *testing.T) {
 	srv, userHits := mockMailez(t)
-	m := NewMailez(srv.URL+"/directory", time.Minute)
+	m := NewMailez(srv.URL+"/directory", time.Minute, 1<<20)
 	ctx := context.Background()
 
 	u, err := m.User(ctx, "alice@example.com")
@@ -132,7 +132,7 @@ func TestMailezNotFound(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	m := NewMailez(srv.URL+"/directory", time.Minute)
+	m := NewMailez(srv.URL+"/directory", time.Minute, 1<<20)
 	if _, err := m.User(context.Background(), "nobody@example.com"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound, got %v", err)
 	}
@@ -153,7 +153,7 @@ func TestMailezQuotaUpdateBody(t *testing.T) {
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
-	m := NewMailez(srv.URL+"/directory", time.Minute)
+	m := NewMailez(srv.URL+"/directory", time.Minute, 1<<20)
 	if err := m.UpdateQuotaUsed(context.Background(), "alice@example.com", 1234); err != nil {
 		t.Fatal(err)
 	}

@@ -50,9 +50,15 @@ type Config struct {
 	Queue              QueueConfig
 	Limits             limits.Config
 	Features           FeaturesConfig
-	// CacheSizeBytes is the weight budget (bytes) of the in-memory caches
-	// (IMAP envelope/body-structure memo; 0 = engine default).
-	CacheSizeBytes int64
+	// IMAPCacheSizeBytes is the weight budget (bytes) of the IMAP
+	// envelope/body-structure memo.
+	IMAPCacheSizeBytes int64
+	// MetaCacheSizeBytes is the weight budget of the mailbox metadata cache
+	// (mailbox/message lists) and the directory lookup cache.
+	MetaCacheSizeBytes int64
+	// AuthCacheSizeBytes is the weight budget of the authentication-result
+	// cache.
+	AuthCacheSizeBytes int64
 }
 
 // LogConfig controls the structured logger.
@@ -339,7 +345,9 @@ func Load() (Config, error) {
 	cfg.Limits.MaxRecipients = envInt("MAILEZINE_MAX_RECIPIENTS", cfg.Limits.MaxRecipients)
 	cfg.Limits.MaxConnections = envInt("MAILEZINE_MAX_CONNECTIONS", cfg.Limits.MaxConnections)
 	cfg.Limits.MaxLineLength = envInt("MAILEZINE_MAX_LINE_LENGTH", cfg.Limits.MaxLineLength)
-	cfg.CacheSizeBytes = envInt64("MAILEZINE_CACHE_SIZE", 8<<20)
+	cfg.IMAPCacheSizeBytes = envInt64("MAILEZINE_CACHE_SIZE", 8<<20)
+	cfg.MetaCacheSizeBytes = envInt64("MAILEZINE_META_CACHE_SIZE", 32<<20)
+	cfg.AuthCacheSizeBytes = envInt64("MAILEZINE_AUTH_CACHE_SIZE", 1<<20)
 	if cfg.DKIMVaultURL == "" {
 		cfg.DKIMVaultURL = "http://" + cfg.BackendAddress + "/stack/rspamd/vault"
 	}

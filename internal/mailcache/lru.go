@@ -87,6 +87,10 @@ func (c *Cache) Get(key string) (any, bool) {
 // Put stores value under key with the given weight, evicting the
 // least-recently-used entries until the cache is within capacity.
 func (c *Cache) Put(key string, value any, weight int64) {
+	// Every entry carries a fixed footprint (map slot, list element, key
+	// storage) on top of the value. Account for it so callers passing tiny
+	// weights (e.g. 1 for a bool) cannot balloon memory.
+	weight += int64(64 + len(key))
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if el, ok := c.items[key]; ok {

@@ -148,7 +148,7 @@ func newDirectory(cfg config.Config, logger *slog.Logger) (directory.Service, er
 	case "mailez":
 		base := "http://" + cfg.BackendAddress + "/stack/directory"
 		logger.Info("directory", "mode", "mailez", "base", base, "cacheTTL", cfg.Directory.CacheTTL)
-		return directory.NewMailez(base, cfg.Directory.CacheTTL), nil
+		return directory.NewMailez(base, cfg.Directory.CacheTTL, cfg.MetaCacheSizeBytes), nil
 	default:
 		return nil, errors.New("config: unknown directory mode " + cfg.Directory.Mode)
 	}
