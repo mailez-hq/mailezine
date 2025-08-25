@@ -15,6 +15,7 @@ import (
 	"mailezine/internal/directory"
 	"mailezine/internal/fts"
 	"mailezine/internal/imapserver"
+	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
 )
 
@@ -38,6 +39,10 @@ type Server struct {
 	// FTS is the optional full-text index; SEARCH TEXT consults it for
 	// candidates and verifies against raw bytes.
 	FTS *fts.Indexer
+
+	// cache memoizes message-derived data (envelope, body structure) across
+	// sessions. nil disables caching.
+	cache *mailcache.LRU
 }
 
 // New builds the go-imap server. TLS is terminated by the mailez gateway,
@@ -50,6 +55,9 @@ func New(s *Server) *imapserver.Server {
 	}
 	if s.MaxMessageBytes <= 0 {
 		s.MaxMessageBytes = 50 << 20
+	}
+	if s.cache == nil {
+		s.cache = mailcache.NewLRU(8192)
 	}
 	caps := imap.CapSet{
 		imap.CapIMAP4rev1: {},

@@ -29,10 +29,12 @@
 | 指标 | postdove | mailezine |
 |---|---|---|
 | IMAP 并发会话（100 连接） | 100 建立，8.8 session/s | **100 建立，370 session/s（42×）** |
-| IMAP FETCH p50 | **33 ms** | 235 ms |
+| IMAP FETCH p50（优化后） | 33 ms | **26 ms** |
 | SMTP 并发（测试集） | 20 | 20 |
 
-mailezine 的 IMAP 会话建立速率是 postdove 的 42 倍；单次 FETCH 读延迟 postdove 更低（legacy IMAP 索引缓存 vs KV 实时读），这是 mailezine 后续优化点（KV 读路径缓存）。
+mailezine 的 IMAP 会话建立速率是 postdove 的 42 倍；单次 FETCH 读延迟在
+读路径优化后（按需下载 + envelope/body-structure LRU + SELECT 快照复用）
+从 235 ms 降至 26 ms，已反超 postdove（33 ms）。
 
 ## 内存 RSS
 
@@ -57,6 +59,8 @@ mailezine 单容器承载全部协议，负载下内存几乎不增长；postdov
 - **吞吐与延迟**：mailezine 在收件、提交、IMAP 会话建立上全面占优（5.6×/9.9×/42×）。
 - **资源占用**：mailezine 内存为 postdove 的 1/5（空闲）到 1/9（负载），且为单容器部署。
 - **差距来源**：postdove 的多进程架构（nginx 代理 + legacy IMAP 登录代理 + legacy MTA 队列）+ maildir 小文件 IO + 每次认证/查询的跨进程往返；mailezine 单进程内完成认证、路由、存储（Pebble KV + S3 blob 流式），队列状态机在 KV 中事务化。
-- **mailezine 当前短板**：单次 IMAP FETCH 读延迟（KV 实时读 vs legacy IMAP 索引缓存），适合作为后续优化（读路径缓存/批量预取）。
+- **mailezine 已优化项**：IMAP FETCH 读路径——按需下载 blob（UID/FLAGS/
+  SIZE 等元数据零下载）、envelope/body-structure LRU 缓存（8192 条目）、
+  FETCH 复用 SELECT 快照；235 ms → 26 ms。
 
 复现：`cmd/bench`（仓库内）+ `deploy/docker-compose.bench-postdove.yml`（postdove 隔离栈）；mailezine 单容器按 benchmark.md §4 启动。

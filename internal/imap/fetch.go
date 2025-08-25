@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strconv"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message/textproto"
@@ -17,9 +18,16 @@ import (
 
 func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	ctx := context.Background()
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
-	if err != nil {
-		return err
+	// FETCH operates on the selected snapshot: the mailbox was listed at
+	// SELECT time and refreshSnapshot keeps it current after writes, so a
+	// fetch burst does not re-scan the whole mailbox per command.
+	msgs := s.snap
+	if msgs == nil {
+		var err error
+		msgs, err = s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+		if err != nil {
+			return err
+		}
 	}
 	markSeen := false
 	changed := false
@@ -34,14 +42,37 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if !numContains(numSet, seq, msg.UID) {
 			continue
 		}
-		rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, msg.UID)
-		if err != nil {
-			return err
+		// Envelope and body structure are memoised per (account, mailbox,
+		// UID); only body sections and cache misses need the blob.
+		envKey := s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
+		var env *imap.Envelope
+		if options.Envelope {
+			if e, ok := s.srv.cache.Get(envKey); ok {
+				env = e.(*imap.Envelope)
+			}
 		}
-		buf, err := io.ReadAll(rc)
-		_ = rc.Close()
-		if err != nil {
-			return err
+		bsKey := "bs\x00" + envKey + "\x00" + strconv.FormatBool(options.BodyStructure != nil && options.BodyStructure.Extended)
+		var bs imap.BodyStructure
+		if options.BodyStructure != nil {
+			if b, ok := s.srv.cache.Get(bsKey); ok {
+				bs = b.(imap.BodyStructure)
+			}
+		}
+		needBuf := len(options.BodySection) > 0 || len(options.BinarySection) > 0 ||
+			len(options.BinarySectionSize) > 0 ||
+			(options.Envelope && env == nil) ||
+			(options.BodyStructure != nil && bs == nil)
+		var buf []byte
+		if needBuf {
+			rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, msg.UID)
+			if err != nil {
+				return err
+			}
+			buf, err = io.ReadAll(rc)
+			_ = rc.Close()
+			if err != nil {
+				return err
+			}
 		}
 		if markSeen && !mailstore.HasFlag(msg.Flags, "\\Seen") {
 			flags := append([]string(nil), msg.Flags...)
@@ -65,13 +96,21 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			rw.WriteInternalDate(msg.InternalDate)
 		}
 		if options.RFC822Size {
-			rw.WriteRFC822Size(int64(len(buf)))
+			rw.WriteRFC822Size(msg.Size)
 		}
 		if options.Envelope {
-			rw.WriteEnvelope(envelopeOf(buf))
+			if env == nil {
+				env := envelopeOf(buf)
+				s.srv.cache.Put(envKey, env)
+			}
+			rw.WriteEnvelope(env)
 		}
 		if options.BodyStructure != nil {
-			rw.WriteBodyStructure(imapserver.ExtractBodyStructure(bytes.NewReader(buf)))
+			if bs == nil {
+				bs := imapserver.ExtractBodyStructure(bytes.NewReader(buf))
+				s.srv.cache.Put(bsKey, bs)
+			}
+			rw.WriteBodyStructure(bs)
 		}
 		for _, bs := range options.BodySection {
 			section := imapserver.ExtractBodySection(bytes.NewReader(buf), bs)

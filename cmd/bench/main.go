@@ -40,7 +40,7 @@ import (
 )
 
 var (
-	engine  = flag.String("engine", "engine", "label for results")
+	engine   = flag.String("engine", "engine", "label for results")
 	smtpAddr = flag.String("smtp", "127.0.0.1:1587", "SMTP submission address")
 	inSmtp   = flag.String("in-smtp", "127.0.0.1:25", "inbound SMTP address")
 	imapAddr = flag.String("imap", "127.0.0.1:143", "IMAP address")
@@ -50,7 +50,6 @@ var (
 	msgs     = flag.Int("msgs", 1000, "total messages")
 	size     = flag.Int("size", 4096, "message body size (bytes)")
 	to       = flag.String("to", "u%05d@example.com", "recipient format (%%05d = 1..N users)")
-	domain   = flag.String("domain", "example.com", "local domain")
 	fromDom  = flag.String("from-dom", "external.test", "seed sender domain")
 	dur      = flag.Duration("dur", 15*time.Second, "sampling duration for stats")
 	verbose  = flag.Bool("verbose", false, "print first failures")
@@ -142,6 +141,15 @@ func randUserID() int {
 	return int(uint64(randInt())%10000) + 1
 }
 
+// formatRecipient fills a %d-style recipient template; a literal address is
+// returned unchanged.
+func formatRecipient(tmpl string) string {
+	if !strings.Contains(tmpl, "%") {
+		return tmpl
+	}
+	return fmt.Sprintf(tmpl, randUserID())
+}
+
 // benchResult aggregates a load run.
 type benchResult struct {
 	Engine   string
@@ -183,13 +191,13 @@ func percentiles(d []time.Duration, p float64) time.Duration {
 // done, and reports rate + latency percentiles.
 func runConcurrent(n, total int, fn func() error) benchResult {
 	var (
-		wg      sync.WaitGroup
-		start   = time.Now()
-		done    atomic.Int64
-		fails   atomic.Int64
+		wg        sync.WaitGroup
+		start     = time.Now()
+		done      atomic.Int64
+		fails     atomic.Int64
 		firstErrs []string
-		latMu   sync.Mutex
-		latency []time.Duration
+		latMu     sync.Mutex
+		latency   []time.Duration
 	)
 	work := make(chan struct{}, total)
 	for i := 0; i < total; i++ {
@@ -251,7 +259,7 @@ func seed() {
 			return err
 		}
 		defer c.Close()
-		to := fmt.Sprintf(*to, randUserID())
+		to := formatRecipient(*to)
 		if err := c.Mail("bench-sender@"+*fromDom, nil); err != nil {
 			return err
 		}
@@ -285,7 +293,7 @@ func smtpBench() {
 		if err := c.Auth(sasl.NewPlainClient("", *user, *pass)); err != nil {
 			return err
 		}
-		to := fmt.Sprintf(*to, randUserID())
+		to := formatRecipient(*to)
 		if err := c.Mail(*user, nil); err != nil {
 			return err
 		}
@@ -339,7 +347,7 @@ func imapBench() {
 			ok.Add(1)
 			for {
 				t0 := time.Now()
-				_, err := ic.Fetch(imap.SeqSetNum(1), nil).Collect()
+				_, err := ic.Fetch(imap.SeqSetNum(1), &imap.FetchOptions{Envelope: true}).Collect()
 				latMu.Lock()
 				latency = append(latency, time.Since(t0))
 				latMu.Unlock()
