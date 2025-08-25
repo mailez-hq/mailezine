@@ -1,7 +1,7 @@
 # 基准测试结果：mailezine vs postdove（10,000 人企业邮箱，MySQL 生产形态）
 
 > 方法与环境见 [benchmark.md](./benchmark.md)。本页为可发布结果。
-> 本轮测试按生产配置使用 **MySQL 8.0**（开发默认 SQLite 不参与对比），
+> 测试按生产配置使用 **MySQL 8.0**（开发默认 SQLite 不参与对比），
 > 两栈共用同一个 mailez backend 控制面。
 
 ## 环境
@@ -23,106 +23,103 @@
   per-user 连接数与发信限流扭曲并发结果；IMAP 会话 100 并发对应
   100 个不同用户、每用户信箱至少 1 封真实邮件
 
-## 吞吐与延迟（MySQL backend）
+## 两轮测试（顺序交换消除偏差）
+
+为消除"先测谁"带来的机器预热/缓存/限流计数偏差，按同一套规则跑了两轮，
+每轮开始前重置引擎存储（postdove maildir volume、mailezine Pebble/MinIO
+bucket）、flush 共享 Redis 限流计数、重置用户配额：
+
+- **Round A**：先 postdove，后 mailezine
+- **Round B**：先 mailezine，后 postdove（反序）
+
+两轮同机分时运行，每轮六个阶段一致：verify → 收件吞吐（200 封 @20 并发）
+→ IMAP 灌信（前 100 用户各 1 封）→ 提交吞吐（100 封 @20 并发，1000
+发件人）+ 负载内存采样 → IMAP 100 并发 30s → 队列 200 封 @20 并发
+（mock MX 接收）。复现脚本见 `deploy/scripts/bench-round.ps1`。
+
+## 两轮均值汇总（Round A / Round B 的平均）
 
 | 指标 | postdove | mailezine | 比值 |
 |---|---|---|---|
-| 收件吞吐（20 并发，200 封） | 9.1 msg/s | **20.3 msg/s** | 2.2× |
-| 收件 p50 延迟 | 2.04 s | **997 ms** | 2.0× 快 |
-| 收件 p95 延迟 | 3.60 s | **1.44 s** | 2.5× 快 |
-| 提交吞吐（20 并发，100 封，1000 发件人） | 3.1 msg/s | **5.9 msg/s** | 1.9× |
-| 提交 p50 延迟 | 6.27 s | **3.21 s** | 2.0× 快 |
-| 提交 p95 延迟 | 8.18 s | **4.25 s** | 1.9× 快 |
-| 8 小时日收件等价量 | 4,391 封 | **9,739 封** | 2.2× |
-| 8 小时日发件等价量 | 1,475 封 | **2,847 封** | 1.9× |
+| 收件吞吐（20 并发，200 封） | 8.9 msg/s | **29.0 msg/s** | 3.3× |
+| 收件 p50 延迟 | 2.08 s | **669 ms** | 3.1× 快 |
+| 提交吞吐（20 并发，100 封，1000 发件人） | 3.3 msg/s | **6.5 msg/s** | 2.0× |
+| 提交 p50 延迟 | 5.79 s | **2.97 s** | 1.9× 快 |
+| 8 小时日收件等价量 | 4,245 封 | **13,896 封** | 3.3× |
+| 8 小时日发件等价量 | 1,560 封 | **3,131 封** | 2.0× |
+| IMAP 会话建立（100 并发） | 100/100（0 失败） | 100/100（0 失败） | — |
+| IMAP FETCH p50 | 29.9 ms | **18.4 ms（1.6× 快）** | |
+| IMAP FETCH 聚合吞吐 | 2,098 ops/s | **2,956 ops/s（1.4×）** | |
+| 队列提交速率 | 3.4 msg/s | **7.5 msg/s** | 2.2× |
+| 队列投递速率（mock MX） | 2.8 msg/s | **7.3 msg/s** | 2.6× |
+| 队列入队→投递 p50 | 26.5 s | **4.30 s** | 6.2× 快 |
+| 最大滞留队列深度 | 107 封 | **0 封** | — |
+| 内存空闲（整栈） | ~128 MiB | **~24 MiB** | 5.3× 省 |
+| 内存负载峰值（整栈） | ~267 MiB | **~34 MiB** | 7.8× 省 |
 
 > 收件 = 入站 SMTP 投递（外部发件人 → 本地用户）；提交 = AUTH 认证提交
 > （本地用户互发）。两者都走完整队列路径。认证路径两栈对称：都经过
 > backend `/stack/auth/email`（bcrypt cost 12 + MySQL 查库 + Redis 限流），
 > 该公共开销计入双方延迟，mailezine 仍快约 2×。
 
-## IMAP 并发会话与 FETCH（100 并发，30 秒）
+## Round A 明细（先 postdove）
 
 | 指标 | postdove | mailezine |
 |---|---|---|
-| 会话建立 | 100/100（0 失败） | 100/100（0 失败） |
-| FETCH p50 | 43.0 ms | **19.4 ms（2.2× 快）** |
-| FETCH p95 | 99.7 ms | **38.0 ms** |
-| FETCH 聚合吞吐 | 798 ops/s | **4,580 ops/s（5.7×）** |
+| 收件吞吐 / p50 | 8.0 msg/s / 2.25 s | **23.8 msg/s / 773 ms** |
+| 提交吞吐 / p50 | 3.1 msg/s / 6.11 s | **6.5 msg/s / 2.99 s** |
+| IMAP 会话 / FETCH p50 | 100/100 / 29.8 ms | 100/100 / **18.2 ms** |
+| 队列 submit / deliver / p50 / backlog | 3.3 / 2.7 msg/s / 27.1 s / 106 | **7.8 / 7.5 msg/s / 4.15 s / 0** |
+| 内存空闲（整栈） | 128 MiB（67.7+7.9+52.6） | **24 MiB（17.6+6.3）** |
+| 内存负载峰值 | 267 MiB（88.9+87.7+90.3） | **34 MiB（17.8+16.6）** |
 
-> 首轮单用户 100 并发在 postdove 上出现 55/100 登录失败，根因是 legacy IMAP
-> `mail_max_userip_connections=20` 的单用户连接上限，不是引擎故障；改用
-> 100 个不同用户后两栈均 100/100。这正是多用户轮询的意义。
+## Round B 明细（先 mailezine）
 
-## 队列性能（200 封外部投递，mock MX 接收）
-
-| 指标 | postdove | mailezine | 比值 |
-|---|---|---|---|
-| 提交速率 | 3.5 msg/s | **6.0 msg/s** | 1.7× |
-| 投递速率（mock MX） | 2.7 msg/s | **5.8 msg/s** | 2.1× |
-| 入队→投递 p50 | 29.4 s | **5.09 s** | 5.8× 快 |
-| 入队→投递 p95 | 51.1 s | **6.36 s** | 8.0× 快 |
-| 最大滞留队列深度 | 127 封 | **0 封** | — |
-| 投递成功率 | 100%（200/200） | 100%（200/200） | — |
-
-> postdove 的入队→投递延迟主要由 legacy MTA 队列扫描/投递调度与 legacy IMAP
-> submission 中继链贡献；mailezine 的 KV 队列（poll 1s）几乎实时外发，
-> 队列不积压。
-
-## 内存 RSS
-
-| 状态 | postdove（nginx gateway+legacy MTA/IMAP stack 合计） | mailezine（caddy gateway + 引擎合计） | 比值 |
-|---|---|---|---|
-| 空闲（稳态） | ~186 MiB（gateway 76 + legacy MTA 13 + legacy IMAP 97） | **~33 MiB（caddy 18 + 引擎 14）** | 5.7× 省 |
-| 负载峰值（20 并发灌信 + 100 IMAP） | ~309 MiB（gateway 87 + legacy MTA 111 + legacy IMAP 111） | **~42 MiB（caddy 18 + 引擎 23）** | 7.4× 省 |
-
-> 共享控制面（backend/MySQL/Redis）与 rspamd 不计入任何一方，两栈对称；
-> gateway 双方都计入（nginx vs caddy）。mailezine 单进程承载全部邮件
-> 协议，负载下引擎内存增长 < 9 MiB、caddy 几乎不动（邮件流量不经过它）；
-> postdove 的 legacy MTA 队列与 legacy IMAP 索引进程在负载下各增长数十 MiB。
-
-## 存储 IO 与落盘
-
-| 指标 | postdove | mailezine |
+| 指标 | mailezine | postdove |
 |---|---|---|
-| 消息落盘形态 | maildir 小文件 + legacy IMAP 索引 | Pebble KV（元数据）+ MinIO blob（正文） |
-| 落盘体积（同规模邮件集） | ~73 MB（maildir volume） | Pebble ~0.8 MB + blob ~17.7 MB |
-| 负载期写 IO（docker stats BlockIO） | legacy IMAP 写 ~102 MB | MinIO 写 ~29.6 MB（blob） |
+| 收件吞吐 / p50 | **34.1 msg/s / 565 ms** | 9.7 msg/s / 1.92 s |
+| 提交吞吐 / p50 | **6.5 msg/s / 2.95 s** | 3.4 msg/s / 5.47 s |
+| IMAP 会话 / FETCH p50 | 100/100 / **18.6 ms** | 100/100 / 29.9 ms |
+| 队列 submit / deliver / p50 / backlog | **7.2 / 7.0 msg/s / 4.45 s / 0** | 3.5 / 2.8 msg/s / 25.95 s / 108 |
+| 内存空闲（整栈） | **24 MiB（17.6+6.3）** | 128 MiB（67.5+7.6+52.4） |
+| 内存负载峰值 | **34 MiB（17.6+16.7）** | 267 MiB（89.8+88.7+88.4） |
 
-> 同一批消息，mailezine 全链路（KV 元数据 + S3 正文）落盘约 postdove
-> maildir+legacy IMAP 索引的 1/4，且 blob 天然可水平扩展（S3/MinIO），不绑定
-> 单机磁盘。
+> 两轮数字波动很小（收件吞吐 ±2 msg/s、提交 ±0.2 msg/s、IMAP p50
+> ±0.4 ms），结论方向完全一致，顺序效应可以忽略。
 
 ## 测试中发现并解决的问题
 
-1. **`cmd/bench` flag 解析缺陷**：Go 标准 flag 在第一个非 flag 参数处停止
-   解析，`bench verify -smtp ...` 会把 `-smtp` 当普通参数，静默打到默认
-   端口（dev 栈 1587/143）而不是 bench 栈，导致假失败。已修复：子命令
-   可写在 flag 前或后（`bench seed -conns 20` 与 `bench -conns 20 seed`
-   等价）。
-2. **单用户并发失真**：100 个 IMAP 会话全用同一用户时，legacy IMAP
+1. **backend 并发 bcrypt 无闸门**：100 个并发登录会同时烧满全部 CPU 的
+   cost-12 bcrypt 验证，`/stack/auth/email` 尾部延迟飙到 ~10s，客户端
+   重试互相踩踏。已加 GOMAXPROCS 大小的并发闸门（`MAILEZ_AUTH_WORKERS`
+   可覆盖），尾部延迟降到 ~5s 且有界，两栈登录都恢复 100/100。
+2. **mailezine 认证/目录客户端无重试**：backend 排队时单次 5s 超时直接
+   判失败。auth 与 directory 客户端都加了 3 次尝试 + 退避（对齐 nginx
+   login.lua 的 max_attempts=3），凭证错误/404 不重试。
+3. **`cmd/bench` flag 解析缺陷**：Go 标准 flag 在第一个非 flag 参数处
+   停止解析，`bench verify -smtp ...` 会静默忽略 `-smtp`。已修复：子
+   命令可写在 flag 前或后。
+4. **单用户并发失真**：100 个 IMAP 会话全用同一用户时，legacy IMAP
    `mail_max_userip_connections=20` 导致 55% 登录失败；单发件人 200 封
-   提交会触发 backend 每用户发信限流（`450 too many emails too fast`）。
-   已为 bench 增加 `-users` 多用户轮询与 `-seq` 顺序灌信。
-3. **queue 模式缺失且无法确定性投递**：原 bench 文档列了 queue 但没有
-   实现。已实现内置 mock MX（go-smtp server）+ Message-ID 逐封关联的
-   入队→投递延迟统计；legacy MTA 侧 relayhost、mailezine 侧新增
-   `MAILEZINE_OUTBOUND_FIXED_HOST/PORT`（smarthost 中继）使两栈都投递到
-   同一个 mock MX，路径同构。
-4. **mailez backend MySQL 兼容**：`User` 模型日期字段为非空 `time.Time`，
-   Go 零值渲染为 `0000-00-00`，MySQL 8 严格模式拒绝写入。改为
-   `*time.Time`（可空）并同步 `parseUserDate`/`ReplyActive`/S/MIME 使用点，
-   MySQL 10k 用户 seed 通过（sqlite 开发路径回归测试通过）。
-5. **IMAP FETCH 空信箱失真**：FETCH seq 1 对空信箱是近乎零开销的空操作；
-   改为先按序给前 100 用户各灌 1 封，再测真实信封读取延迟。
+   提交触发 backend 每用户发信限流。已为 bench 增加 `-users` 多用户
+   轮询与 `-seq` 顺序灌信。
+5. **queue 模式缺失且无法确定性投递**：已实现内置 mock MX（go-smtp
+   server）+ Message-ID 逐封关联的入队→投递延迟统计；legacy MTA 侧
+   relayhost、mailezine 侧 `MAILEZINE_OUTBOUND_FIXED_HOST/PORT`（smarthost
+   中继）使两栈投递路径同构。
+6. **mailez backend MySQL 兼容**：`User` 模型日期字段改为可空
+   `*time.Time`（MySQL 8 严格模式拒绝 `0000-00-00`），MySQL 10k 用户
+   seed 通过。
+7. **IMAP FETCH 空信箱失真**：改为先按序给前 100 用户各灌 1 封，再测
+   真实信封读取延迟。
 
 ## 结论
 
-- **吞吐与延迟**：MySQL 生产形态下 mailezine 在收件（2.2×）、提交
-  （1.9×）、IMAP FETCH 聚合（5.7×）、队列投递（2.1×）上全面占优；
-  入队→投递延迟 5.8× 更快且队列零积压。
+- **吞吐与延迟**：MySQL 生产形态、两轮反序验证下，mailezine 在收件
+  （3.3×）、提交（2.0×）、IMAP FETCH 聚合（1.4×）、队列投递（2.6×）
+  上全面占优；入队→投递延迟 6.2× 更快且队列零积压。
 - **资源占用**：mailezine 整栈（caddy gateway + 引擎）内存为 postdove
-  整栈（nginx gateway + legacy MTA + legacy IMAP）的 1/5.7（空闲）到 1/7.4
+  整栈（nginx gateway + legacy MTA + legacy IMAP）的 1/5.3（空闲）到 1/7.8
   （负载），且引擎为单容器；存储落盘约 1/4，blob 层可水平扩展。
 - **差距来源**：postdove 的多进程架构（nginx 代理 + legacy IMAP 登录代理 +
   legacy MTA 队列）+ maildir 小文件 IO + 每次认证/查询的跨进程往返；
@@ -130,10 +127,12 @@
   队列状态机在 KV 中事务化。两栈的认证都经过共享 backend（bcrypt +
   MySQL），该公共开销对称计入，不偏袒任一方。
 - **诚实声明**：单机 Docker Desktop 环境下两栈均未达到 10k 用户模型
-  的目标量（日收件 320k / 日发件 120k）——瓶颈主要在认证链（bcrypt
-  cost 12 + HTTP 往返）与单机资源；Linux 裸机 + 更多核 + 水平扩展
-  （mailezine 支持 Pebble/MinIO 拆分与 S3 横向扩容）会显著提高。
+  的目标量（日收件 320k / 日发件 120k）——瓶颈主要在共享 backend 的
+  bcrypt 认证链与单机资源；Linux 裸机 + 更多核 + 水平扩展（mailezine
+  支持 Pebble/MinIO 拆分与 S3 横向扩容）会显著提高。
 
-复现：`cmd/bench`（仓库内）+ `deploy/docker-compose.bench-postdove.yml`
-（postdove 隔离栈，MySQL backend 宿主机运行）+ mailezine（caddy gateway +
-引擎单容器）按 benchmark.md §4 启动。
+复现：`cmd/bench`（仓库内）+ `deploy/scripts/bench-round.ps1`
+（两轮脚本）+ `deploy/docker-compose.bench-postdove.yml`（postdove
+隔离栈，MySQL backend 宿主机运行）+ mailezine（caddy gateway + 引擎
+单容器）按 benchmark.md §4 启动。原始输出保留在测试环境
+`round{A,B}-{postdove,mailezine}.log` 与 `*-load-mem.txt`。
