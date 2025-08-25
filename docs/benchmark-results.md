@@ -11,9 +11,10 @@
 - **共享控制面（两栈共用）**：mailez backend（MySQL 8.0 + Redis），
   10,000 用户 seed；postdove 与 mailezine 都通过 backend 的目录/认证 API
   工作，MySQL/Redis 不构成任一引擎的独有负担
-- postdove：nginx gateway + legacy MTA + legacy IMAP（maildir），rspamd milter
-  禁用（共享组件，另行验证）
-- mailezine：单容器（Pebble KV + MinIO S3 blob，`mailez` 目录/认证模式）
+- postdove：**nginx** gateway（邮件代理 + TLS 终止）+ legacy MTA + legacy IMAP
+  （maildir），rspamd milter 禁用（共享组件，另行验证）
+- mailezine：**caddy** gateway（仅 HTTP/ACME，邮件端口引擎直出）+
+  引擎单容器（Pebble KV + MinIO S3 blob，`mailez` 目录/认证模式）
 - 同一负载工具（`cmd/bench`）驱动，两栈同机分时运行
 - 消息：16 KiB 纯文本（企业典型）；灌信模拟外部发件人 → 本地用户；
   提交为认证用户互发；队列测试经内置 mock MX 接收（legacy MTA relayhost /
@@ -70,14 +71,15 @@
 
 ## 内存 RSS
 
-| 状态 | postdove（gateway+legacy MTA/IMAP stack 合计） | mailezine（1 容器） | 比值 |
+| 状态 | postdove（nginx gateway+legacy MTA/IMAP stack 合计） | mailezine（caddy gateway + 引擎合计） | 比值 |
 |---|---|---|---|
-| 空闲 | ~254 MiB（gateway 81 + legacy MTA 62 + legacy IMAP 111） | **19.4 MiB** | 13× 省 |
-| 负载（20 并发灌信 + 100 IMAP） | ~309 MiB（gateway 87 + legacy MTA 111 + legacy IMAP 111） | **23.0 MiB** | 13.4× 省 |
+| 空闲（稳态） | ~186 MiB（gateway 76 + legacy MTA 13 + legacy IMAP 97） | **~33 MiB（caddy 18 + 引擎 14）** | 5.7× 省 |
+| 负载峰值（20 并发灌信 + 100 IMAP） | ~309 MiB（gateway 87 + legacy MTA 111 + legacy IMAP 111） | **~42 MiB（caddy 18 + 引擎 23）** | 7.4× 省 |
 
-> 共享控制面（backend/MySQL/Redis）与 rspamd 不计入任何一方，两栈对称。
-> mailezine 单进程承载全部协议，负载下内存增长 < 4 MiB；postdove 的
-> legacy MTA 队列与 legacy IMAP 索引进程在负载下各增长数十 MiB。
+> 共享控制面（backend/MySQL/Redis）与 rspamd 不计入任何一方，两栈对称；
+> gateway 双方都计入（nginx vs caddy）。mailezine 单进程承载全部邮件
+> 协议，负载下引擎内存增长 < 9 MiB、caddy 几乎不动（邮件流量不经过它）；
+> postdove 的 legacy MTA 队列与 legacy IMAP 索引进程在负载下各增长数十 MiB。
 
 ## 存储 IO 与落盘
 
@@ -119,8 +121,9 @@
 - **吞吐与延迟**：MySQL 生产形态下 mailezine 在收件（2.2×）、提交
   （1.9×）、IMAP FETCH 聚合（5.7×）、队列投递（2.1×）上全面占优；
   入队→投递延迟 5.8× 更快且队列零积压。
-- **资源占用**：mailezine 内存为 postdove 引擎容器的 1/13（空闲/负载），
-  且为单容器部署；存储落盘约 1/4，blob 层可水平扩展。
+- **资源占用**：mailezine 整栈（caddy gateway + 引擎）内存为 postdove
+  整栈（nginx gateway + legacy MTA + legacy IMAP）的 1/5.7（空闲）到 1/7.4
+  （负载），且引擎为单容器；存储落盘约 1/4，blob 层可水平扩展。
 - **差距来源**：postdove 的多进程架构（nginx 代理 + legacy IMAP 登录代理 +
   legacy MTA 队列）+ maildir 小文件 IO + 每次认证/查询的跨进程往返；
   mailezine 单进程内完成认证、路由、存储（Pebble KV + S3 blob 流式），
@@ -132,5 +135,5 @@
   （mailezine 支持 Pebble/MinIO 拆分与 S3 横向扩容）会显著提高。
 
 复现：`cmd/bench`（仓库内）+ `deploy/docker-compose.bench-postdove.yml`
-（postdove 隔离栈，MySQL backend 宿主机运行）+ mailezine 单容器按
-benchmark.md §4 启动。
+（postdove 隔离栈，MySQL backend 宿主机运行）+ mailezine（caddy gateway +
+引擎单容器）按 benchmark.md §4 启动。

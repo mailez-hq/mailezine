@@ -51,25 +51,29 @@
 
 - mailez backend（**MySQL 8.0 生产形态** + Redis，10k 用户 seed）
   - 开发默认 SQLite；基准按生产配置使用 MySQL（`DB_DRIVER=mysql`）。
-  - backend 是两栈共同的目录/认证控制面：postdove 的 gateway/legacy IMAP/
-    legacy MTA 通过 `/stack/*` 内部 API 认证与查目录；mailezine 以
+  - backend 是两栈共同的目录/认证控制面：postdove 的 nginx gateway/
+    legacy MTA/IMAP stack 通过 `/stack/*` 内部 API 认证与查目录；mailezine 以
     `MAILEZINE_DIRECTORY_MODE=mailez` / `MAILEZINE_AUTH_MODE=mailez`
     消费同一套 API。
   - Redis 由 backend 用于会话/限流，同样为共享控制面依赖。
+- rspamd 为共享组件，基准中两栈均禁用 milter（对称隔离，另行验证）。
 - 消息存储隔离：postdove 用 maildir volume，mailezine 用 Pebble KV +
   MinIO blob（S3）。
 
-### postdove（社区版）
+### 两栈组件对照（对称）
 
-- nginx gateway + legacy MTA + legacy IMAP（maildir）
-- 目录/认证走共享 backend（MySQL + Redis）
-- 无 rspamd（隔离引擎差异；rspamd 为共享组件）
+| | postdove（社区版） | mailezine（企业版） |
+|---|---|---|
+| gateway | **nginx**：邮件代理 + TLS 终止（25/465/587/110/995/143/993/4190） | **caddy**：仅 HTTP/ACME（80/443）；邮件端口由引擎直出，不经过 gateway |
+| 引擎 | legacy MTA（队列）+ legacy IMAP（maildir） | mailezine 单容器（Pebble KV + MinIO blob，内化隐式 TLS 465/993/995） |
+| 目录/认证 | 共享 backend（MySQL + Redis） | 共享 backend（MySQL + Redis） |
+| 存储 | maildir 小文件 + legacy IMAP 索引 | Pebble KV（元数据）+ MinIO blob（正文，S3） |
+| rspamd | 禁用（共享组件） | 禁用（与 postdove 对称） |
 
-### mailezine（企业版）
-
-- mailezine 单容器（mailez 目录/认证模式，10k 用户）
-- Pebble KV + MinIO blob（S3）
-- 无 rspamd（与 postdove 对称）
+> **邮件路径对称性**：postdove 的邮件流量必须经过 nginx 邮件代理（认证
+> 代理 + TLS 终止），基准打 nginx 端口；mailezine 模式下邮件流量不经过
+> caddy（caddy 只服务 HTTP/ACME），引擎直接对外，基准打的引擎端口就是
+> 生产路径。内存对比中 gateway 双方都计入（nginx vs caddy）。
 
 两栈同机（14 核 / 32GB），分时运行避免互相干扰；消息落盘路径隔离。
 
