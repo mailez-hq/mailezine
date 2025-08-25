@@ -62,6 +62,58 @@ func TestMailezRejected(t *testing.T) {
 	}
 }
 
+func TestMailezRetriesTransientFailure(t *testing.T) {
+	var hits int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stack/auth/email", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if hits == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Auth-Status", "OK")
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	m := NewMailez(srv.URL + "/stack")
+	ok, err := m.Authenticate(context.Background(), "alice@example.com", "s3cret", Options{Protocol: "imap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("expected authenticated after retry")
+	}
+	if hits != 2 {
+		t.Fatalf("hits = %d, want 2 (one retry)", hits)
+	}
+}
+
+func TestMailezNoRetryOnRejection(t *testing.T) {
+	var hits int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/stack/auth/email", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.Header().Set("Auth-Status", "Authentication credentials invalid")
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	m := NewMailez(srv.URL + "/stack")
+	ok, err := m.Authenticate(context.Background(), "alice@example.com", "wrong", Options{Protocol: "imap"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("expected rejected")
+	}
+	if hits != 1 {
+		t.Fatalf("hits = %d, want 1 (rejections must not be retried)", hits)
+	}
+}
+
 func TestMailezServerError(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/stack/auth/email", func(w http.ResponseWriter, r *http.Request) {

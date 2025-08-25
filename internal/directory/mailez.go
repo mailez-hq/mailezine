@@ -33,7 +33,7 @@ func NewMailez(base string, cacheTTL time.Duration, maxWeight int64) *Mailez {
 	}
 	return &Mailez{
 		base:  base,
-		hc:    &http.Client{Timeout: 5 * time.Second},
+		hc:    &http.Client{Timeout: 6 * time.Second},
 		cache: mailcache.NewCacheWithNegative(maxWeight, cacheTTL, 5*time.Second),
 	}
 }
@@ -177,27 +177,59 @@ func (m *Mailez) Sieve(ctx context.Context, email string) (SieveScript, error) {
 func (m *Mailez) Close() error { return nil }
 
 func (m *Mailez) getJSON(ctx context.Context, key, path string, out any) error {
+	// Retry transient transport/5xx failures with backoff: under concurrent
+	// logins the shared control plane's bcrypt gate queues auth requests,
+	// and a directory lookup that shares the queue must not fail the whole
+	// login. 404s are definitive and are cached as negatives, never retried.
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(i) * 500 * time.Millisecond):
+			}
+		}
+		retry, err := m.tryGetJSON(ctx, key, path, out)
+		if err == nil {
+			return nil
+		}
+		if !retry {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+// tryGetJSON performs one request. retry=false marks a definitive outcome
+// (404 or a 4xx client error) that must not be retried.
+func (m *Mailez) tryGetJSON(ctx context.Context, key, path string, out any) (retry bool, err error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.base+path, nil)
 	if err != nil {
-		return err
+		return true, err
 	}
 	resp, err := m.hc.Do(req)
 	if err != nil {
-		return err
+		return true, err
 	}
 	defer resp.Body.Close()
 	switch {
 	case resp.StatusCode == http.StatusNotFound:
 		m.cache.PutNegative(key)
-		return ErrNotFound
+		return false, ErrNotFound
+	case resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway ||
+		resp.StatusCode == http.StatusGatewayTimeout:
+		return true, fmt.Errorf("directory: %s: status %d", path, resp.StatusCode)
 	case resp.StatusCode != http.StatusOK:
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("directory: %s: status %d: %s", path, resp.StatusCode, body)
+		return false, fmt.Errorf("directory: %s: status %d: %s", path, resp.StatusCode, body)
 	}
 	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
-		return fmt.Errorf("directory: decode %s: %w", path, err)
+		return false, fmt.Errorf("directory: decode %s: %w", path, err)
 	}
-	return nil
+	return false, nil
 }
 
 var _ Service = (*Mailez)(nil)

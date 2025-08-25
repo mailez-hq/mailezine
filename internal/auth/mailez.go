@@ -14,6 +14,11 @@ import (
 )
 
 // Mailez is a Service backed by the mailez auth contract.
+//
+// Retry budget mirrors the postdove gateway's login.lua (max_attempts=3):
+// under concurrent logins the control plane's bcrypt verification (cost 12)
+// can push tail latency past one request timeout, so transport-level failures
+// are retried with backoff. Credential rejections are never retried.
 type Mailez struct {
 	base string // e.g. http://backend:8080/stack
 	hc   *http.Client
@@ -23,11 +28,31 @@ type Mailez struct {
 func NewMailez(base string) *Mailez {
 	return &Mailez{
 		base: base,
-		hc:   &http.Client{Timeout: 5 * time.Second},
+		hc:   &http.Client{Timeout: 6 * time.Second},
 	}
 }
 
 func (m *Mailez) Authenticate(ctx context.Context, email, password string, opts Options) (bool, error) {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return false, ctx.Err()
+			case <-time.After(time.Duration(i) * 500 * time.Millisecond):
+			}
+		}
+		ok, err := m.attempt(ctx, email, password, opts)
+		if err == nil {
+			return ok, nil
+		}
+		lastErr = err
+	}
+	return false, lastErr
+}
+
+func (m *Mailez) attempt(ctx context.Context, email, password string, opts Options) (bool, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.base+"/auth/email", nil)
 	if err != nil {
 		return false, err

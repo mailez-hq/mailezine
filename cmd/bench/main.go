@@ -22,6 +22,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"math"
 	"net"
@@ -486,6 +487,13 @@ func queueBench() {
 	srv.MaxMessageBytes = 1 << 22
 	srv.ReadTimeout = 60 * time.Second
 	srv.WriteTimeout = 60 * time.Second
+	// Normal client aborts (probes, engine connection churn) are bench
+	// noise, not failures: keep them out of stderr unless -verbose.
+	if *verbose {
+		srv.ErrorLog = log.New(os.Stderr, "mock-mx: ", 0)
+	} else {
+		srv.ErrorLog = log.New(io.Discard, "", 0)
+	}
 	ln, err := net.Listen("tcp", *mxAddr)
 	checkFatal(err)
 	go func() { _ = srv.Serve(ln) }()
