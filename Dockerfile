@@ -1,0 +1,46 @@
+# syntax=docker/dockerfile-upstream:1.4.3
+
+# mailezine engine image. Build context is the mailezine repository root
+# (the mailez compose profile points here).
+#
+# The default image runs the pure-Go Pebble backend (no cgo). RocksDB
+# production builds need a separate cgo stage (librocksdb) — see
+# PLAN.md §10; the KV contract keeps both interchangeable.
+FROM golang:1.26-alpine AS build
+ENV GOPROXY=https://goproxy.cn,direct CGO_ENABLED=0
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY cmd ./cmd
+COPY internal ./internal
+ARG VERSION=dev
+RUN go build -trimpath -ldflags="-s -w -X mailezine/internal/version.Version=${VERSION}" -o /out/mailezine ./cmd/mailezine
+
+FROM alpine:3.21
+
+ARG VERSION=dev
+LABEL version=$VERSION
+ARG APK_MIRROR="mirrors.aliyun.com"
+
+RUN set -euxo pipefail \
+  ; sed -i "s|dl-cdn.alpinelinux.org|${APK_MIRROR}|g" /etc/apk/repositories \
+  ; apk add --no-cache ca-certificates tzdata wget \
+  ; addgroup -S mailezine \
+  ; adduser -S -D -G mailezine -u 82 mailezine \
+  ; mkdir -p /data \
+  ; chown mailezine:mailezine /data
+
+COPY --from=build /out/mailezine /mailezine
+RUN echo $VERSION >/version
+
+# Health/metrics + the protocol matrix (the gateway proxies 25/465/587 and
+# IMAP/POP3/ManageSieve on its own ports; the engine listens on the internal
+# port contract configured through MAILEZINE_* envs).
+EXPOSE 11480/tcp
+HEALTHCHECK --start-period=10s --interval=15s CMD wget -qO- http://127.0.0.1:11480/health >/dev/null || exit 1
+
+# The engine runs unprivileged so files it writes (maildir messages, uidlist,
+# KV spool) carry a single identity across the mail stack. Mounted data
+# directories must be chowned to uid 82 (mailezine) by the deployer.
+USER mailezine
+CMD ["/mailezine"]

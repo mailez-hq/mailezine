@@ -1,0 +1,542 @@
+// Session implementation: login, mailbox management, message operations.
+package imap
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"sort"
+	"time"
+
+	"github.com/emersion/go-imap/v2"
+	"mailezine/internal/imapserver"
+
+	"mailezine/internal/auth"
+	"mailezine/internal/directory"
+	"mailezine/internal/mailstore"
+	"mailezine/internal/store"
+)
+
+// session is one IMAP connection. The mailbox field is the selected
+// mailbox name ("" when none).
+type session struct {
+	srv  *Server
+	user string
+	mbox string
+	snap []*mailstore.Message // selected mailbox snapshot for IDLE/POLL diffs
+}
+
+var _ imapserver.Session = (*session)(nil)
+var _ imapserver.SessionMove = (*session)(nil)
+var _ imapserver.SessionNamespace = (*session)(nil)
+var _ imapserver.SessionAppendLimit = (*session)(nil)
+var _ imapserver.SessionExtension = (*session)(nil)
+var _ imapserver.SessionSort = (*session)(nil)
+
+func (s *session) Close() error { return nil }
+
+func (s *session) Login(username, password string) error {
+	ok, err := s.srv.Auth.Authenticate(context.Background(), username, password, auth.Options{Protocol: "imap"})
+	if err != nil || !ok {
+		return imapserver.ErrAuthFailed
+	}
+	// The directory is the account authority: disabled or unknown accounts
+	// cannot sign in even when credentials match.
+	u, err := s.srv.Directory.User(context.Background(), username)
+	if err != nil || !u.Enabled {
+		return imapserver.ErrAuthFailed
+	}
+	s.user = username
+	return nil
+}
+
+func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.SelectData, error) {
+	if mailbox == "" {
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "empty mailbox name"}
+	}
+	ctx := context.Background()
+	if _, err := s.srv.Store.ListMailboxes(ctx, s.user); err != nil {
+		return nil, err
+	}
+	st, err := s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, directory.ErrNotFound) {
+			return nil, &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeNonExistent,
+				Text: "No such mailbox",
+			}
+		}
+		return nil, err
+	}
+	msgs, err := s.srv.Store.ListMessages(ctx, s.user, mailbox)
+	if err != nil {
+		return nil, err
+	}
+	s.mbox = mailbox
+	s.snap = msgs
+	flags := []imap.Flag{
+		imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted,
+		imap.FlagSeen, imap.FlagDraft,
+	}
+	permanent := append(append([]imap.Flag(nil), flags...), imap.FlagWildcard)
+	data := &imap.SelectData{
+		Flags:          flags,
+		PermanentFlags: permanent,
+		NumMessages:    st.NumMessages,
+		UIDNext:        imap.UID(st.UIDNext),
+		UIDValidity:    st.UIDValidity,
+		HighestModSeq:  st.HighestModSeq,
+	}
+	for i, msg := range msgs {
+		if !mailstore.HasFlag(msg.Flags, "\\Seen") {
+			data.FirstUnseenSeqNum = uint32(i) + 1
+			break
+		}
+	}
+	return data, nil
+}
+
+func (s *session) Unselect() error {
+	s.mbox = ""
+	return nil
+}
+
+func (s *session) Create(mailbox string, options *imap.CreateOptions) error {
+	_, err := s.srv.Store.CreateMailbox(context.Background(), s.user, mailbox)
+	if errors.Is(err, store.ErrExists) {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeAlreadyExists,
+			Text: "Mailbox already exists",
+		}
+	}
+	return err
+}
+
+func (s *session) Delete(mailbox string) error {
+	if mailbox == "INBOX" {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be deleted"}
+	}
+	err := s.srv.Store.DeleteMailbox(context.Background(), s.user, mailbox)
+	if errors.Is(err, store.ErrNotFound) {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+	}
+	return err
+}
+
+func (s *session) Rename(mailbox, newName string, options *imap.RenameOptions) error {
+	if mailbox == "INBOX" {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be renamed"}
+	}
+	err := s.srv.Store.RenameMailbox(context.Background(), s.user, mailbox, newName)
+	if errors.Is(err, store.ErrNotFound) {
+		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+	}
+	return err
+}
+
+func (s *session) Subscribe(mailbox string) error {
+	return s.srv.Store.SetSubscribed(context.Background(), s.user, mailbox, true)
+}
+
+func (s *session) Unsubscribe(mailbox string) error {
+	return s.srv.Store.SetSubscribed(context.Background(), s.user, mailbox, false)
+}
+
+func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, options *imap.ListOptions) error {
+	boxes, err := s.srv.Store.ListMailboxes(context.Background(), s.user)
+	if err != nil {
+		return err
+	}
+	if len(patterns) == 0 {
+		return w.WriteList(&imap.ListData{
+			Attrs: []imap.MailboxAttr{imap.MailboxAttrNoSelect},
+			Delim: mailboxDelim,
+		})
+	}
+	for _, mb := range boxes {
+		if options.SelectSubscribed && !mb.Subscribed {
+			continue
+		}
+		matched := false
+		for _, pattern := range patterns {
+			if imapserver.MatchList(mb.Name, mailboxDelim, ref, pattern) {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			continue
+		}
+		data := imap.ListData{Mailbox: mb.Name, Delim: mailboxDelim}
+		if mb.Subscribed {
+			data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
+		}
+		if options.ReturnStatus != nil {
+			data.Status = statusData(&mb, options.ReturnStatus)
+		}
+		if err := w.WriteList(&data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
+	mb, err := s.srv.Store.MailboxStatus(context.Background(), s.user, mailbox)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+		}
+		return nil, err
+	}
+	return statusData(&mb, options), nil
+}
+
+func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.AppendOptions) (*imap.AppendData, error) {
+	// Enforce the APPEND limit like SMTP DATA does.
+	data, err := io.ReadAll(io.LimitReader(r, s.srv.MaxMessageBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > s.srv.MaxMessageBytes {
+		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "message exceeds size limit"}
+	}
+	msg := &mailstore.Message{Data: data, InternalDate: options.Time}
+	if options.Time.IsZero() {
+		msg.InternalDate = time.Now()
+	}
+	for _, f := range options.Flags {
+		msg.Flags = append(msg.Flags, string(f))
+	}
+	uid, err := s.srv.Store.Append(context.Background(), s.user, mailbox, msg)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
+		}
+		return nil, err
+	}
+	if isJunkMailbox(mailbox) {
+		// APPEND into Junk trains spam.
+		s.learnMessage(context.Background(), mailbox, uid, true)
+	}
+	if s.srv.FTS != nil {
+		if err := s.srv.FTS.IndexMessage(context.Background(), s.user, mailbox, uid, data); err != nil {
+			s.srv.Logger.Error("imap: fts index", "mailbox", mailbox, "uid", uid, "err", err)
+		}
+	}
+	st, err := s.srv.Store.MailboxStatus(context.Background(), s.user, mailbox)
+	if err != nil {
+		return nil, err
+	}
+	return &imap.AppendData{UIDValidity: st.UIDValidity, UID: imap.UID(uid)}, nil
+}
+
+func (s *session) AppendLimit() uint32 {
+	return uint32(s.srv.MaxMessageBytes)
+}
+
+func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
+	if s.mbox == "" {
+		return nil
+	}
+	current, err := s.srv.Store.ListMessages(context.Background(), s.user, s.mbox)
+	if err != nil {
+		return err
+	}
+	old := map[uint32]*mailstore.Message{}
+	oldSeq := map[uint32]uint32{}
+	for i, m := range s.snap {
+		old[m.UID] = m
+		oldSeq[m.UID] = uint32(i) + 1
+	}
+	cur := map[uint32]*mailstore.Message{}
+	for _, m := range current {
+		cur[m.UID] = m
+	}
+	// EXISTS when the mailbox grew.
+	if uint32(len(current)) > uint32(len(s.snap)) {
+		if err := w.WriteNumMessages(uint32(len(current))); err != nil {
+			return err
+		}
+	}
+	// FLAGS updates for existing messages.
+	for uid, m := range cur {
+		o, ok := old[uid]
+		if !ok || sameFlags(o, m) {
+			continue
+		}
+		if seq, ok := oldSeq[uid]; ok {
+			if err := w.WriteMessageFlags(seq, imap.UID(uid), imapFlags(m.Flags)); err != nil {
+				return err
+			}
+		}
+	}
+	// EXPUNGEs (descending sequence order, RFC 3501).
+	if allowExpunge {
+		var removed []uint32
+		for uid := range old {
+			if _, ok := cur[uid]; !ok {
+				removed = append(removed, uid)
+			}
+		}
+		sort.Slice(removed, func(i, j int) bool { return oldSeq[removed[i]] > oldSeq[removed[j]] })
+		for _, uid := range removed {
+			if err := w.WriteExpunge(oldSeq[uid]); err != nil {
+				return err
+			}
+		}
+	}
+	s.snap = current
+	return nil
+}
+
+func (s *session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return nil
+		case <-ticker.C:
+			if err := s.Poll(w, true); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// refreshSnapshot re-reads the selected mailbox after commands that changed
+// it (STORE/EXPUNGE/MOVE/FETCH-with-\Seen), so Poll does not echo the
+// session's own changes back at it.
+func (s *session) refreshSnapshot(ctx context.Context) error {
+	if s.mbox == "" {
+		return nil
+	}
+	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	if err != nil {
+		return err
+	}
+	s.snap = msgs
+	return nil
+}
+
+func sameFlags(a, b *mailstore.Message) bool {
+	if len(a.Flags) != len(b.Flags) || len(a.Keywords) != len(b.Keywords) {
+		return false
+	}
+	return flagSetEqual(a.Flags, b.Flags) && flagSetEqual(a.Keywords, b.Keywords)
+}
+
+func flagSetEqual(a, b []string) bool {
+	seen := map[string]bool{}
+	for _, f := range a {
+		seen[f] = true
+	}
+	for _, f := range b {
+		if !seen[f] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *session) Namespace() (*imap.NamespaceData, error) {
+	return &imap.NamespaceData{
+		Personal: []imap.NamespaceDescriptor{{Delim: mailboxDelim}},
+	}, nil
+}
+
+func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
+	ctx := context.Background()
+	var uidList []uint32
+	if uids != nil {
+		for _, r := range *uids {
+			for u := r.Start; u <= r.Stop; u++ {
+				uidList = append(uidList, uint32(u))
+			}
+		}
+	}
+	// Sequence numbers must be relative to the selected snapshot.
+	before, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	if err != nil {
+		return err
+	}
+	seqOf := map[uint32]uint32{}
+	for i, msg := range before {
+		seqOf[msg.UID] = uint32(i) + 1
+	}
+	deleted, err := s.srv.Store.Expunge(ctx, s.user, s.mbox, uidList)
+	if err != nil {
+		return err
+	}
+	if len(deleted) > 0 {
+		if err := s.refreshSnapshot(ctx); err != nil {
+			return err
+		}
+		if s.srv.FTS != nil {
+			for _, uid := range deleted {
+				if err := s.srv.FTS.DeleteMessage(ctx, s.user, s.mbox, uid); err != nil {
+					s.srv.Logger.Error("imap: fts delete", "mailbox", s.mbox, "uid", uid, "err", err)
+				}
+			}
+		}
+	}
+	// RFC 3501: expunge responses in descending sequence order.
+	for i := len(deleted) - 1; i >= 0; i-- {
+		if seq, ok := seqOf[deleted[i]]; ok {
+			if err := w.WriteExpunge(seq); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) {
+	ctx := context.Background()
+	uids, err := s.resolveUIDs(ctx, numSet)
+	if err != nil {
+		return nil, err
+	}
+	mapping, err := s.srv.Store.Copy(ctx, s.user, s.mbox, dest, uids)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
+		}
+		return nil, err
+	}
+	st, err := s.srv.Store.MailboxStatus(ctx, s.user, dest)
+	if err != nil {
+		return nil, err
+	}
+	data := &imap.CopyData{UIDValidity: st.UIDValidity}
+	for src, dst := range mapping {
+		data.SourceUIDs.AddNum(imap.UID(src))
+		data.DestUIDs.AddNum(imap.UID(dst))
+		s.learnCopyMove(ctx, s.mbox, dest, src, dst)
+		s.indexCopyMove(ctx, s.mbox, dest, src, dst, false)
+	}
+	return data, nil
+}
+
+func (s *session) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string) error {
+	ctx := context.Background()
+	uids, err := s.resolveUIDs(ctx, numSet)
+	if err != nil {
+		return err
+	}
+	before, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	if err != nil {
+		return err
+	}
+	seqOf := map[uint32]uint32{}
+	for i, msg := range before {
+		seqOf[msg.UID] = uint32(i) + 1
+	}
+	mapping, err := s.srv.Store.Move(ctx, s.user, s.mbox, dest, uids)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
+		}
+		return err
+	}
+	if len(mapping) > 0 {
+		if err := s.refreshSnapshot(ctx); err != nil {
+			return err
+		}
+	}
+	st, err := s.srv.Store.MailboxStatus(ctx, s.user, dest)
+	if err != nil {
+		return err
+	}
+	data := &imap.CopyData{UIDValidity: st.UIDValidity}
+	var moved []uint32
+	for src, dst := range mapping {
+		data.SourceUIDs.AddNum(imap.UID(src))
+		data.DestUIDs.AddNum(imap.UID(dst))
+		moved = append(moved, src)
+		s.learnCopyMove(ctx, s.mbox, dest, src, dst)
+		s.indexCopyMove(ctx, s.mbox, dest, src, dst, true)
+	}
+	if err := w.WriteCopyData(data); err != nil {
+		return err
+	}
+	sortUint32(moved)
+	for i := len(moved) - 1; i >= 0; i-- {
+		if seq, ok := seqOf[moved[i]]; ok {
+			if err := w.WriteExpunge(seq); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// resolveUIDs converts a seq/UID set into the concrete UIDs of the selected
+// mailbox.
+func (s *session) resolveUIDs(ctx context.Context, numSet imap.NumSet) ([]uint32, error) {
+	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	if err != nil {
+		return nil, err
+	}
+	var uids []uint32
+	switch ns := numSet.(type) {
+	case imap.SeqSet:
+		for i, msg := range msgs {
+			if ns.Contains(uint32(i) + 1) {
+				uids = append(uids, msg.UID)
+			}
+		}
+	case imap.UIDSet:
+		for _, msg := range msgs {
+			if ns.Contains(imap.UID(msg.UID)) {
+				uids = append(uids, msg.UID)
+			}
+		}
+	default:
+		return nil, fmt.Errorf("imap: unsupported num set %T", numSet)
+	}
+	return uids, nil
+}
+
+func statusData(mb *mailstore.Mailbox, options *imap.StatusOptions) *imap.StatusData {
+	data := imap.StatusData{Mailbox: mb.Name}
+	if options.NumMessages {
+		n := mb.NumMessages
+		data.NumMessages = &n
+	}
+	if options.UIDNext {
+		data.UIDNext = imap.UID(mb.UIDNext)
+	}
+	if options.UIDValidity {
+		data.UIDValidity = mb.UIDValidity
+	}
+	if options.NumUnseen {
+		n := mb.NumUnseen
+		data.NumUnseen = &n
+	}
+	if options.NumDeleted {
+		n := mb.NumDeleted
+		data.NumDeleted = &n
+	}
+	if options.Size {
+		n := mb.Size
+		data.Size = &n
+	}
+	if options.NumRecent {
+		n := uint32(0)
+		data.NumRecent = &n
+	}
+	return &data
+}
+
+func sortUint32(s []uint32) {
+	for i := 1; i < len(s); i++ {
+		for j := i; j > 0 && s[j] < s[j-1]; j-- {
+			s[j], s[j-1] = s[j-1], s[j]
+		}
+	}
+}

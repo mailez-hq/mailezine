@@ -1,0 +1,8 @@
+/bin/
+/data/
+.e2e-data/
+deploy/scripts/ci-env/go.tar.gz
+*.exe
+*.env
+*.pem
+*.key

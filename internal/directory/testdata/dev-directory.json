@@ -1,0 +1,25 @@
+{
+  "users": {
+    "alice@example.com": {
+      "email": "alice@example.com",
+      "enabled": true,
+      "quotaBytes": 1073741824,
+      "quotaBytesUsed": 0,
+      "forwardEnabled": false,
+      "forwardKeep": false,
+      "forwardTargets": [],
+      "recipientDelimiter": "+"
+    }
+  },
+  "domains": ["example.com"],
+  "aliases": {
+    "team@example.com": ["alice@example.com"]
+  },
+  "relays": {},
+  "senders": {
+    "alice@example.com": ["alice@example.com"]
+  },
+  "sieve": {
+    "alice@example.com": "require \"fileinto\";\nif header :contains \"Subject\" \"spam\" { fileinto \"Junk\"; }\n"
+  }
+}

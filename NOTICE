@@ -1,0 +1,18 @@
+mailezine 第三方组件合规声明
+
+mailezine 复用以下 MIT 许可开源组件（版权归各自作者，MIT 许可全文见各包
+目录内 LICENSE 或模块缓存）。peer engine（github.com/mjl-/peer engine）已彻底移除（D43/D44），
+生产与测试代码均无 mjl-/ 依赖。
+
+- github.com/emersion/go-msgauth（MIT）：dkim（RFC 6376 签名/校验）、
+  authres（RFC 8601 Authentication-Results 生成）、dmarc（RFC 7489 记录
+  解析）。
+- github.com/emersion/go-imap/v2（MIT）：imapserver/imapwire/imapnum/utf7
+  及其 internal 辅助包，已 vendor 进 internal/ 并加扩展钩子（见
+  internal/imapserver/README.md）；go-imap v1（测试依赖，客户端矩阵驱动）。
+- github.com/miekg/dns（BSD-3-Clause）：TLSA 记录查询（internal/maildns）。
+- github.com/emersion/go-smtp、go-message、go-sasl、foxcpp/go-sieve、
+  minio/minio-go、cockroachdb/pebble、linxGnu/grocksdb、
+  prometheus/client_golang 等：go.mod 固定版本依赖。
+
+reference server（AGPL-3.0）仅作为架构/数据模型参考，未引入任何代码。

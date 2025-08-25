@@ -1,0 +1,448 @@
+// Package delivery implements the inbound pipeline (ARCHITECTURE.md §4):
+// resolve recipients through the directory, enforce quotas and store one
+// copy per local target. Verification (SPF/DKIM/DMARC) and spam filtering
+// run before storage: verify → classify → deliver.
+package delivery
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"reflect"
+	"strings"
+	"sync"
+	"time"
+
+	"mailezine/internal/directory"
+	"mailezine/internal/fts"
+	"mailezine/internal/mailstore"
+	"mailezine/internal/sieve"
+	"mailezine/internal/spam"
+)
+
+// ErrQuota is returned when storing a copy would exceed the account quota.
+var ErrQuota = errors.New("delivery: quota exceeded")
+
+// SMTP rejection outcomes produced by the spam stage. The SMTP layer maps
+// these to 554 (reject), 451 (greylist/soft reject) responses so the
+// message is never stored.
+var (
+	ErrReject     = errors.New("delivery: message rejected by spam filter")
+	ErrSoftReject = errors.New("delivery: message temporarily rejected by spam filter")
+	ErrGreylist   = errors.New("delivery: message greylisted, retry later")
+	// ErrSieveReject is returned when a Sieve reject/ereject action refuses
+	// the message (RFC 5429); the SMTP layer maps it to 550.
+	ErrSieveReject = errors.New("delivery: message rejected by sieve script")
+)
+
+// Verifier adds authentication results (SPF/DKIM/DMARC) to inbound messages.
+type Verifier interface {
+	Verify(ctx context.Context, peer net.IP, from string, data []byte) (header string, err error)
+}
+
+// Classifier scans an inbound message and returns headers to prepend plus an
+// action. spam.Client satisfies it.
+type Classifier interface {
+	Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (spam.Result, error)
+}
+
+// Pipeline resolves and stores inbound messages.
+type Pipeline struct {
+	Directory    directory.Service
+	Store        mailstore.Store
+	Verifier     Verifier           // optional
+	Classifier   Classifier         // optional; nil disables scanning
+	Sieve        *sieve.Engine      // optional; nil keeps INBOX
+	ScriptSource sieve.ScriptSource // optional; defaults to Directory.Sieve
+	Hostname     string             // our hostname for the Received header
+	FTS          *fts.Indexer       // optional full-text index
+	// Redirect forwards a copy to an external address (sieve redirect);
+	// implementations spool into the outbound queue. When nil, redirects
+	// are logged and skipped (the local copy still applies).
+	Redirect func(ctx context.Context, from, to string, data []byte) error
+	Logger   *slog.Logger
+
+	vacationMu   sync.Mutex
+	vacationLast map[string]time.Time // "account\x00sender" -> last auto-reply
+}
+
+// Deliver stores one copy per resolved local target. Aliases expand through
+// the directory; external targets are rejected by the SMTP layer until relay
+// routing lands. Verification and classification happen before storage;
+// Authentication-Results and spam headers are prepended to the stored copy.
+func (p *Pipeline) Deliver(ctx context.Context, peer net.IP, from string, to []string, data []byte) error {
+	if p.Logger == nil {
+		p.Logger = slog.Default()
+	}
+	stored := data
+	headers := []string{receivedHeader(p.Hostname, peer)}
+	if !hasHeader(data, "Message-ID") {
+		host := p.Hostname
+		if host == "" {
+			host = "mailezine"
+		}
+		headers = append(headers, fmt.Sprintf("Message-ID: <%s.%s@%s>",
+			time.Now().Format("20060102150405"), newMessageID(), host))
+	}
+	if p.Verifier != nil {
+		if header, err := p.Verifier.Verify(ctx, peer, from, data); err != nil {
+			p.Logger.Warn("delivery: verify", "from", from, "err", err)
+		} else if header != "" {
+			headers = append(headers, header)
+		}
+	}
+	if !classifierNil(p.Classifier) {
+		res, err := p.Classifier.Classify(ctx, peer, from, to, data)
+		if err != nil {
+			// Fail-open (decision D5): an unreachable classifier must not
+			// stop mail. The missing mark is visible in metrics.
+			p.Logger.Warn("delivery: classify", "from", from, "err", err)
+		} else {
+			switch res.Action {
+			case "reject":
+				return ErrReject
+			case "soft reject":
+				return ErrSoftReject
+			case "greylist":
+				return ErrGreylist
+			}
+			headers = append(headers, res.Headers...)
+			if !headersContain(headers, "X-Spam-Level") {
+				// rspamd's header set is configurable; the Sieve spamtest
+				// extension reads X-Spam-Level, so synthesize it from the
+				// score when the scanner did not provide it.
+				level := int(res.Score)
+				if level < 0 {
+					level = 0
+				}
+				headers = append(headers, "X-Spam-Level: "+strings.Repeat("*", level))
+			}
+		}
+	}
+	if len(headers) > 0 {
+		stored = prependHeaders(headers, data)
+	}
+	for _, rcpt := range to {
+		if err := p.deliverTo(ctx, rcpt, from, stored, data); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// hasHeader reports whether the message header block contains the field.
+func hasHeader(data []byte, key string) bool {
+	key = strings.ToLower(key) + ":"
+	block := string(data)
+	if i := strings.Index(block, "\r\n\r\n"); i >= 0 {
+		block = block[:i]
+	}
+	for _, line := range strings.Split(block, "\r\n") {
+		if strings.HasPrefix(strings.ToLower(line), key) {
+			return true
+		}
+	}
+	return false
+}
+
+// headersContain reports whether the "Name: value" header list has the field.
+func headersContain(headers []string, key string) bool {
+	key = strings.ToLower(key) + ":"
+	for _, h := range headers {
+		if strings.HasPrefix(strings.ToLower(h), key) {
+			return true
+		}
+	}
+	return false
+}
+
+// applyHeaderEdits applies RFC 5293 editheader actions to the message being
+// stored: deletes first, then adds (a delete+add pair is a "replace").
+func applyHeaderEdits(data []byte, res sieve.Result) []byte {
+	if len(res.DeleteHeaders) == 0 && len(res.AddHeaders) == 0 {
+		return data
+	}
+	block := string(data)
+	body := ""
+	if i := strings.Index(block, "\r\n\r\n"); i >= 0 {
+		body = block[i:]
+		block = block[:i]
+	}
+	lines := strings.Split(block, "\r\n")
+	del := map[string][]string{} // lower name -> values to match (nil = all)
+	for _, e := range res.DeleteHeaders {
+		if e.Delete {
+			var vals []string
+			if e.Value != "" {
+				vals = strings.Split(e.Value, ",")
+			}
+			del[strings.ToLower(e.Name)] = vals
+		}
+	}
+	var kept []string
+	for _, line := range lines {
+		name := line
+		if i := strings.IndexByte(line, ':'); i >= 0 {
+			name = line[:i]
+		}
+		vals, ok := del[strings.ToLower(name)]
+		if !ok {
+			kept = append(kept, line)
+			continue
+		}
+		if vals == nil {
+			continue // delete every instance
+		}
+		value := strings.TrimSpace(line[len(name)+1:])
+		matched := false
+		for _, v := range vals {
+			if strings.TrimSpace(v) == value {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			kept = append(kept, line)
+		}
+	}
+	for _, e := range res.AddHeaders {
+		kept = append(kept, e.Name+": "+e.Value)
+	}
+	return []byte(strings.Join(kept, "\r\n") + body)
+}
+
+// sendVacation generates an RFC 5230 auto-reply and hands it to the outbound
+// path with a null envelope sender (RFC 5321: no DSN for auto-replies, and
+// the null sender prevents loops). A per-recipient :days throttle is kept in
+// memory; the "Auto-Submitted" presence check stops reply storms.
+func (p *Pipeline) sendVacation(ctx context.Context, account, from string, to []string, data []byte, v *sieve.Vacation) error {
+	if p.Redirect == nil {
+		p.Logger.Warn("delivery: vacation skipped (no outbound queue)", "account", account, "to", from)
+		return nil
+	}
+	if hasHeader(data, "Auto-Submitted") || hasHeader(data, "X-Auto-Response-Suppress") {
+		return nil
+	}
+	if from == "" {
+		return nil // never reply to the null sender
+	}
+	days := v.Days
+	if days <= 0 {
+		days = 7
+	}
+	key := account + "\x00" + from
+	// Persisted throttle when the store supports it; otherwise fall back
+	// to the in-memory map (still prevents same-process storms).
+	var last time.Time
+	if vs, ok := p.Store.(mailstore.VacationStateStore); ok {
+		var err error
+		last, err = vs.VacationLastSent(ctx, account, from)
+		if err != nil {
+			p.Logger.Warn("delivery: vacation state read", "account", account, "err", err)
+		}
+	} else {
+		p.vacationMu.Lock()
+		last = p.vacationLast[key]
+		p.vacationMu.Unlock()
+	}
+	if !last.IsZero() && time.Since(last) < time.Duration(days)*24*time.Hour {
+		return nil
+	}
+	now := time.Now()
+	if vs, ok := p.Store.(mailstore.VacationStateStore); ok {
+		if err := vs.SetVacationLastSent(ctx, account, from, now); err != nil {
+			p.Logger.Warn("delivery: vacation state write", "account", account, "err", err)
+		}
+	} else {
+		p.vacationMu.Lock()
+		if p.vacationLast == nil {
+			p.vacationLast = map[string]time.Time{}
+		}
+		p.vacationLast[key] = now
+		p.vacationMu.Unlock()
+	}
+
+	sender := v.From
+	if sender == "" {
+		sender = account
+	}
+	subject := v.Subject
+	if subject == "" {
+		subject = "Re: your message"
+	}
+	reply := fmt.Sprintf("Auto-Submitted: auto-replied\r\n"+
+		"X-Auto-Response-Suppress: All\r\n"+
+		"From: %s\r\n"+
+		"To: %s\r\n"+
+		"Subject: %s\r\n"+
+		"Date: %s\r\n\r\n%s\r\n",
+		sender, from, subject, time.Now().Format(time.RFC1123Z), v.Body)
+	p.Logger.Debug("delivery: vacation reply", "account", account, "to", from, "days", days)
+	return p.Redirect(ctx, "", from, []byte(reply))
+}
+
+// receivedHeader builds the RFC 5321 §4.4 Received trace of this MTA. The
+// HELO identity is not surfaced by go-smtp, so the peer IP stands in.
+func receivedHeader(hostname string, peer net.IP) string {
+	if hostname == "" {
+		hostname = "unknown"
+	}
+	ip := "unknown"
+	if peer != nil {
+		ip = peer.String()
+	}
+	return fmt.Sprintf("Received: from %s by %s (mailezine) with SMTP id %s; %s",
+		ip, hostname, newMessageID(), time.Now().Format(time.RFC1123Z))
+}
+
+func newMessageID() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "000000000000"
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// classifierNil reports whether c is nil or a typed nil pointer. Storing a
+// nil *spam.Client in the interface field would otherwise panic at call time
+// instead of degrading to fail-open.
+func classifierNil(c Classifier) bool {
+	if c == nil {
+		return true
+	}
+	v := reflect.ValueOf(c)
+	switch v.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Ptr, reflect.Slice:
+		return v.IsNil()
+	}
+	return false
+}
+
+func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw []byte) error {
+	targets, err := p.Directory.Aliases(ctx, rcpt)
+	if err != nil {
+		return fmt.Errorf("delivery: resolve %s: %w", rcpt, err)
+	}
+	for _, target := range targets {
+		size := int64(len(raw))
+		if err := p.checkQuota(ctx, target, size); err != nil {
+			return err
+		}
+		mailboxes := []string{"INBOX"}
+		var sieveRes sieve.Result
+		if p.Sieve != nil {
+			script, ok, serr := p.activeScript(ctx, target)
+			if serr != nil {
+				p.Logger.Warn("delivery: sieve fetch", "account", target, "err", serr)
+			} else if ok {
+				res, rerr := p.Sieve.Route(ctx, script, from, targets, stored)
+				sieveRes = res
+				if rerr != nil {
+					// A broken script must never lose mail: keep INBOX.
+					p.Logger.Warn("delivery: sieve run", "account", target, "err", rerr)
+				} else if res.Discard {
+					p.Logger.Debug("delivery: sieve discard", "account", target)
+					continue
+				} else if res.Reject != "" {
+					p.Logger.Info("delivery: sieve reject", "account", target, "reason", res.Reject)
+					return fmt.Errorf("%w: %s", ErrSieveReject, res.Reject)
+				} else if len(res.Mailboxes) > 0 {
+					mailboxes = res.Mailboxes
+				}
+				for _, addr := range res.Redirects {
+					if p.Redirect == nil {
+						p.Logger.Warn("delivery: sieve redirect skipped (no queue)",
+							"account", target, "to", addr)
+						continue
+					}
+					if err := p.Redirect(ctx, from, addr, stored); err != nil {
+						p.Logger.Error("delivery: sieve redirect", "account", target, "to", addr, "err", err)
+					}
+				}
+				if res.Vacation != nil {
+					if err := p.sendVacation(ctx, target, from, targets, stored, res.Vacation); err != nil {
+						p.Logger.Error("delivery: vacation", "account", target, "to", from, "err", err)
+					}
+				}
+			}
+		}
+		finalData := applyHeaderEdits(stored, sieveRes)
+		for _, mailbox := range mailboxes {
+			msg := &mailstore.Message{
+				From:         from,
+				To:           targets,
+				Data:         finalData,
+				InternalDate: time.Now(),
+			}
+			uid, err := p.Store.Deliver(ctx, target, mailbox, msg)
+			if err != nil {
+				return fmt.Errorf("delivery: store to %s/%s: %w", target, mailbox, err)
+			}
+			if p.FTS != nil {
+				if err := p.FTS.IndexMessage(ctx, target, mailbox, uid, finalData); err != nil {
+					// Indexing must never lose mail.
+					p.Logger.Warn("delivery: fts index", "account", target, "mailbox", mailbox, "err", err)
+				}
+			}
+		}
+		p.reportQuota(ctx, target)
+		p.Logger.Debug("delivered", "to", target, "mailboxes", mailboxes, "bytes", size)
+	}
+	return nil
+}
+
+// activeScript resolves the script to run for one account.
+func (p *Pipeline) activeScript(ctx context.Context, target string) (string, bool, error) {
+	if p.ScriptSource != nil {
+		return p.ScriptSource.ActiveSieveScript(ctx, target)
+	}
+	script, err := p.Directory.Sieve(ctx, target)
+	if err != nil {
+		return "", false, err
+	}
+	return script.Script, script.Script != "", nil
+}
+
+// prependHeaders joins header lines (ending in CRLF) and places them before
+// the message body. rspamd header values are already unfolded.
+func prependHeaders(headers []string, data []byte) []byte {
+	var sb strings.Builder
+	for _, h := range headers {
+		sb.WriteString(h)
+		if !strings.HasSuffix(h, "\r\n") {
+			sb.WriteString("\r\n")
+		}
+	}
+	out := make([]byte, 0, sb.Len()+len(data))
+	out = append(out, sb.String()...)
+	return append(out, data...)
+}
+
+func (p *Pipeline) checkQuota(ctx context.Context, target string, size int64) error {
+	q, err := p.Directory.Quota(ctx, target)
+	if err != nil {
+		return nil // no quota rule: not enforced
+	}
+	used, err := p.Store.QuotaUsedBytes(ctx, target)
+	if err != nil {
+		return err
+	}
+	if q.Limit > 0 && used+size > q.Limit {
+		p.Logger.Warn("quota exceeded", "account", target, "used", used, "limit", q.Limit)
+		return ErrQuota
+	}
+	return nil
+}
+
+// reportQuota writes the used quota back to the control plane (best effort).
+func (p *Pipeline) reportQuota(ctx context.Context, target string) {
+	used, err := p.Store.QuotaUsedBytes(ctx, target)
+	if err != nil {
+		return
+	}
+	_ = p.Directory.UpdateQuotaUsed(ctx, target, used)
+}
