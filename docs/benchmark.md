@@ -47,15 +47,27 @@
 
 ## 4. 环境
 
+### 共享控制面（两栈共用，不属任一引擎）
+
+- mailez backend（**MySQL 8.0 生产形态** + Redis，10k 用户 seed）
+  - 开发默认 SQLite；基准按生产配置使用 MySQL（`DB_DRIVER=mysql`）。
+  - backend 是两栈共同的目录/认证控制面：postdove 的 gateway/legacy IMAP/
+    legacy MTA 通过 `/stack/*` 内部 API 认证与查目录；mailezine 以
+    `MAILEZINE_DIRECTORY_MODE=mailez` / `MAILEZINE_AUTH_MODE=mailez`
+    消费同一套 API。
+  - Redis 由 backend 用于会话/限流，同样为共享控制面依赖。
+- 消息存储隔离：postdove 用 maildir volume，mailezine 用 Pebble KV +
+  MinIO blob（S3）。
+
 ### postdove（社区版）
 
-- mailez backend（sqlite + Redis，10k 用户 seed）
-- nginx gateway + legacy MTA + legacy IMAP（maildir）+ redis
+- nginx gateway + legacy MTA + legacy IMAP（maildir）
+- 目录/认证走共享 backend（MySQL + Redis）
 - 无 rspamd（隔离引擎差异；rspamd 为共享组件）
 
 ### mailezine（企业版）
 
-- mailezine 单容器（dev 目录桩，10k 用户）
+- mailezine 单容器（mailez 目录/认证模式，10k 用户）
 - Pebble KV + MinIO blob（S3）
 - 无 rspamd（与 postdove 对称）
 
@@ -63,16 +75,22 @@
 
 ## 5. 测试工具
 
-`cmd/bench`（仓库内，可复现）：
+`cmd/bench`（仓库内，可复现）。flag 可写在子命令前或后（`bench seed
+-conns 20` 与 `bench -conns 20 seed` 等价）：
 
 - `seed`：IMAP/SMTP 灌信到本地域
 - `smtp`：并发认证提交（per-connection 一封）
 - `imap`：并发登录 + SELECT + FETCH 采样
-- `queue`：并发提交外部收件人 → mock MX 记录接收
+- `queue`：并发提交外部收件人 → 内置 mock MX 记录接收，按 Message-ID
+  关联入队→投递延迟，采样滞留队列深度
 - `stats`：docker stats / /proc 采样（内存 RSS、块 IO）
 
 ## 6. 可复现性
 
 - 固定镜像 tag（mailez/*:local）
 - 固定随机种子（收件人/大小分布）
+- 多用户轮询（`-users`）：认证提交/IMAP 会话按用户循环，避免
+  legacy IMAP `mail_max_userip_connections` 与 backend 每用户发信限流
+  把并发测试打成单用户伪瓶颈；`-seq` 让灌信收件人顺序轮询，保证
+  IMAP FETCH 每个会话都有真实邮件可读。
 - 输出原始数据 + 汇总表

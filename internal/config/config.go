@@ -155,6 +155,11 @@ type RspamdConfig struct {
 type OutboundConfig struct {
 	Enabled bool
 	Port    int // delivery port for remote MXes, default 25
+	// FixedHost/FixedPort relay every outbound message to one smarthost,
+	// skipping MX resolution (equivalent to legacy MTA relayhost). Empty
+	// FixedHost keeps direct MX delivery.
+	FixedHost string
+	FixedPort int
 	// SmarthostUsername/Password enable SASL AUTH when delivering through
 	// a configured smarthost (directory relay transport "smtp:[host]").
 	SmarthostUsername string
@@ -319,6 +324,8 @@ func Load() (Config, error) {
 		Outbound: OutboundConfig{
 			Enabled:           envBool("MAILEZINE_OUTBOUND_ENABLED", true),
 			Port:              envInt("MAILEZINE_OUTBOUND_PORT", 25),
+			FixedHost:         getenv("MAILEZINE_OUTBOUND_FIXED_HOST", ""),
+			FixedPort:         envInt("MAILEZINE_OUTBOUND_FIXED_PORT", 0),
 			SmarthostUsername: getenv("MAILEZINE_OUTBOUND_SMTP_USERNAME", ""),
 			SmarthostPassword: getenv("MAILEZINE_OUTBOUND_SMTP_PASSWORD", ""),
 		},

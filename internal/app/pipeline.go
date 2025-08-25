@@ -26,12 +26,14 @@ func (a *App) wireQueue() error {
 	}
 	dnsResolver := maildns.NewSystemResolver()
 	directDeliverer := &queue.SMTPDeliverer{
-		Logger:   a.logger,
-		Hostname: a.cfg.Hostname,
-		Resolver: net.DefaultResolver,
-		Port:     a.cfg.Outbound.Port,
-		Username: a.cfg.Outbound.SmarthostUsername,
-		Password: a.cfg.Outbound.SmarthostPassword,
+		Logger:    a.logger,
+		Hostname:  a.cfg.Hostname,
+		Resolver:  net.DefaultResolver,
+		Port:      a.cfg.Outbound.Port,
+		FixedHost: a.cfg.Outbound.FixedHost,
+		FixedPort: a.cfg.Outbound.FixedPort,
+		Username:  a.cfg.Outbound.SmarthostUsername,
+		Password:  a.cfg.Outbound.SmarthostPassword,
 		// MTA-STS/DANE policy for outbound TLS (opportunistic fallback).
 		PolicyResolver: dnsResolver,
 		MTSTS:          mailmtasts.NewFetcher(),
