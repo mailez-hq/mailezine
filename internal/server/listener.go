@@ -6,6 +6,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -71,7 +72,8 @@ type Listener struct {
 	Name          string
 	Addr          string
 	MaxConn       int
-	ProxyProtocol bool // expect a PROXY v1 header on every connection
+	ProxyProtocol bool        // expect a PROXY v1 header on every connection
+	TLSConfig     *tls.Config // optional: serve implicit TLS (RFC 8314)
 	Logger        *slog.Logger
 	Handler       Handler
 }
@@ -102,7 +104,7 @@ func (l *Listener) ServeListener(ctx context.Context, ln net.Listener) error {
 	if l.Logger == nil {
 		l.Logger = slog.Default()
 	}
-	l.Logger.Info("listening", "component", l.Name, "addr", ln.Addr().String())
+	l.Logger.Info("listening", "component", l.Name, "addr", ln.Addr().String(), "tls", l.TLSConfig != nil)
 
 	go func() {
 		<-ctx.Done()
@@ -141,6 +143,11 @@ func (l *Listener) ServeListener(ctx context.Context, ln net.Listener) error {
 					return
 				}
 				c = wrapped
+			}
+			// PROXY header (plaintext) precedes TLS: wrap after it is
+			// consumed so implicit-TLS ports can sit behind a gateway/LB.
+			if l.TLSConfig != nil {
+				c = tls.Server(c, l.TLSConfig)
 			}
 			sessionID := newSessionID()
 			l.Logger.Debug("connection open", "component", l.Name, "session", sessionID)

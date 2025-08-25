@@ -2,9 +2,18 @@ package server
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"errors"
 	"io"
 	"log/slog"
+	"math/big"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -157,4 +166,81 @@ func TestLimitListenerBackpressure(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("second connection not accepted after slot release")
 	}
+}
+
+func TestListenerImplicitTLSAfterProxy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cert, err := testCert()
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &Listener{
+		Name:          "test",
+		Addr:          "127.0.0.1:0",
+		MaxConn:       4,
+		ProxyProtocol: true,
+		TLSConfig:     &tls.Config{Certificates: []tls.Certificate{cert}},
+		Logger:        discardLogger(),
+		Handler: func(_ context.Context, conn net.Conn) error {
+			if _, ok := conn.(*tls.Conn); !ok {
+				return errors.New("handler did not receive a TLS connection")
+			}
+			_, err := conn.Write([]byte("secure\n"))
+			return err
+		},
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- l.ServeListener(ctx, ln) }()
+
+	// The PROXY v1 header is plaintext and must precede the TLS handshake.
+	raw, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Write([]byte("PROXY TCP4 203.0.113.9 10.0.0.1 4242 143\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	tlsConn := tls.Client(raw, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	defer tlsConn.Close()
+	buf := make([]byte, 7) // "secure\n"
+	if _, err := io.ReadFull(tlsConn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(buf), "secure") {
+		t.Fatalf("handler reply = %q", buf)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+	}
+}
+
+func testCert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, nil
 }

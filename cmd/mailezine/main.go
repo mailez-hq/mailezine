@@ -424,17 +424,34 @@ func runCtx(ctx context.Context, args []string) int {
 	proxySMTP := proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTP)
 	proxySubmission := proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.Submission)
 	proxyIMAP := proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAP)
-	if err := serveSMTP(ctx, smtpInbound, cfg.Listeners.SMTP, cfg.Limits.MaxConnections, proxySMTP, logger); err != nil {
+	if err := serveSMTP(ctx, smtpInbound, cfg.Listeners.SMTP, cfg.Limits.MaxConnections, proxySMTP, nil, logger); err != nil {
 		logger.Error("listen", "component", "smtp", "addr", cfg.Listeners.SMTP, "err", err)
 		return 2
 	}
-	if err := serveSMTP(ctx, smtpSubmission, cfg.Listeners.Submission, cfg.Limits.MaxConnections, proxySubmission, logger); err != nil {
+	if err := serveSMTP(ctx, smtpSubmission, cfg.Listeners.Submission, cfg.Limits.MaxConnections, proxySubmission, nil, logger); err != nil {
 		logger.Error("listen", "component", "submission", "addr", cfg.Listeners.Submission, "err", err)
 		return 2
 	}
-	if err := serveTCP(ctx, imapSrv, "imap", cfg.Listeners.IMAP, cfg.Limits.MaxConnections, proxyIMAP, logger); err != nil {
+	if err := serveTCP(ctx, imapSrv, "imap", cfg.Listeners.IMAP, cfg.Limits.MaxConnections, proxyIMAP, nil, logger); err != nil {
 		logger.Error("listen", "component", "imap", "addr", cfg.Listeners.IMAP, "err", err)
 		return 2
+	}
+	// Implicit-TLS variants (RFC 8314): submissions:465 / imaps:993 /
+	// pop3s:995. The engine terminates TLS itself, so no gateway is needed
+	// in front of these ports (the reference server deployment model).
+	if cfg.Listeners.SMTPS != "" && tlsConf != nil {
+		if err := serveSMTP(ctx, smtpSubmission, cfg.Listeners.SMTPS, cfg.Limits.MaxConnections,
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTPS), tlsConf, logger); err != nil {
+			logger.Error("listen", "component", "smtps", "addr", cfg.Listeners.SMTPS, "err", err)
+			return 2
+		}
+	}
+	if cfg.Listeners.IMAPS != "" && tlsConf != nil {
+		if err := serveTCP(ctx, imapSrv, "imaps", cfg.Listeners.IMAPS, cfg.Limits.MaxConnections,
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAPS), tlsConf, logger); err != nil {
+			logger.Error("listen", "component", "imaps", "addr", cfg.Listeners.IMAPS, "err", err)
+			return 2
+		}
 	}
 	msieve := &server.Listener{
 		Name:          "managesieve",
@@ -465,6 +482,22 @@ func runCtx(ctx context.Context, args []string) int {
 				logger.Error("pop3 server", "addr", cfg.Listeners.POP3, "err", err)
 			}
 		}()
+		if cfg.Listeners.POP3S != "" && tlsConf != nil {
+			pop3sL := &server.Listener{
+				Name:          "pop3s",
+				Addr:          cfg.Listeners.POP3S,
+				MaxConn:       cfg.Limits.MaxConnections,
+				ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.POP3S),
+				TLSConfig:     tlsConf,
+				Logger:        logger,
+				Handler:       pop3Srv.ServeConn,
+			}
+			go func() {
+				if err := pop3sL.Serve(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("pop3s server", "addr", cfg.Listeners.POP3S, "err", err)
+				}
+			}()
+		}
 	}
 
 	<-ctx.Done()
@@ -494,8 +527,9 @@ func runCtx(ctx context.Context, args []string) int {
 }
 
 // serveSMTP binds addr and serves; the server is drained in the shutdown
-// phase via Shutdown.
-func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int, proxy bool, logger *slog.Logger) error {
+// phase via Shutdown. A non-nil tlsConf turns the listener into implicit
+// TLS (RFC 8314 submissions port), negotiated before the first SMTP byte.
+func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int, proxy bool, tlsConf *tls.Config, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -504,6 +538,9 @@ func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int
 	var lim net.Listener = server.NewLimitListener(ln, maxConn)
 	if proxy {
 		lim = server.NewProxyListener(lim, logger)
+	}
+	if tlsConf != nil {
+		lim = tls.NewListener(lim, tlsConf)
 	}
 	go func() {
 		if err := srv.Serve(lim); err != nil && ctx.Err() == nil {
@@ -521,7 +558,8 @@ type tcpServer interface {
 }
 
 // serveTCP binds addr and serves a tcpServer (LimitListener backpressure).
-func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int, proxy bool, logger *slog.Logger) error {
+// A non-nil tlsConf turns the listener into implicit TLS (imaps port).
+func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int, proxy bool, tlsConf *tls.Config, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -530,6 +568,9 @@ func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int
 	var lim net.Listener = server.NewLimitListener(ln, maxConn)
 	if proxy {
 		lim = server.NewProxyListener(lim, logger)
+	}
+	if tlsConf != nil {
+		lim = tls.NewListener(lim, tlsConf)
 	}
 	go func() {
 		if err := srv.Serve(lim); err != nil && ctx.Err() == nil {

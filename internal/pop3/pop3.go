@@ -43,6 +43,9 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	r := bufio.NewReader(conn)
 	w := bufio.NewWriter(conn)
 	ses := &session{srv: s, conn: conn, r: r, w: w}
+	if _, ok := conn.(*tls.Conn); ok {
+		ses.tlsUp = true // implicit TLS (pop3s): no STLS needed
+	}
 	return ses.run(ctx)
 }
 

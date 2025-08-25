@@ -65,6 +65,12 @@ type ListenersConfig struct {
 	IMAP        string
 	ManageSieve string
 	POP3        string
+	// Implicit-TLS variants (RFC 8314 mode, the submissions/imaps/pop3s
+	// ports): TLS is negotiated before the first protocol byte. Empty
+	// disables; requires MAILEZINE_TLS_CERT_FILE/KEY_FILE.
+	SMTPS string
+	IMAPS string
+	POP3S string
 }
 
 // StorageConfig selects the storage backend (ARCHITECTURE.md §3).
@@ -255,6 +261,9 @@ func Load() (Config, error) {
 			IMAP:        getenv("MAILEZINE_IMAP_ADDR", ":1143"),
 			ManageSieve: getenv("MAILEZINE_MANAGESIEVE_ADDR", ":11490"),
 			POP3:        getenv("MAILEZINE_POP3_ADDR", ":10110"),
+			SMTPS:       getenv("MAILEZINE_SMTPS_ADDR", ""),
+			IMAPS:       getenv("MAILEZINE_IMAPS_ADDR", ""),
+			POP3S:       getenv("MAILEZINE_POP3S_ADDR", ""),
 		},
 		Storage: StorageConfig{
 			Backend:     getenv("MAILEZINE_STORAGE_BACKEND", "maildir"),

@@ -45,6 +45,9 @@ func (s *Server) ManageSieveSession(ctx context.Context, conn net.Conn) error {
 	w := bufio.NewWriter(conn)
 
 	ses := &mSession{srv: s, conn: conn, r: r, w: w}
+	if _, ok := conn.(*tls.Conn); ok {
+		ses.tlsUp = true // implicit TLS: no STARTTLS needed
+	}
 	if err := ses.writeCapabilities(); err != nil {
 		return err
 	}

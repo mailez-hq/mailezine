@@ -46,6 +46,22 @@ func TestValidate(t *testing.T) {
 			t.Fatal("expected error for unknown backend")
 		}
 	})
+	t.Run("implicit TLS addresses parsed", func(t *testing.T) {
+		t.Setenv("MAILEZINE_STORAGE_BACKEND", "pebble")
+		t.Setenv("MAILEZINE_ROCKS_PATH", "/data/rocks")
+		t.Setenv("MAILEZINE_DIRECTORY_FILE", "/data/directory.json")
+		t.Setenv("MAILEZINE_AUTH_DEV_FILE", "/data/passwords.json")
+		t.Setenv("MAILEZINE_SMTPS_ADDR", ":465")
+		t.Setenv("MAILEZINE_IMAPS_ADDR", ":993")
+		t.Setenv("MAILEZINE_POP3S_ADDR", ":995")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cfg.Listeners.SMTPS != ":465" || cfg.Listeners.IMAPS != ":993" || cfg.Listeners.POP3S != ":995" {
+			t.Fatalf("implicit TLS listeners: %+v", cfg.Listeners)
+		}
+	})
 	t.Run("dev directory requires file", func(t *testing.T) {
 		c := base()
 		c.Directory.File = ""

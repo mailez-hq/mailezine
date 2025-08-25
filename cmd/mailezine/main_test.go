@@ -14,6 +14,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -592,6 +593,122 @@ func TestEndToEndTLS(t *testing.T) {
 		t.Fatalf("imap fetch over TLS: %+v", fetched)
 	}
 	_ = imapClient.Logout().Wait()
+
+	cancel()
+	if code := waitExit(t, exit); code != 0 {
+		t.Fatalf("engine exit code = %d, want 0", code)
+	}
+}
+
+// TestEndToEndImplicitTLS verifies the RFC 8314 implicit-TLS ports
+// (submissions:465 / imaps:993 / pop3s:995): the engine terminates TLS
+// itself, STARTTLS/STLS are not advertised on those connections, and each
+// protocol authenticates and round-trips over the encrypted channel.
+func TestEndToEndImplicitTLS(t *testing.T) {
+	dir := t.TempDir()
+	dirFile := filepath.Join(dir, "directory.json")
+	authFile := filepath.Join(dir, "passwords.json")
+	rocksPath := filepath.Join(dir, "rocks")
+	writeDevFiles(t, dirFile, authFile)
+	certFile, keyFile := writeSelfSigned(t, dir)
+
+	healthAddr, smtpAddr, subAddr := "127.0.0.1:"+freePort(t), "127.0.0.1:"+freePort(t), "127.0.0.1:"+freePort(t)
+	smtpsAddr, imapsAddr, pop3sAddr := "127.0.0.1:"+freePort(t), "127.0.0.1:"+freePort(t), "127.0.0.1:"+freePort(t)
+	setTestEnv(t, dirFile, authFile, rocksPath, healthAddr, smtpAddr, subAddr, false, "")
+	t.Setenv("MAILEZINE_SMTPS_ADDR", smtpsAddr)
+	t.Setenv("MAILEZINE_IMAPS_ADDR", imapsAddr)
+	t.Setenv("MAILEZINE_POP3S_ADDR", pop3sAddr)
+	t.Setenv("MAILEZINE_TLS_CERT_FILE", certFile)
+	t.Setenv("MAILEZINE_TLS_KEY_FILE", keyFile)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	exit := startEngine(t, ctx)
+	waitHTTP(t, "http://"+healthAddr+"/health")
+
+	tlsConf := &tls.Config{InsecureSkipVerify: true}
+
+	// submissions:465 — implicit TLS, no STARTTLS advertised, AUTH works.
+	conn, err := tls.Dial("tcp", smtpsAddr, tlsConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := gosmtp.NewClient(conn)
+	if err := client.Hello("mail.mailez.test"); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := client.Extension("STARTTLS"); ok {
+		t.Fatal("SMTPS advertised STARTTLS inside TLS")
+	}
+	if err := client.Auth(sasl.NewPlainClient("", "alice@example.com", "s3cret")); err != nil {
+		t.Fatal(err)
+	}
+	body := "From: alice@example.com\r\nTo: alice@example.com\r\nSubject: implicit tls\r\n\r\nsecure body\r\n"
+	if err := smtpSend(client, "alice@example.com", []string{"alice@example.com"}, body); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.Close()
+
+	// imaps:993 — implicit TLS, no STARTTLS capability, LOGIN works.
+	imapClient, err := imapclient.DialTLS(imapsAddr, &imapclient.Options{TLSConfig: tlsConf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imapClient.Caps().Has(imap.CapStartTLS) {
+		t.Fatal("IMAPS advertised STARTTLS inside TLS")
+	}
+	if err := imapClient.Login("alice@example.com", "s3cret").Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := imapClient.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if err := imapClient.Logout().Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	// pop3s:995 — implicit TLS, no STLS capability, AUTH PLAIN works.
+	pop, err := tls.Dial("tcp", pop3sAddr, tlsConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pop.Close()
+	pr := bufio.NewReader(pop)
+	if line, err := pr.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("pop3s greeting: %q %v", line, err)
+	}
+	if _, err := fmt.Fprintf(pop, "CAPA\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	var capaLines []string
+	for {
+		line, err := pr.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		line = strings.TrimRight(line, "\r\n")
+		if line == "." {
+			break
+		}
+		capaLines = append(capaLines, line)
+	}
+	for _, c := range capaLines {
+		if c == "STLS" {
+			t.Fatal("POP3S advertised STLS inside TLS")
+		}
+	}
+	token := base64.StdEncoding.EncodeToString([]byte("\x00alice@example.com\x00s3cret"))
+	if _, err := fmt.Fprintf(pop, "AUTH PLAIN %s\r\n", token); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := pr.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("pop3s AUTH: %q %v", line, err)
+	}
+	if _, err := fmt.Fprintf(pop, "STAT\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if line, err := pr.ReadString('\n'); err != nil || !strings.HasPrefix(line, "+OK 1 ") {
+		t.Fatalf("pop3s STAT: %q %v", line, err)
+	}
 
 	cancel()
 	if code := waitExit(t, exit); code != 0 {
