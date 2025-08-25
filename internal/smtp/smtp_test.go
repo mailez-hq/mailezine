@@ -234,6 +234,31 @@ func TestTrustedRelayAccepted(t *testing.T) {
 	}
 }
 
+func TestRecipientDelimiter(t *testing.T) {
+	b, cap := testBackend(t, false)
+	b.RecipientDelimiter = "+"
+	client := startTestServer(t, b)
+	if err := sendMessage(t, client, "sender@remote.test", []string{"alice+tag@example.com"}, "Subject: plus\r\n\r\nbody\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	if cap.submits != 1 {
+		t.Fatalf("expected 1 submit, got %d", cap.submits)
+	}
+	if len(cap.to) != 1 || cap.to[0] != "alice@example.com" {
+		t.Fatalf("delimiter not stripped: %v", cap.to)
+	}
+}
+
+func TestRecipientDelimiterDisabled(t *testing.T) {
+	b, cap := testBackend(t, false)
+	if err := sendMessage(t, startTestServer(t, b), "sender@remote.test", []string{"alice+tag@example.com"}, "Subject: plus\r\n\r\nbody\r\n"); err == nil {
+		t.Fatal("unknown plus address accepted with delimiter disabled")
+	}
+	if cap.submits != 0 {
+		t.Fatalf("message submitted despite unknown recipient")
+	}
+}
+
 func TestUntrustedRelayDenied(t *testing.T) {
 	b, cap := testBackend(t, false)
 	b.AllowRelay = true

@@ -31,17 +31,18 @@ import (
 
 // Backend wires the SMTP server to the mailezine services.
 type Backend struct {
-	Hostname        string
-	Directory       directory.Service
-	Auth            auth.Service
-	TrustedNets     []*net.IPNet
-	RequireAuth     bool // true for the submission listener
-	AllowRelay      bool // trusted sessions may submit external recipients
-	MaxRecipients   int
-	MaxMessageBytes int64
-	MaxLineLength   int
-	TLSConfig       *tls.Config // optional; enables STARTTLS for direct deploys
-	Logger          *slog.Logger
+	Hostname           string
+	Directory          directory.Service
+	Auth               auth.Service
+	TrustedNets        []*net.IPNet
+	RequireAuth        bool   // true for the submission listener
+	AllowRelay         bool   // trusted sessions may submit external recipients
+	RecipientDelimiter string // extended-address separator ("" disables)
+	MaxRecipients      int
+	MaxMessageBytes    int64
+	MaxLineLength      int
+	TLSConfig          *tls.Config // optional; enables STARTTLS for direct deploys
+	Logger             *slog.Logger
 
 	// Submit enqueues a validated message. Called once per DATA with the
 	// peer address, authenticated user ("" for anonymous/trusted-peer
@@ -188,6 +189,16 @@ func (s *session) Rcpt(to string, _ *gosmtp.RcptOptions) error {
 	// subnet or authenticated) and relay is enabled; otherwise they are
 	// refused to avoid open-relay and address enumeration.
 	if _, err := s.backend.Directory.Aliases(context.Background(), rcpt); err != nil {
+		// Extended addresses (user+tag@domain) deliver to the base user.
+		if errors.Is(err, directory.ErrNotFound) && s.backend.RecipientDelimiter != "" {
+			if base, ok := directory.SplitDelimited(rcpt, s.backend.RecipientDelimiter); ok {
+				if _, err2 := s.backend.Directory.Aliases(context.Background(), base); err2 == nil {
+					rcpt = base
+					s.to = append(s.to, rcpt)
+					return nil
+				}
+			}
+		}
 		if errors.Is(err, directory.ErrNotFound) {
 			if s.backend.AllowRelay && s.trusted {
 				s.to = append(s.to, rcpt)

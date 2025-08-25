@@ -3,6 +3,7 @@ package pop3
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"log/slog"
@@ -119,6 +120,104 @@ func TestPOP3Lifecycle(t *testing.T) {
 	ms := mailstore.NewKV(s)
 	seedMailbox(t, ms)
 	runPOP3Lifecycle(t, ms)
+}
+
+func TestPOP3AuthSASL(t *testing.T) {
+	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
+	ms := mailstore.NewKV(s)
+	seedMailbox(t, ms)
+	addr, _ := startPOP3(t, ms)
+
+	t.Run("CAPA advertises SASL", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		if got := c.cmd("CAPA"); !strings.HasPrefix(got, "+OK") {
+			t.Fatalf("CAPA: %q", got)
+		}
+		var caps []string
+		for {
+			line := c.readline()
+			if line == "." {
+				break
+			}
+			caps = append(caps, line)
+		}
+		if !containsStr(caps, "SASL PLAIN LOGIN") {
+			t.Fatalf("CAPA missing SASL: %v", caps)
+		}
+	})
+
+	t.Run("PLAIN inline", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		token := base64.StdEncoding.EncodeToString([]byte("\x00alice@example.com\x00s3cret"))
+		if got := c.cmd("AUTH PLAIN " + token); !strings.HasPrefix(got, "+OK") {
+			t.Fatalf("AUTH PLAIN inline: %q", got)
+		}
+		if got := c.cmd("STAT"); !strings.HasPrefix(got, "+OK 2 ") {
+			t.Fatalf("STAT after AUTH: %q", got)
+		}
+	})
+
+	t.Run("PLAIN challenge", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		if got := c.cmd("AUTH PLAIN"); got != "+ " {
+			t.Fatalf("PLAIN challenge: %q", got)
+		}
+		token := base64.StdEncoding.EncodeToString([]byte("\x00alice@example.com\x00s3cret"))
+		if got := c.cmd(token); !strings.HasPrefix(got, "+OK") {
+			t.Fatalf("PLAIN response: %q", got)
+		}
+	})
+
+	t.Run("LOGIN challenge", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		if got := c.cmd("AUTH LOGIN"); got != "+ VXNlcm5hbWU6" {
+			t.Fatalf("LOGIN user challenge: %q", got)
+		}
+		user := base64.StdEncoding.EncodeToString([]byte("alice@example.com"))
+		if got := c.cmd(user); got != "+ UGFzc3dvcmQ6" {
+			t.Fatalf("LOGIN pass challenge: %q", got)
+		}
+		pass := base64.StdEncoding.EncodeToString([]byte("s3cret"))
+		if got := c.cmd(pass); !strings.HasPrefix(got, "+OK") {
+			t.Fatalf("LOGIN response: %q", got)
+		}
+	})
+
+	t.Run("LOGIN inline", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		user := base64.StdEncoding.EncodeToString([]byte("alice@example.com"))
+		pass := base64.StdEncoding.EncodeToString([]byte("s3cret"))
+		if got := c.cmd("AUTH LOGIN " + user); got != "+ UGFzc3dvcmQ6" {
+			t.Fatalf("LOGIN inline user: %q", got)
+		}
+		if got := c.cmd(pass); !strings.HasPrefix(got, "+OK") {
+			t.Fatalf("LOGIN inline pass: %q", got)
+		}
+	})
+
+	t.Run("bad credentials", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		token := base64.StdEncoding.EncodeToString([]byte("\x00alice@example.com\x00wrong"))
+		if got := c.cmd("AUTH PLAIN " + token); !strings.HasPrefix(got, "-ERR") {
+			t.Fatalf("bad password accepted: %q", got)
+		}
+	})
+
+	t.Run("unsupported mechanism", func(t *testing.T) {
+		c := dialPOP(t, addr)
+		if got := c.cmd("AUTH CRAM-MD5"); !strings.HasPrefix(got, "-ERR") {
+			t.Fatalf("unsupported mechanism: %q", got)
+		}
+	})
+}
+
+func containsStr(list []string, want string) bool {
+	for _, s := range list {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func runPOP3Lifecycle(t *testing.T, ms mailstore.MailboxStore) {

@@ -7,6 +7,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -51,15 +52,16 @@ type message struct {
 }
 
 type session struct {
-	srv     *Server
-	conn    net.Conn
-	r       *bufio.Reader
-	w       *bufio.Writer
-	user    string
-	authed  bool
-	tlsUp   bool
-	msgs    []message // INBOX snapshot at login, ordered by UID
-	deleted map[uint32]bool
+	srv      *Server
+	conn     net.Conn
+	r        *bufio.Reader
+	w        *bufio.Writer
+	user     string
+	authUser string // decoded username while a LOGIN exchange is in flight
+	authed   bool
+	tlsUp    bool
+	msgs     []message // INBOX snapshot at login, ordered by UID
+	deleted  map[uint32]bool
 }
 
 func (s *session) run(ctx context.Context) error {
@@ -103,6 +105,8 @@ func (s *session) handle(ctx context.Context, cmd string) (bool, error) {
 		}
 		s.user = fields[1]
 		return false, s.reply("+OK send PASS")
+	case "AUTH":
+		return false, s.handleAuth(ctx, fields)
 	case "PASS":
 		if len(fields) != 2 || s.user == "" {
 			return false, s.reply("-ERR usage: PASS <password>")
@@ -164,6 +168,114 @@ func (s *session) login(ctx context.Context, password string) error {
 	s.deleted = map[uint32]bool{}
 	s.authed = true
 	return nil
+}
+
+// handleAuth implements the POP3 SASL AUTH extension (RFC 1734 + RFC 5034)
+// for PLAIN (RFC 4616) and LOGIN. Both mechanisms accept the initial
+// response inline or via the classic "+ " challenge exchange.
+func (s *session) handleAuth(ctx context.Context, fields []string) error {
+	if s.authed {
+		return s.reply("-ERR already authenticated")
+	}
+	if s.srv.TLSConfig != nil && !s.tlsUp {
+		return s.reply("-ERR TLS required before authentication")
+	}
+	if len(fields) < 2 {
+		return s.reply("-ERR usage: AUTH <mechanism> [initial-response]")
+	}
+	switch mech := strings.ToUpper(fields[1]); mech {
+	case "PLAIN":
+		if len(fields) >= 3 {
+			return s.authPlain(ctx, fields[2])
+		}
+		if err := s.reply("+ "); err != nil {
+			return err
+		}
+		line, err := s.readLine()
+		if err != nil {
+			return err
+		}
+		return s.authPlain(ctx, strings.TrimSpace(line))
+	case "LOGIN":
+		if len(fields) >= 3 {
+			u, err := decodeBase64(fields[2])
+			if err != nil {
+				return s.reply("-ERR invalid base64")
+			}
+			s.authUser = u
+		} else {
+			if err := s.reply("+ VXNlcm5hbWU6"); err != nil { // "Username:"
+				return err
+			}
+			line, err := s.readLine()
+			if err != nil {
+				return err
+			}
+			u, err := decodeBase64(strings.TrimSpace(line))
+			if err != nil {
+				return s.reply("-ERR invalid base64")
+			}
+			s.authUser = u
+		}
+		if err := s.reply("+ UGFzc3dvcmQ6"); err != nil { // "Password:"
+			return err
+		}
+		line, err := s.readLine()
+		if err != nil {
+			return err
+		}
+		p, err := decodeBase64(strings.TrimSpace(line))
+		if err != nil {
+			return s.reply("-ERR invalid base64")
+		}
+		s.user = s.authUser
+		s.authUser = ""
+		if err := s.login(ctx, p); err != nil {
+			return s.reply("-ERR authentication failed")
+		}
+		return s.reply("+OK mailbox locked and ready")
+	default:
+		return s.reply("-ERR unsupported authentication mechanism")
+	}
+}
+
+func (s *session) authPlain(ctx context.Context, token string) error {
+	raw, err := decodeBase64(token)
+	if err != nil {
+		return s.reply("-ERR invalid base64")
+	}
+	// RFC 4616: [authzid] NUL authcid NUL passwd.
+	parts := strings.Split(string(raw), "\x00")
+	var user, pass string
+	switch len(parts) {
+	case 3:
+		user, pass = parts[1], parts[2]
+	case 2:
+		user, pass = parts[0], parts[1]
+	default:
+		return s.reply("-ERR malformed credentials")
+	}
+	if user == "" {
+		return s.reply("-ERR malformed credentials")
+	}
+	s.user = user
+	if err := s.login(ctx, pass); err != nil {
+		return s.reply("-ERR authentication failed")
+	}
+	return s.reply("+OK mailbox locked and ready")
+}
+
+func decodeBase64(s string) (string, error) {
+	b, err := base64.StdEncoding.DecodeString(s)
+	return string(b), err
+}
+
+func (s *session) readLine() (string, error) {
+	line, err := s.r.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 func (s *session) stats() (count int, size int64) {
@@ -318,7 +430,7 @@ func (s *session) handleDele(fields []string) error {
 }
 
 func (s *session) handleCapa() error {
-	caps := []string{"+OK Capability list follows", "USER", "UIDL", "TOP", "RESP-CODES"}
+	caps := []string{"+OK Capability list follows", "USER", "UIDL", "TOP", "RESP-CODES", "SASL PLAIN LOGIN"}
 	if s.srv.TLSConfig != nil && !s.tlsUp {
 		caps = append(caps, "STLS")
 	}

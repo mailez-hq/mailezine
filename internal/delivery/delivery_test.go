@@ -85,6 +85,22 @@ func TestDeliverExpandsAlias(t *testing.T) {
 	}
 }
 
+func TestDeliverToDelimitedAddress(t *testing.T) {
+	p, ms, _ := newTestPipeline(t, 1<<20)
+	p.RecipientDelimiter = "+"
+	body := "Subject: plus\r\n\r\nbody\r\n"
+	if err := p.Deliver(context.Background(), nil, "sender@remote.test", []string{"alice+tag@example.com"}, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	email, err := ms.EmailByUID(context.Background(), "alice@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatalf("mail did not land in base user INBOX: %v", err)
+	}
+	if email.Mailbox != "INBOX" || email.From != "sender@remote.test" {
+		t.Fatalf("email: %+v", email)
+	}
+}
+
 func TestDeliverQuotaEnforced(t *testing.T) {
 	p, _, _ := newTestPipeline(t, 4)
 	body := "Subject: big\r\n\r\n0123456789\r\n"

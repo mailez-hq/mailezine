@@ -9,10 +9,31 @@ package directory
 import (
 	"context"
 	"errors"
+	"strings"
 )
 
 // ErrNotFound means "valid request, nothing in the directory for it".
 var ErrNotFound = errors.New("directory: not found")
+
+// SplitDelimited splits an extended address at the first occurrence of
+// delim inside the localpart: "user+tag@domain" with delim "+" returns
+// "user@domain". The delimiter mirrors the recipient_delimiter behaviour of
+// classic MTAs; an empty delim, an absent delimiter or a leading delimiter
+// yields ok=false.
+func SplitDelimited(addr, delim string) (base string, ok bool) {
+	if delim == "" {
+		return "", false
+	}
+	at := strings.LastIndex(addr, "@")
+	if at <= 0 {
+		return "", false
+	}
+	local, domain := addr[:at], addr[at:]
+	if i := strings.Index(local, delim); i > 0 {
+		return local[:i] + domain, true
+	}
+	return "", false
+}
 
 // Service is the directory contract consumed by delivery, submission and
 // provisioning paths.

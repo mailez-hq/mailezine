@@ -177,14 +177,15 @@ func runCtx(ctx context.Context, args []string) int {
 		classifier = spam.New(cfg.Rspamd.URL, cfg.Rspamd.LearnURL, cfg.Rspamd.Password, cfg.Hostname, logger)
 	}
 	pipeline := &delivery.Pipeline{
-		Directory:    dir,
-		Store:        st.mailbox,
-		Verifier:     verifier,
-		Sieve:        sieve.NewEngine(logger),
-		ScriptSource: sieve.DefaultScriptSource{Store: st.mailbox, Directory: dir},
-		Hostname:     cfg.Hostname,
-		Logger:       logger,
-		FTS:          ftsIndexer,
+		Directory:          dir,
+		Store:              st.mailbox,
+		Verifier:           verifier,
+		Sieve:              sieve.NewEngine(logger),
+		ScriptSource:       sieve.DefaultScriptSource{Store: st.mailbox, Directory: dir},
+		Hostname:           cfg.Hostname,
+		RecipientDelimiter: cfg.RecipientDelimiter,
+		Logger:             logger,
+		FTS:                ftsIndexer,
 	}
 	if classifier != nil {
 		// Never assign a typed nil to the interface: an unconfigured
@@ -291,6 +292,7 @@ func runCtx(ctx context.Context, args []string) int {
 		pipeline.Redirect = func(ctx context.Context, from, to string, data []byte) error {
 			// Sieve redirect: rewrite the envelope sender like relayed mail
 			// so bounces route back through us.
+			data = delivery.Outclean(data)
 			relayFrom := from
 			if rewritten, err := dir.SRSForward(ctx, from); err == nil && rewritten != "" {
 				relayFrom = rewritten
@@ -311,31 +313,33 @@ func runCtx(ctx context.Context, args []string) int {
 		return 2
 	}
 	smtpInbound := smtp.NewServer(&smtp.Backend{
-		Hostname:        cfg.Hostname,
-		Directory:       dir,
-		Auth:            authSvc,
-		TrustedNets:     trustedNets,
-		AllowRelay:      cfg.Outbound.Enabled,
-		MaxRecipients:   cfg.Limits.MaxRecipients,
-		MaxMessageBytes: cfg.Limits.MaxMessageSize,
-		MaxLineLength:   cfg.Limits.MaxLineLength,
-		TLSConfig:       tlsConf,
-		Logger:          logger,
-		Submit:          submit,
+		Hostname:           cfg.Hostname,
+		Directory:          dir,
+		Auth:               authSvc,
+		TrustedNets:        trustedNets,
+		AllowRelay:         cfg.Outbound.Enabled,
+		RecipientDelimiter: cfg.RecipientDelimiter,
+		MaxRecipients:      cfg.Limits.MaxRecipients,
+		MaxMessageBytes:    cfg.Limits.MaxMessageSize,
+		MaxLineLength:      cfg.Limits.MaxLineLength,
+		TLSConfig:          tlsConf,
+		Logger:             logger,
+		Submit:             submit,
 	})
 	smtpSubmission := smtp.NewServer(&smtp.Backend{
-		Hostname:        cfg.Hostname,
-		Directory:       dir,
-		Auth:            authSvc,
-		TrustedNets:     trustedNets,
-		RequireAuth:     true,
-		AllowRelay:      true,
-		MaxRecipients:   cfg.Limits.MaxRecipients,
-		MaxMessageBytes: cfg.Limits.MaxMessageSize,
-		MaxLineLength:   cfg.Limits.MaxLineLength,
-		TLSConfig:       tlsConf,
-		Logger:          logger,
-		Submit:          submit,
+		Hostname:           cfg.Hostname,
+		Directory:          dir,
+		Auth:               authSvc,
+		TrustedNets:        trustedNets,
+		RequireAuth:        true,
+		AllowRelay:         true,
+		RecipientDelimiter: cfg.RecipientDelimiter,
+		MaxRecipients:      cfg.Limits.MaxRecipients,
+		MaxMessageBytes:    cfg.Limits.MaxMessageSize,
+		MaxLineLength:      cfg.Limits.MaxLineLength,
+		TLSConfig:          tlsConf,
+		Logger:             logger,
+		Submit:             submit,
 	})
 	imapCfg := &imap.Server{
 		Store:           st.mailbox,
@@ -573,6 +577,9 @@ func serveHTTP(ctx context.Context, srv *http.Server, logger *slog.Logger) error
 // outbound queue is enabled.
 func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Manager, logger *slog.Logger) func(context.Context, net.IP, string, string, []string, []byte) error {
 	return func(ctx context.Context, peer net.IP, user, from string, to []string, data []byte) error {
+		// Outbound mail never carries internal Received chains or client
+		// fingerprints collected on the way in.
+		data = delivery.Outclean(data)
 		var local, relay []string
 		for _, rcpt := range to {
 			targets, err := dir.Aliases(ctx, rcpt)

@@ -37,15 +37,19 @@ type Config struct {
 	Management     ManagementConfig
 	BackendAddress string
 	Hostname       string
-	TrustedNets    []string // CIDRs that are authenticated by the gateway
-	Rspamd         RspamdConfig
-	DKIMVaultURL   string
-	Outbound       OutboundConfig
-	TLS            TLSConfig
-	ProxyProtocol  []string // listener ports expecting a PROXY v1 header
-	Queue          QueueConfig
-	Limits         limits.Config
-	Features       FeaturesConfig
+	// RecipientDelimiter is the extended-address separator: mail to
+	// "user+tag@domain" delivers to the base user when the full address is
+	// unknown. Empty disables plus addressing.
+	RecipientDelimiter string
+	TrustedNets        []string // CIDRs that are authenticated by the gateway
+	Rspamd             RspamdConfig
+	DKIMVaultURL       string
+	Outbound           OutboundConfig
+	TLS                TLSConfig
+	ProxyProtocol      []string // listener ports expecting a PROXY v1 header
+	Queue              QueueConfig
+	Limits             limits.Config
+	Features           FeaturesConfig
 }
 
 // LogConfig controls the structured logger.
@@ -242,8 +246,9 @@ func Load() (Config, error) {
 			Level:  getenv("MAILEZINE_LOG_LEVEL", "info"),
 			Format: getenv("MAILEZINE_LOG_FORMAT", "text"),
 		},
-		HealthAddr: getenv("MAILEZINE_HEALTH_ADDR", fmt.Sprintf(":%d", DefaultHealthPort)),
-		Hostname:   getenv("MAILEZINE_HOSTNAME", defaultHostname()),
+		HealthAddr:         getenv("MAILEZINE_HEALTH_ADDR", fmt.Sprintf(":%d", DefaultHealthPort)),
+		Hostname:           getenv("MAILEZINE_HOSTNAME", defaultHostname()),
+		RecipientDelimiter: getenv("MAILEZINE_RECIPIENT_DELIMITER", "+"),
 		Listeners: ListenersConfig{
 			SMTP:        getenv("MAILEZINE_SMTP_ADDR", ":1025"),
 			Submission:  getenv("MAILEZINE_SUBMISSION_ADDR", ":1587"),

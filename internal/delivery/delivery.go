@@ -59,7 +59,10 @@ type Pipeline struct {
 	Sieve        *sieve.Engine      // optional; nil keeps INBOX
 	ScriptSource sieve.ScriptSource // optional; defaults to Directory.Sieve
 	Hostname     string             // our hostname for the Received header
-	FTS          *fts.Indexer       // optional full-text index
+	// RecipientDelimiter is the extended-address separator: "user+tag@d"
+	// resolves to "user@d" when the full address is unknown ("" disables).
+	RecipientDelimiter string
+	FTS                *fts.Indexer // optional full-text index
 	// Redirect forwards a copy to an external address (sieve redirect);
 	// implementations spool into the outbound queue. When nil, redirects
 	// are logged and skipped (the local copy still applies).
@@ -324,6 +327,13 @@ func classifierNil(c Classifier) bool {
 
 func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw []byte) error {
 	targets, err := p.Directory.Aliases(ctx, rcpt)
+	if errors.Is(err, directory.ErrNotFound) && p.RecipientDelimiter != "" {
+		if base, ok := directory.SplitDelimited(rcpt, p.RecipientDelimiter); ok {
+			if targets, err = p.Directory.Aliases(ctx, base); err == nil {
+				rcpt = base
+			}
+		}
+	}
 	if err != nil {
 		return fmt.Errorf("delivery: resolve %s: %w", rcpt, err)
 	}
