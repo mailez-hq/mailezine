@@ -1,6 +1,8 @@
 package delivery
 
 import (
+	"bufio"
+	"io"
 	"strings"
 )
 
@@ -23,40 +25,85 @@ var outcleanIgnore = []string{
 // bare version token (e.g. "1.0 (Mac OS X Mail 8.1 ...)" → "1.0"). The body
 // is never touched. The function preserves the original line endings.
 func Outclean(data []byte) []byte {
-	raw := string(data)
-	if !strings.Contains(raw, "\r\n") && !strings.Contains(raw, "\n") {
+	var buf strings.Builder
+	if err := OutcleanTo(strings.NewReader(string(data)), &buf); err != nil {
 		return data
 	}
-	lines := strings.Split(raw, "\n")
-	var out []string
+	return []byte(buf.String())
+}
+
+// OutcleanTo streams the outbound privacy filter: it copies r to w, dropping
+// Received/client-fingerprint headers (with folded continuations) in the
+// header block and normalising Mime-Version, while leaving the body verbatim.
+// Line endings are preserved.
+func OutcleanTo(r io.Reader, w io.Writer) error {
+	br := bufio.NewReader(r)
 	inHeaders := true
-	for i := 0; i < len(lines); i++ {
-		line := lines[i]
-		if inHeaders {
-			if line == "" || line == "\r" {
-				// End of headers: copy the separator and the rest verbatim.
-				out = append(out, line)
-				inHeaders = false
-				out = append(out, lines[i+1:]...)
-				break
+	var pending string
+	var pendingErr error
+	for {
+		var line string
+		var err error
+		if pending != "" || pendingErr != nil {
+			line, err = pending, pendingErr
+			pending, pendingErr = "", nil
+		} else {
+			line, err = br.ReadString('\n')
+		}
+		if err != nil && err != io.EOF {
+			return err
+		}
+		last := err == io.EOF
+		if inHeaders && strings.TrimRight(line, "\r\n") == "" {
+			// Blank line ends the header block.
+			inHeaders = false
+			if _, werr := io.WriteString(w, line); werr != nil {
+				return werr
 			}
-			lower := strings.ToLower(line)
-			trimmed := strings.TrimLeft(lower, " \t")
-			if stripped := matchIgnore(trimmed); stripped {
-				// Drop this header and any folded continuation lines.
-				for i+1 < len(lines) && isFolded(lines[i+1]) {
-					i++
+			if last {
+				return nil
+			}
+			continue
+		}
+		if inHeaders {
+			trimmed := strings.TrimLeft(strings.ToLower(line), " \t")
+			if matchIgnore(trimmed) {
+				// Drop this header and its folded continuation lines.
+				for {
+					next, nerr := br.ReadString('\n')
+					if nerr != nil && nerr != io.EOF {
+						return nerr
+					}
+					if next == "" || !isFolded(next) {
+						// Keep the first non-folded line for the main loop
+						// (it may be the header/body separator or the next
+						// header).
+						pending, pendingErr = next, nerr
+						break
+					}
+				}
+				if pending == "" && pendingErr == io.EOF {
+					return nil
 				}
 				continue
 			}
 			if isMimeVersion(line) {
-				out = append(out, cleanMimeVersion(line))
+				if _, werr := io.WriteString(w, cleanMimeVersion(line)); werr != nil {
+					return werr
+				}
+				if last {
+					return nil
+				}
 				continue
 			}
 		}
-		out = append(out, line)
+		if _, werr := io.WriteString(w, line); werr != nil {
+			return werr
+		}
+		if last {
+			return nil
+		}
 	}
-	return []byte(strings.Join(out, "\n"))
 }
 
 func matchIgnore(trimmedLower string) bool {
@@ -88,9 +135,14 @@ func isMimeVersion(line string) bool {
 func cleanMimeVersion(line string) string {
 	// Preserve the original line ending (the header is rebuilt).
 	eol := ""
-	if strings.HasSuffix(line, "\r") {
-		eol = "\r"
+	if strings.HasSuffix(line, "\n") {
 		line = line[:len(line)-1]
+		if strings.HasSuffix(line, "\r") {
+			eol = "\r\n"
+			line = line[:len(line)-1]
+		} else {
+			eol = "\n"
+		}
 	}
 	trimmed := strings.TrimLeft(line, " \t")
 	lead := line[:len(line)-len(trimmed)]

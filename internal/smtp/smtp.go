@@ -27,6 +27,7 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
+	"mailezine/internal/mailbuffer"
 )
 
 // Backend wires the SMTP server to the mailezine services.
@@ -38,16 +39,21 @@ type Backend struct {
 	RequireAuth        bool   // true for the submission listener
 	AllowRelay         bool   // trusted sessions may submit external recipients
 	RecipientDelimiter string // extended-address separator ("" disables)
-	MaxRecipients      int
-	MaxMessageBytes    int64
-	MaxLineLength      int
-	TLSConfig          *tls.Config // optional; enables STARTTLS for direct deploys
-	Logger             *slog.Logger
+	// BufferMemoryLimit is the message size below which DATA is buffered in
+	// memory; larger messages spill to a temp file (default 1 MiB).
+	BufferMemoryLimit int64
+	MaxRecipients     int
+	MaxMessageBytes   int64
+	MaxLineLength     int
+	TLSConfig         *tls.Config // optional; enables STARTTLS for direct deploys
+	Logger            *slog.Logger
 
 	// Submit enqueues a validated message. Called once per DATA with the
 	// peer address, authenticated user ("" for anonymous/trusted-peer
-	// sessions), envelope and raw message bytes (RFC 5322).
-	Submit func(ctx context.Context, peer net.IP, user, from string, to []string, data []byte) error
+	// sessions), envelope and the buffered message (RFC 5322). The buffer is
+	// valid only for the duration of the call; consumers that need the bytes
+	// beyond it must copy or stream them.
+	Submit func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error
 }
 
 // NewServer builds a go-smtp server from the backend.
@@ -60,6 +66,9 @@ func NewServer(b *Backend) *gosmtp.Server {
 	}
 	if b.MaxMessageBytes <= 0 {
 		b.MaxMessageBytes = 50 << 20
+	}
+	if b.BufferMemoryLimit <= 0 {
+		b.BufferMemoryLimit = 1 << 20
 	}
 	if b.MaxLineLength <= 0 {
 		b.MaxLineLength = 1000
@@ -220,10 +229,9 @@ func (s *session) Data(r io.Reader) error {
 		return &gosmtp.SMTPError{Code: 451, Message: "delivery not configured"}
 	}
 	limit := s.backend.MaxMessageBytes
-	data, err := io.ReadAll(r)
+	data, err := mailbuffer.NewFromReader(r, limit, s.backend.BufferMemoryLimit)
 	if err != nil {
-		// go-smtp enforces MaxMessageBytes on the DATA reader.
-		if errors.Is(err, gosmtp.ErrDataTooLarge) {
+		if errors.Is(err, mailbuffer.ErrTooLarge) || errors.Is(err, gosmtp.ErrDataTooLarge) {
 			return &gosmtp.SMTPError{Code: 552, Message: "message exceeds size limit"}
 		}
 		if errors.Is(err, gosmtp.ErrTooLongLine) {
@@ -231,9 +239,7 @@ func (s *session) Data(r io.Reader) error {
 		}
 		return &gosmtp.SMTPError{Code: 451, Message: "error reading message"}
 	}
-	if int64(len(data)) > limit {
-		return &gosmtp.SMTPError{Code: 552, Message: "message exceeds size limit"}
-	}
+	defer data.Remove()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	peer := remoteIP(s.conn.Conn().RemoteAddr())

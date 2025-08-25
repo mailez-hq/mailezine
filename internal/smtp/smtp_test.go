@@ -18,6 +18,7 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
+	"mailezine/internal/mailbuffer"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/server"
 	"mailezine/internal/store"
@@ -52,11 +53,12 @@ func testBackend(t *testing.T, requireAuth bool) (*Backend, *capture) {
 		MaxMessageBytes: 64 * 1024,
 		MaxLineLength:   1000,
 		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Submit: func(_ context.Context, peer net.IP, _ string, from string, to []string, data []byte) error {
+		Submit: func(_ context.Context, peer net.IP, _ string, from string, to []string, data mailbuffer.Buffer) error {
 			cap.mu.Lock()
 			defer cap.mu.Unlock()
 			cap.submits++
-			cap.from, cap.to, cap.data = from, append([]string(nil), to...), append([]byte(nil), data...)
+			raw, _ := data.ReadAll()
+			cap.from, cap.to, cap.data = from, append([]string(nil), to...), raw
 			cap.peer = peer
 			return nil
 		},
@@ -210,7 +212,7 @@ func TestMessageSizeLimit(t *testing.T) {
 
 func TestSubmitErrorReturnsTemporary(t *testing.T) {
 	b, _ := testBackend(t, false)
-	b.Submit = func(context.Context, net.IP, string, string, []string, []byte) error {
+	b.Submit = func(context.Context, net.IP, string, string, []string, mailbuffer.Buffer) error {
 		return errors.New("queue full")
 	}
 	client := startTestServer(t, b)
@@ -277,7 +279,7 @@ func TestUntrustedRelayDenied(t *testing.T) {
 
 func TestRejectMappedTo554(t *testing.T) {
 	b, _ := testBackend(t, false)
-	b.Submit = func(context.Context, net.IP, string, string, []string, []byte) error {
+	b.Submit = func(context.Context, net.IP, string, string, []string, mailbuffer.Buffer) error {
 		return delivery.ErrReject
 	}
 	client := startTestServer(t, b)
@@ -289,7 +291,7 @@ func TestRejectMappedTo554(t *testing.T) {
 
 func TestGreylistMappedTo451(t *testing.T) {
 	b, _ := testBackend(t, false)
-	b.Submit = func(context.Context, net.IP, string, string, []string, []byte) error {
+	b.Submit = func(context.Context, net.IP, string, string, []string, mailbuffer.Buffer) error {
 		return delivery.ErrGreylist
 	}
 	client := startTestServer(t, b)
@@ -301,7 +303,7 @@ func TestGreylistMappedTo451(t *testing.T) {
 
 func TestSieveRejectMappedTo550(t *testing.T) {
 	b, _ := testBackend(t, false)
-	b.Submit = func(context.Context, net.IP, string, string, []string, []byte) error {
+	b.Submit = func(context.Context, net.IP, string, string, []string, mailbuffer.Buffer) error {
 		return fmt.Errorf("%w: not for you", delivery.ErrSieveReject)
 	}
 	client := startTestServer(t, b)
@@ -483,8 +485,12 @@ func TestInboundFullPath(t *testing.T) {
 		MaxMessageBytes: 64 * 1024,
 		MaxLineLength:   1000,
 		Logger:          slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Submit: func(ctx context.Context, peer net.IP, _ string, from string, to []string, data []byte) error {
-			return pipe.Deliver(ctx, peer, from, to, data)
+		Submit: func(ctx context.Context, peer net.IP, _ string, from string, to []string, data mailbuffer.Buffer) error {
+			raw, err := data.ReadAll()
+			if err != nil {
+				return err
+			}
+			return pipe.Deliver(ctx, peer, from, to, raw)
 		},
 	}
 	client := startTestServer(t, b)
