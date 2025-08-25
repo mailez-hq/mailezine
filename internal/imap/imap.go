@@ -39,10 +39,12 @@ type Server struct {
 	// FTS is the optional full-text index; SEARCH TEXT consults it for
 	// candidates and verifies against raw bytes.
 	FTS *fts.Indexer
+	// CacheSizeBytes bounds the envelope/body-structure memo (0 = default).
+	CacheSizeBytes int64
 
 	// cache memoizes message-derived data (envelope, body structure) across
 	// sessions. nil disables caching.
-	cache *mailcache.LRU
+	cache *mailcache.Cache
 }
 
 // New builds the go-imap server. TLS is terminated by the mailez gateway,
@@ -57,7 +59,7 @@ func New(s *Server) *imapserver.Server {
 		s.MaxMessageBytes = 50 << 20
 	}
 	if s.cache == nil {
-		s.cache = mailcache.NewLRU(8192)
+		s.cache = mailcache.NewCache(s.CacheSizeBytes)
 	}
 	caps := imap.CapSet{
 		imap.CapIMAP4rev1: {},

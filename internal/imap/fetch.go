@@ -101,14 +101,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if options.Envelope {
 			if env == nil {
 				env := envelopeOf(buf)
-				s.srv.cache.Put(envKey, env)
+				s.srv.cache.Put(envKey, env, int64(envelopeWeight(env)))
 			}
 			rw.WriteEnvelope(env)
 		}
 		if options.BodyStructure != nil {
 			if bs == nil {
 				bs := imapserver.ExtractBodyStructure(bytes.NewReader(buf))
-				s.srv.cache.Put(bsKey, bs)
+				s.srv.cache.Put(bsKey, bs, 2048)
 			}
 			rw.WriteBodyStructure(bs)
 		}
@@ -175,4 +175,12 @@ func envelopeOf(buf []byte) *imap.Envelope {
 		return nil
 	}
 	return imapserver.ExtractEnvelope(header)
+}
+
+// envelopeWeight estimates the memory footprint of a parsed envelope so the
+// cache capacity tracks bytes rather than entry count.
+func envelopeWeight(e *imap.Envelope) int {
+	addr := func(l []imap.Address) int { return len(l) * 96 }
+	return 512 + len(e.Subject) + addr(e.From) + addr(e.Sender) +
+		addr(e.ReplyTo) + addr(e.To) + addr(e.Cc) + addr(e.Bcc)
 }

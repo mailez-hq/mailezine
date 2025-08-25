@@ -50,6 +50,9 @@ type Config struct {
 	Queue              QueueConfig
 	Limits             limits.Config
 	Features           FeaturesConfig
+	// CacheSizeBytes is the weight budget (bytes) of the in-memory caches
+	// (IMAP envelope/body-structure memo; 0 = engine default).
+	CacheSizeBytes int64
 }
 
 // LogConfig controls the structured logger.
@@ -336,6 +339,7 @@ func Load() (Config, error) {
 	cfg.Limits.MaxRecipients = envInt("MAILEZINE_MAX_RECIPIENTS", cfg.Limits.MaxRecipients)
 	cfg.Limits.MaxConnections = envInt("MAILEZINE_MAX_CONNECTIONS", cfg.Limits.MaxConnections)
 	cfg.Limits.MaxLineLength = envInt("MAILEZINE_MAX_LINE_LENGTH", cfg.Limits.MaxLineLength)
+	cfg.CacheSizeBytes = envInt64("MAILEZINE_CACHE_SIZE", 8<<20)
 	if cfg.DKIMVaultURL == "" {
 		cfg.DKIMVaultURL = "http://" + cfg.BackendAddress + "/stack/rspamd/vault"
 	}

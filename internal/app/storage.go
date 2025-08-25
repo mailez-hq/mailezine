@@ -34,6 +34,7 @@ type Storage struct {
 type MailboxBackend interface {
 	mailstore.MailboxStore
 	mailstore.SieveStore
+	mailstore.ACLStore
 }
 
 type mailboxBackend = MailboxBackend

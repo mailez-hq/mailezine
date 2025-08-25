@@ -1,15 +1,18 @@
 package mailcache
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
-func TestLRU(t *testing.T) {
-	c := NewLRU(2)
-	c.Put("a", 1)
-	c.Put("b", 2)
+func TestLRUWeightEviction(t *testing.T) {
+	c := NewCache(10)
+	c.Put("a", 1, 4)
+	c.Put("b", 2, 4)
 	if v, ok := c.Get("a"); !ok || v != 1 {
 		t.Fatalf("get a = %v %v", v, ok)
 	}
-	c.Put("c", 3) // evicts "b" (LRU)
+	c.Put("c", 3, 4) // total 12 > 10: evicts "b" (LRU)
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should have been evicted")
 	}
@@ -21,11 +24,72 @@ func TestLRU(t *testing.T) {
 	}
 }
 
+func TestLRUOversizedEntry(t *testing.T) {
+	c := NewCache(4)
+	c.Put("big", "x", 100)
+	if c.weight != 0 {
+		t.Fatalf("oversized entry should be evicted immediately, weight=%d", c.weight)
+	}
+	if _, ok := c.Get("big"); ok {
+		t.Fatal("oversized entry should not be cached")
+	}
+}
+
 func TestLRUUpdate(t *testing.T) {
-	c := NewLRU(1)
-	c.Put("k", "v1")
-	c.Put("k", "v2")
+	c := NewCache(10)
+	c.Put("k", "v1", 2)
+	c.Put("k", "v2", 2)
 	if v, _ := c.Get("k"); v != "v2" {
 		t.Fatalf("update: %v", v)
+	}
+	if c.weight != 2 {
+		t.Fatalf("weight after update = %d", c.weight)
+	}
+}
+
+func TestTTLExpiry(t *testing.T) {
+	c := NewCacheWithTTL(100, 30*time.Millisecond)
+	c.Put("k", "v", 1)
+	if v, ok := c.Get("k"); !ok || v != "v" {
+		t.Fatalf("before expiry: %v %v", v, ok)
+	}
+	time.Sleep(40 * time.Millisecond)
+	if _, ok := c.Get("k"); ok {
+		t.Fatal("entry should have expired")
+	}
+}
+
+func TestNegativeCache(t *testing.T) {
+	c := NewCacheWithNegative(100, time.Minute, 20*time.Millisecond)
+	c.PutNegative("missing")
+	v, ok := c.Get("missing")
+	if !ok || v != nil {
+		t.Fatalf("negative hit = %v %v", v, ok)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if _, ok := c.Get("missing"); ok {
+		t.Fatal("negative entry should have expired")
+	}
+	// A regular value is not nil.
+	c.Put("present", "x", 1)
+	if v, ok := c.Get("present"); !ok || v != "x" {
+		t.Fatalf("regular hit = %v %v", v, ok)
+	}
+}
+
+func TestRemoveAndClear(t *testing.T) {
+	c := NewCache(100)
+	c.Put("a", 1, 1)
+	c.Put("b", 2, 1)
+	c.Remove("a")
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("a should be removed")
+	}
+	c.Clear()
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("b should be cleared")
+	}
+	if c.weight != 0 {
+		t.Fatalf("weight after clear = %d", c.weight)
 	}
 }

@@ -23,6 +23,8 @@ import (
 	"mailezine/internal/ha"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
+	"mailezine/internal/mailcache"
+	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
 	"mailezine/internal/metrics"
 	"mailezine/internal/pop3"
@@ -205,8 +207,19 @@ func (a *App) openServices() error {
 	if a.auth, err = newAuth(a.cfg, a.logger); err != nil {
 		return err
 	}
+	// Successful authentications are memoised briefly (credential-keyed, so
+	// a cache hit only replays the exact pair that succeeded); this cuts the
+	// control-plane round trip from the hot AUTH path.
+	a.auth = auth.NewCached(a.auth,
+		mailcache.NewCacheWithTTL(a.cfg.CacheSizeBytes, 30*time.Second))
 	if a.st, err = NewStorage(a.cfg, a.logger); err != nil {
 		return err
+	}
+	// Metadata cache: message/mailbox lists are memoized per account with a
+	// TTL safety net; every write path invalidates the affected mailboxes.
+	if a.cfg.CacheSizeBytes > 0 {
+		a.st.mailbox = mailstore.NewCached(a.st.mailbox,
+			mailcache.NewCacheWithTTL(a.cfg.CacheSizeBytes, 30*time.Second))
 	}
 	// Embedded full-text index (bleve); a failure disables FTS but never
 	// startup (search falls back to the scan).
@@ -301,6 +314,7 @@ func (a *App) wireServers() error {
 		TLSConfig:       tlsConf,
 		Logger:          a.logger,
 		FTS:             a.fts,
+		CacheSizeBytes:  a.cfg.CacheSizeBytes,
 	}
 	if classifier := a.classifier; classifier != nil {
 		// Junk-boundary learning on APPEND/COPY/MOVE across Junk.
