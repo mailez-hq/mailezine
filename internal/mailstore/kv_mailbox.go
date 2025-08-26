@@ -541,7 +541,9 @@ func messageFromEmail(e *Email) *Message {
 	return &Message{
 		UID:          e.UID,
 		From:         e.From,
-		Flags:        append([]string(nil), e.Flags...),
+		// Match the maildir backend: keywords are exposed through Flags so
+		// FETCH and SEARCH (KEYWORD) see them; SetFlags re-splits them.
+		Flags:        append(append([]string(nil), e.Flags...), e.Keywords...),
 		Keywords:     append([]string(nil), e.Keywords...),
 		InternalDate: e.Date,
 		Size:         e.Size,
