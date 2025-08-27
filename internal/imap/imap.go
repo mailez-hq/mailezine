@@ -28,6 +28,7 @@ type Server struct {
 	Store           mailstore.MailboxStore
 	Auth            auth.Service
 	Directory       directory.Service
+	Port            string // listening port, passed to auth so the control plane recognizes webmail ports
 	MaxMessageBytes int64
 	TLSConfig       *tls.Config // optional; enables STARTTLS for direct deploys
 	Logger          *slog.Logger

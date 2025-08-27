@@ -37,7 +37,10 @@ var _ imapserver.SessionSort = (*session)(nil)
 func (s *session) Close() error { return nil }
 
 func (s *session) Login(username, password string) error {
-	ok, err := s.srv.Auth.Authenticate(context.Background(), username, password, auth.Options{Protocol: "imap"})
+	ok, err := s.srv.Auth.Authenticate(context.Background(), username, password, auth.Options{
+		Protocol: "imap",
+		Port:     s.srv.Port,
+	})
 	if err != nil || !ok {
 		return imapserver.ErrAuthFailed
 	}

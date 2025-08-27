@@ -29,6 +29,7 @@ type Server struct {
 	Store     mailstore.MailboxStore
 	Auth      auth.Service
 	Directory directory.Service
+	Port      string      // listening port, passed to auth so the control plane recognizes webmail ports
 	TLSConfig *tls.Config // optional; enables STLS for direct deploys
 	Logger    *slog.Logger
 }
@@ -152,7 +153,10 @@ func (s *session) login(ctx context.Context, password string) error {
 	if s.srv.TLSConfig != nil && !s.tlsUp {
 		return errors.New("TLS required before authentication")
 	}
-	ok, err := s.srv.Auth.Authenticate(ctx, s.user, password, auth.Options{Protocol: "pop3"})
+	ok, err := s.srv.Auth.Authenticate(ctx, s.user, password, auth.Options{
+		Protocol: "pop3",
+		Port:     s.srv.Port,
+	})
 	if err != nil || !ok {
 		return errors.New("bad credentials")
 	}

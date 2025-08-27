@@ -100,14 +100,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		}
 		if options.Envelope {
 			if env == nil {
-				env := envelopeOf(buf)
+				env = envelopeOf(buf)
 				s.srv.cache.Put(envKey, env, int64(envelopeWeight(env)))
 			}
 			rw.WriteEnvelope(env)
 		}
 		if options.BodyStructure != nil {
 			if bs == nil {
-				bs := imapserver.ExtractBodyStructure(bytes.NewReader(buf))
+				bs = imapserver.ExtractBodyStructure(bytes.NewReader(buf))
 				s.srv.cache.Put(bsKey, bs, 2048)
 			}
 			rw.WriteBodyStructure(bs)

@@ -35,6 +35,7 @@ type Backend struct {
 	Hostname           string
 	Directory          directory.Service
 	Auth               auth.Service
+	Port               string // listening port, passed to auth so the control plane recognizes webmail ports
 	TrustedNets        []*net.IPNet
 	RequireAuth        bool   // true for the submission listener
 	AllowRelay         bool   // trusted sessions may submit external recipients
@@ -110,7 +111,10 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 		return nil, fmt.Errorf("smtp: unsupported mechanism %q", mech)
 	}
 	return sasl.NewPlainServer(func(_ string, username, password string) error {
-		ok, err := s.backend.Auth.Authenticate(context.Background(), username, password, auth.Options{Protocol: "smtp"})
+		ok, err := s.backend.Auth.Authenticate(context.Background(), username, password, auth.Options{
+			Protocol: "smtp",
+			Port:     s.backend.Port,
+		})
 		if err != nil {
 			return err
 		}

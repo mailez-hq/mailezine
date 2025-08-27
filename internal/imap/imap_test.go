@@ -381,3 +381,37 @@ func TestIMAPHeaderFieldsFetch(t *testing.T) {
 		t.Fatalf("unrequested header returned: %q", got)
 	}
 }
+
+// TestIMAPBodyStructureFetch verifies ENVELOPE + extended BODYSTRUCTURE on a
+// cache-miss path. Regression: short-variable shadowing left the outer
+// envelope/structure nil and WriteBodyStructure panicked, dropping the
+// connection (webmail read path).
+func TestIMAPBodyStructureFetch(t *testing.T) {
+	c, _ := startTestServer(t)
+	body := "From: sender@remote.test\r\nTo: alice@example.com\r\nSubject: bs\r\n" +
+		"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n" +
+		"--b\r\nContent-Type: text/plain\r\n\r\nhello\r\n--b--\r\n"
+	u1 := appendMessage(t, c, "INBOX", body, nil)
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := c.Fetch(imap.UIDSetNum(u1), &imap.FetchOptions{
+		Envelope:      true,
+		BodyStructure: &imap.FetchItemBodyStructure{Extended: true},
+	}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("fetch count = %d", len(fetched))
+	}
+	if fetched[0].Envelope == nil {
+		t.Fatal("missing ENVELOPE")
+	}
+	if fetched[0].BodyStructure == nil {
+		t.Fatal("missing BODYSTRUCTURE")
+	}
+	if got := fetched[0].BodyStructure.MediaType(); !strings.EqualFold(got, "multipart/mixed") {
+		t.Fatalf("body structure media type = %q", got)
+	}
+}

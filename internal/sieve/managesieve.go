@@ -29,6 +29,7 @@ type Server struct {
 	Auth      auth.Service
 	Directory directory.Service
 	Scripts   mailstore.SieveStore
+	Port      string      // listening port, passed to auth so the control plane recognizes webmail ports
 	TLSConfig *tls.Config // optional; enables STARTTLS for direct deploys
 	Logger    *slog.Logger
 }
@@ -152,7 +153,10 @@ func (s *mSession) authenticate(email, password string) error {
 	if s.srv.TLSConfig != nil && !s.tlsUp {
 		return s.status("NO", "STARTTLS required before authentication")
 	}
-	ok, err := s.srv.Auth.Authenticate(context.Background(), email, password, auth.Options{Protocol: "sieve"})
+	ok, err := s.srv.Auth.Authenticate(context.Background(), email, password, auth.Options{
+		Protocol: "sieve",
+		Port:     s.srv.Port,
+	})
 	if err != nil || !ok {
 		return s.status("NO", "authentication failed")
 	}

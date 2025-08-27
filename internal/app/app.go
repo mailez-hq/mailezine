@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -282,6 +283,7 @@ func (a *App) wireServers() error {
 		Hostname:           a.cfg.Hostname,
 		Directory:          a.dir,
 		Auth:               a.auth,
+		Port:               listenerPort(a.cfg.Listeners.SMTP),
 		TrustedNets:        trustedNets,
 		AllowRelay:         a.cfg.Outbound.Enabled,
 		RecipientDelimiter: a.cfg.RecipientDelimiter,
@@ -296,6 +298,7 @@ func (a *App) wireServers() error {
 		Hostname:           a.cfg.Hostname,
 		Directory:          a.dir,
 		Auth:               a.auth,
+		Port:               listenerPort(a.cfg.Listeners.Submission),
 		TrustedNets:        trustedNets,
 		RequireAuth:        true,
 		AllowRelay:         true,
@@ -312,6 +315,7 @@ func (a *App) wireServers() error {
 		Store:           a.st.mailbox,
 		Auth:            a.auth,
 		Directory:       a.dir,
+		Port:            listenerPort(a.cfg.Listeners.IMAP),
 		MaxMessageBytes: a.cfg.Limits.MaxMessageSize,
 		TLSConfig:       tlsConf,
 		Logger:          a.logger,
@@ -332,6 +336,7 @@ func (a *App) wireServers() error {
 		Auth:      a.auth,
 		Directory: a.dir,
 		Scripts:   a.st.mailbox,
+		Port:      listenerPort(a.cfg.Listeners.ManageSieve),
 		TLSConfig: tlsConf,
 		Logger:    a.logger,
 	}
@@ -339,10 +344,21 @@ func (a *App) wireServers() error {
 		Store:     a.st.mailbox,
 		Auth:      a.auth,
 		Directory: a.dir,
+		Port:      listenerPort(a.cfg.Listeners.POP3),
 		TLSConfig: tlsConf,
 		Logger:    a.logger,
 	}
 	return nil
+}
+
+// listenerPort extracts the port from a "host:port" listen address (":1143"
+// → "1143"). Empty on malformed input.
+func listenerPort(addr string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return ""
+	}
+	return port
 }
 
 // serveListeners binds and serves every HTTP and protocol listener.

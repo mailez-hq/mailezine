@@ -471,22 +471,26 @@ func (w *FetchResponseWriter) WriteEnvelope(envelope *imap.Envelope) {
 // WriteBodyStructure writes the message's body structure (either BODYSTRUCTURE
 // or BODY).
 func (w *FetchResponseWriter) WriteBodyStructure(bs imap.BodyStructure) {
+	// Defensive normalization: the extended metadata must always be present
+	// when BODYSTRUCTURE is written. A nil Extended (e.g. a structure that
+	// came from a non-extended parse) must not panic and drop the connection;
+	// synthesize empty extended fields instead.
+	switch b := bs.(type) {
+	case *imap.BodyStructureSinglePart:
+		if b.Extended == nil {
+			b.Extended = &imap.BodyStructureSinglePartExt{}
+		}
+	case *imap.BodyStructureMultiPart:
+		if b.Extended == nil {
+			b.Extended = &imap.BodyStructureMultiPartExt{}
+		}
+	}
+
 	if w.options.bodyStructure.nonExtended {
 		w.writeBodyStructure(bs, false)
 	}
 
 	if w.options.bodyStructure.extended {
-		var isExtended bool
-		switch bs := bs.(type) {
-		case *imap.BodyStructureSinglePart:
-			isExtended = bs.Extended != nil
-		case *imap.BodyStructureMultiPart:
-			isExtended = bs.Extended != nil
-		}
-		if !isExtended {
-			panic("imapserver: client requested extended body structure but a non-extended one is written back")
-		}
-
 		w.writeBodyStructure(bs, true)
 	}
 }
