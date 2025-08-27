@@ -70,7 +70,9 @@ if ($Engine -eq 'postdove') {
   $smtp   = '127.0.0.1:31587'
   $inSmtp = '127.0.0.1:35025'
   $imap   = '127.0.0.1:3143'
-  $containers = 'bench-mz-caddy,bench-mz2'
+  # enterprise has no dedicated caddy gateway anymore (the nginx gateway is
+  # HTTP-only and outside the mail path); sample the engine container only.
+  $containers = 'bench-mz2'
 
   Log "RESET: mailezine engine container + MinIO bucket"
   docker rm -f bench-mz2 2>&1 | Out-Null

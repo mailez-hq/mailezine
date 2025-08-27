@@ -160,3 +160,38 @@ mailezine），验证结果可复现：
 隔离栈，MySQL backend 宿主机运行）+ mailezine（caddy gateway + 引擎
 单容器）按 benchmark.md §4 启动。原始输出保留在测试环境
 `round{A,B}-{postdove,mailezine}.log` 与 `*-load-mem.txt`。
+
+---
+
+## 复测（2026-08-28，社区版 vs 企业版）
+
+沿用同一套 `cmd/bench` + `bench-round.ps1` 两轮反序方案；环境变化：
+
+- **企业版已无 caddy gateway**：邮件端口由引擎直出，内存采样只计引擎
+  容器（postdove 仍计 nginx gateway + legacy MTA + legacy IMAP 整栈）。
+- **共享控制面认证并发**：postdove 由 legacy IMAP 原生 bcrypt 验证，而
+  mailezine 将认证委托给 backend 的 Go bcrypt（cost 12，约 1.7s/次）。
+  100 并发 IMAP 登录加引擎 3 次重试会打满默认 GOMAXPROCS 门控，导致
+  认证排队超过引擎 6s 超时（间歇性失败）。复测将控制面
+  `MAILEZ_AUTH_WORKERS` 调到 128，两栈在对称的认证容量下对比
+  （该容量属共享控制面，非被测引擎）。
+- 顺带修复：`ArchivedMessage.Subject` 索引列 1024→512（MySQL utf8mb4
+  键长超限，否则 backend 在 MySQL 上无法完成归档迁移）。
+
+### 两轮均值汇总（Round A / Round B 平均）
+
+| 指标 | postdove（社区版） | mailezine（企业版） | 比值 |
+|---|---|---|---|
+| 收件吞吐（20 并发，200 封） | 4.45 msg/s | **16.55 msg/s** | 3.7× |
+| 收件 p50 延迟 | 3.55 s | **1.03 s** | 3.5× 快 |
+| 提交吞吐（20 并发，100 封，1000 发件人） | 1.75 msg/s | **6.20 msg/s** | 3.5× |
+| 提交 p50 延迟 | 10.88 s | **2.90 s** | 3.8× 快 |
+| IMAP FETCH p50（100 并发） | 76.9 ms | **21.1 ms** | 3.6× 快 |
+| 队列投递速率 | 1.80 msg/s | **8.20 msg/s** | 4.6× |
+| 入队→投递 p50 | 40.4 s | **4.47 s** | 9.0× 快 |
+| 队列积压峰值 | 121.5 封 | **0 封** | — |
+| 空闲内存（整栈） | ~128 MiB | **~6.5 MiB** | 1/19.7 |
+| 负载内存（整栈） | ~251 MiB | **~16.5 MiB** | 1/15.2 |
+
+原始数据（本轮）：`.bench-fetch/round{A,B}-*.log`、
+`run-{A,B}-*.out`、`round{A,B}-*-load-mem.txt`。
