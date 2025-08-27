@@ -22,9 +22,9 @@ import (
 
 func runReindex(args []string) int {
 	fs := flag.NewFlagSet("mailezine reindex", flag.ContinueOnError)
-	backend := fs.String("storage", "pebble", "storage backend: pebble|rocksdb|maildir")
-	rocksPath := fs.String("rocks-path", "", "KV path (pebble/rocksdb)")
-	maildirPath := fs.String("maildir-path", "", "maildir root (maildir backend)")
+	backend := fs.String("storage", "pebble", "storage backend: pebble|tidb")
+	rocksPath := fs.String("rocks-path", "", "KV path (pebble)")
+	dsn := fs.String("dsn", "", "TiDB DSN (tidb)")
 	ftsPath := fs.String("fts-path", "", "index directory (default <rocks-path>.fts)")
 	s3 := s3Flags{}
 	fs.StringVar(&s3.endpoint, "s3-endpoint", "", "S3/MinIO endpoint (enables S3 blob)")
@@ -36,24 +36,31 @@ func runReindex(args []string) int {
 		return 2
 	}
 
-	cfg := config.Config{
-		Storage: s3.storageConfig(*backend, *rocksPath),
-	}
-	if *backend == "maildir" {
-		cfg.Storage.MaildirPath = *maildirPath
-	}
-	if *backend == "pebble" || *backend == "rocksdb" {
+	var cfg config.Config
+	switch *backend {
+	case "pebble":
 		if *rocksPath == "" {
-			fmt.Fprintln(os.Stderr, "reindex: --rocks-path is required for pebble/rocksdb")
+			fmt.Fprintln(os.Stderr, "reindex: --rocks-path is required for pebble")
 			return 2
 		}
-	}
-	if *backend == "maildir" && *maildirPath == "" {
-		fmt.Fprintln(os.Stderr, "reindex: --maildir-path is required for maildir")
+		cfg = config.Config{Storage: s3.storageConfig("pebble", *rocksPath)}
+	case "tidb":
+		if *dsn == "" {
+			fmt.Fprintln(os.Stderr, "reindex: --dsn is required for tidb")
+			return 2
+		}
+		cfg = config.Config{Storage: s3.storageConfigDSN("tidb", *dsn)}
+	default:
+		fmt.Fprintf(os.Stderr, "reindex: unsupported storage backend %q (want pebble|tidb)\n", *backend)
 		return 2
 	}
 	if *ftsPath == "" {
-		*ftsPath = *rocksPath + ".fts"
+		if *backend == "pebble" {
+			*ftsPath = *rocksPath + ".fts"
+		} else {
+			fmt.Fprintln(os.Stderr, "reindex: --fts-path is required for tidb (the index is local)")
+			return 2
+		}
 	}
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))

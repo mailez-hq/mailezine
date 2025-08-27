@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 
 	"mailezine/internal/app"
 	"mailezine/internal/config"
@@ -31,8 +30,9 @@ func runMigrate(args []string) int {
 	fs := flag.NewFlagSet("mailezine migrate", flag.ContinueOnError)
 	src := fs.String("src", "", "source maildir root")
 	from := fs.String("from", "maildir", "source backend: maildir")
-	to := fs.String("to", "pebble", "target backend: pebble")
-	dst := fs.String("dst", "", "target KV path")
+	to := fs.String("to", "pebble", "target backend: pebble|tidb")
+	dsn := fs.String("dsn", "", "TiDB DSN (required when -to tidb)")
+	dst := fs.String("dst", "", "target KV path (required when -to pebble)")
 	dryRun := fs.Bool("dry-run", false, "scan and count without writing")
 	s3 := s3Flags{}
 	fs.StringVar(&s3.endpoint, "s3-endpoint", "", "S3/MinIO endpoint (enables S3 blob)")
@@ -43,8 +43,8 @@ func runMigrate(args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if *src == "" || *dst == "" {
-		fmt.Fprintln(os.Stderr, "migrate: --src and --dst are required")
+	if *src == "" {
+		fmt.Fprintln(os.Stderr, "migrate: --src is required")
 		fs.Usage()
 		return 2
 	}
@@ -52,13 +52,27 @@ func runMigrate(args []string) int {
 		fmt.Fprintf(os.Stderr, "migrate: unsupported source backend %q\n", *from)
 		return 2
 	}
-	if *to != "pebble" {
+	var target config.StorageConfig
+	switch *to {
+	case "pebble":
+		if *dst == "" {
+			fmt.Fprintln(os.Stderr, "migrate: --dst is required for -to pebble")
+			return 2
+		}
+		target = s3.storageConfig("pebble", *dst)
+	case "tidb":
+		if *dsn == "" {
+			fmt.Fprintln(os.Stderr, "migrate: --dsn is required for -to tidb")
+			return 2
+		}
+		target = s3.storageConfigDSN("tidb", *dsn)
+	default:
 		fmt.Fprintf(os.Stderr, "migrate: unsupported target backend %q\n", *to)
 		return 2
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
 
-	return migrateMaildirToKV(*src, *dst, *dryRun, s3, logger)
+	return migrateMaildirToKV(*src, target, *dryRun, logger)
 }
 
 type s3Flags struct {
@@ -78,10 +92,20 @@ func (f s3Flags) storageConfig(backend, path string) config.StorageConfig {
 	}
 }
 
-func migrateMaildirToKV(src, dst string, dryRun bool, s3 s3Flags, logger *slog.Logger) int {
-	kv, blob, err := app.OpenKVBlob(config.Config{
-		Storage: s3.storageConfig("pebble", dst),
-	}, logger)
+func (f s3Flags) storageConfigDSN(backend, dsn string) config.StorageConfig {
+	return config.StorageConfig{
+		Backend:     backend,
+		DSN:         dsn,
+		S3Endpoint:  f.endpoint,
+		S3AccessKey: f.accessKey,
+		S3SecretKey: f.secretKey,
+		S3Bucket:    f.bucket,
+		S3UseSSL:    f.useSSL,
+	}
+}
+
+func migrateMaildirToKV(src string, target config.StorageConfig, dryRun bool, logger *slog.Logger) int {
+	kv, blob, err := app.OpenKVBlob(config.Config{Storage: target}, logger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "migrate: open target: %v\n", err)
 		return 2
@@ -156,9 +180,18 @@ func migrateMaildirToKV(src, dst string, dryRun bool, s3 s3Flags, logger *slog.L
 	if dryRun {
 		fmt.Printf("dry-run: %d accounts, %d messages, %d bytes\n", migrated, totalMessages, totalBytes)
 	} else {
-		fmt.Printf("migrated: %d accounts, %d messages, %d bytes -> %s\n", migrated, totalMessages, totalBytes, dst)
+		fmt.Printf("migrated: %d accounts, %d messages, %d bytes -> %s\n",
+			migrated, totalMessages, totalBytes, targetLabel(target))
 	}
 	return 0
+}
+
+// targetLabel describes the migration target for the summary line.
+func targetLabel(c config.StorageConfig) string {
+	if c.Backend == "tidb" {
+		return "tidb (" + c.DSN + ")"
+	}
+	return "pebble (" + c.RocksPath + ")"
 }
 
 func fail(format string, args ...any) int {
