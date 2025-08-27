@@ -44,6 +44,29 @@ const (
 	FlagTrashed Flag = 'T'
 )
 
+// imapFromMaildir maps maildir ":2," system flags to IMAP flag strings.
+var imapFromMaildir = map[Flag]string{
+	FlagDraft:   "\\Draft",
+	FlagFlagged: "\\Flagged",
+	FlagPassed:  "\\Passed",
+	FlagReplied: "\\Answered",
+	FlagSeen:    "\\Seen",
+	FlagTrashed: "\\Trashed",
+}
+
+// MaildirToIMAPFlags converts maildir ":2," system flags to IMAP flag
+// strings (used by the migrate command; \Deleted has no maildir letter and
+// lives in the sidecar keywords).
+func MaildirToIMAPFlags(flags []Flag) []string {
+	out := make([]string, 0, len(flags))
+	for _, f := range flags {
+		if s, ok := imapFromMaildir[f]; ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
 // InfoSep is the separator between the base filename and the ":2," info.
 const InfoSep = ":2,"
 

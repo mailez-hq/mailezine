@@ -1,7 +1,7 @@
 // RFC 4314 ACL extension on the IMAP session: GETACL/SETACL/DELETEACL/
 // MYRIGHTS/LISTRIGHTS, dispatched through the imapserver SessionExtension
-// hook. Persistence goes through mailstore.ACLStore (KV or maildir); the
-// owner always has full implicit rights and is never stored in the ACL.
+// hook. Persistence goes through mailstore.ACLStore (KV); the owner always
+// has full implicit rights and is never stored in the ACL.
 package imap
 
 import (

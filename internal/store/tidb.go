@@ -254,8 +254,8 @@ func (k *TiDBKV) WithTxn(ctx context.Context, fn func(t TxnOps) error) error {
 // tidbTxn applies staged writes directly on the SQL transaction; the engine
 // provides read-your-writes natively, so Get after Put/Delete observes them.
 type tidbTxn struct {
-	ctx context.Context
-	tx  *sql.Tx
+	ctx              context.Context
+	tx               *sql.Tx
 	getQ, putQ, delQ string
 	// err holds the first statement failure; the commit phase consumes it.
 	err error

@@ -75,17 +75,13 @@ dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
   `docker run -d -p 11333:11333 mailez/rspamd:local /usr/bin/rspamd -f --insecure`
   后 `go test -tags docker ...`；CI 用官方镜像跑同一套）。
 - M7 对拍 / TLS：`internal/imap` 与 `internal/pop3` 的线级生命周期测试
-  双后端共享（KV 本机 + maildir CI）；`TestSMTPStartTLS` /
+  （KV 本机）；`TestSMTPStartTLS` /
   `TestIMAPStartTLS` 用自签证书验证 STARTTLS 广告与升级后收发。
-- M7 挂载演练：`TestMountDovecotMaildir`（legacy IMAP 真实 uidlist v3 单行
-  V/N/G、`:new` 前缀、`,S=,W=` 文件名 → mailezine 读 UID1 + 追加 UID2 +
-  uidlist 保真）+ 真容器 `deploy/scripts/maildir-mount-e2e.sh`（legacy IMAP
-  播种 → mailezine 挂载 → IMAP/SMTP → legacy IMAP legacy-imap-ctl 回读）。
 - 质量批次：崩溃矩阵（`TestCrashConsistency` Pebble 本机 /
-  `TestCrashConsistencyRocks` CI；`TestQueueCrashConsistency`）、fuzz
+  `TestQueueCrashConsistency`）、fuzz
   （maildir/sieve/imap）、POP3 `TestPOP3StartTLS`、ManageSieve
   `TestManageSieveStartTLS`、`TestLoadTOMLOverlay`、队列事件与指标测试、
-  `TestMigratePebbleToMaildir`（反向迁移 + keywords 保真）、Sieve redirect
+  Sieve redirect
   （单测 + delivery 钩子 + 无队列降级）、`TestSMTPServerCapabilities`
   （8BITMIME/SIZE/DSN/SMTPUTF8 广告）、`TestOutboundTLSPolicy`
   （MTA-STS/DANE 选择：无策略/无记录 → opportunistic、TLSA → required、
@@ -137,8 +133,8 @@ dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
   `deploy/scripts/mailez-backend-e2e.sh` 一键编排并在真环境通过。
 - 存储后端自测：`cmd/storage-smoke`（dev 桩 SMTP 提交 + IMAP/POP3 读信，
   send/check 两模式）；`storage-backend-e2e.sh`（Pebble：发收 + 重启持久化
-  实测通过）与 `rocksdb-storage-e2e.sh`（RocksDB cgo：同一流程 + WAL 恢复
-  实测通过）。
+  实测通过）；`tidb-dev.ps1` / `tidb-storage-e2e.ps1`（TiDB KV 契约 +
+  收发 + 重启持久化）。
 - MinIO blob（D29）：`storage-smoke --s3-*` 用 minio-go ListObjects 断言
   `email-*` 消息对象真实落桶；`minio-storage-e2e.sh`（独立 MinIO + Pebble
   KV）实测：SMTP 提交 → 落桶 → IMAP/POP3 读信 → 重启 → 经 MinIO 恢复。

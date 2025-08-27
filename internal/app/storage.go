@@ -1,8 +1,6 @@
 // Storage assembly (ARCHITECTURE.md §3, D3/D4): the engine always opens a
-// KV+blob pair — it is the spool of the outbound queue and, for the
-// RocksDB/Pebble backend, also the mailbox index. The maildir backend
-// (POSIX-only) replaces the mailbox surface while the queue still spools
-// under <maildir>/.mailezine.
+// KV+blob pair — it is the spool of the outbound queue and the mailbox
+// index. Pebble is the single-node KV, TiDB the distributed path.
 package app
 
 import (
@@ -10,7 +8,6 @@ import (
 	"errors"
 	"log/slog"
 	"net"
-	"path/filepath"
 
 	"mailezine/internal/config"
 	"mailezine/internal/fts"
@@ -54,40 +51,27 @@ func (s *Storage) Close() error {
 	return nil
 }
 
-// NewStorage opens the configured backend pair. mailbox is nil for the
-// RocksDB/Pebble backends (the caller wraps KV+blob with mailstore.NewKV).
+// NewStorage opens the configured backend pair. The mailbox surface is
+// always the KV+blob implementation (mailstore.NewKV).
 func NewStorage(cfg config.Config, logger *slog.Logger) (*Storage, error) {
 	kv, blob, err := OpenKVBlob(cfg, logger)
 	if err != nil {
 		return nil, err
 	}
-	mailbox, err := openMailbox(cfg, logger)
-	if err != nil {
-		_ = kv.Close()
-		return nil, err
-	}
 	facade := store.New(kv, blob)
-	if mailbox == nil {
-		mailbox = mailstore.NewKV(facade)
-	}
+	mailbox := mailstore.NewKV(facade)
 	return &Storage{kv: kv, blob: blob, mailbox: mailbox, facade: facade}, nil
 }
 
 // OpenKVBlob picks the KV and blob implementations from the config:
-// RocksDB (build tag) or Pebble for KV; MinIO/S3 or local FS for blob.
+// Pebble or TiDB for KV; MinIO/S3 or local FS for blob.
 func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, error) {
 	kvPath, blobRoot := cfg.Storage.RocksPath, cfg.Storage.RocksPath+".blobs"
-	if cfg.Storage.Backend == "maildir" {
-		base := filepath.Join(cfg.Storage.MaildirPath, ".mailezine")
-		kvPath, blobRoot = filepath.Join(base, "queue.kv"), filepath.Join(base, "blobs")
-	}
 
 	var kv store.KV
 	var err error
 	switch cfg.Storage.Backend {
-	case "rocksdb":
-		kv, err = openRocks(kvPath, logger)
-	case "pebble", "maildir":
+	case "pebble":
 		kv, err = store.OpenPebble(kvPath)
 	case "tidb":
 		kv, err = store.OpenTiDB(cfg.Storage.DSN, "mailezine_kv")
@@ -144,9 +128,6 @@ func openFTS(cfg config.Config, logger *slog.Logger) *fts.Indexer {
 	path := cfg.FTS.Path
 	if path == "" {
 		base := cfg.Storage.RocksPath
-		if cfg.Storage.Backend == "maildir" {
-			base = filepath.Join(cfg.Storage.MaildirPath, ".mailezine")
-		}
 		path = base + ".fts"
 	}
 	idx, err := fts.Open(path, cfg.FTS.TikaURL, logger)

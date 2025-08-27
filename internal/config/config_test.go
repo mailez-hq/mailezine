@@ -14,7 +14,7 @@ func base() Config {
 		Log:            LogConfig{Level: "info", Format: "text"},
 		HealthAddr:     ":11480",
 		Listeners:      ListenersConfig{SMTP: ":1025", Submission: ":1587", IMAP: ":1143", ManageSieve: ":11490", POP3: ":10110"},
-		Storage:        StorageConfig{Backend: "maildir", MaildirPath: "./data/mail"},
+		Storage:        StorageConfig{Backend: "pebble", RocksPath: "./data/rocks"},
 		Directory:      DirectoryConfig{Mode: "dev", File: "testdata/directory.json", CacheTTL: 30 * time.Second},
 		Auth:           AuthConfig{Mode: "dev", DevPasswordsFile: "testdata/passwords.json"},
 		BackendAddress: "127.0.0.1:8080",
@@ -27,16 +27,16 @@ func base() Config {
 }
 
 func TestValidate(t *testing.T) {
-	t.Run("valid maildir dev", func(t *testing.T) {
+	t.Run("valid pebble dev", func(t *testing.T) {
 		if err := base().Validate(); err != nil {
 			t.Fatalf("valid config rejected: %v", err)
 		}
 	})
-	t.Run("maildir requires path", func(t *testing.T) {
+	t.Run("pebble requires path", func(t *testing.T) {
 		c := base()
-		c.Storage.MaildirPath = ""
+		c.Storage.RocksPath = ""
 		if err := c.Validate(); err == nil {
-			t.Fatal("expected error for empty maildir path")
+			t.Fatal("expected error for empty rocks path")
 		}
 	})
 	t.Run("unknown backend", func(t *testing.T) {
@@ -76,17 +76,10 @@ func TestValidate(t *testing.T) {
 			t.Fatal("expected error for missing auth file")
 		}
 	})
-	t.Run("rocksdb requires path", func(t *testing.T) {
-		c := base()
-		c.Storage.Backend = "rocksdb"
-		c.Storage.RocksPath = ""
-		if err := c.Validate(); err == nil {
-			t.Fatal("expected error for empty rocks path")
-		}
-	})
 	t.Run("pebble requires path", func(t *testing.T) {
 		c := base()
 		c.Storage.Backend = "pebble"
+		c.Storage.RocksPath = ""
 		if err := c.Validate(); err == nil {
 			t.Fatal("expected error for pebble without path")
 		}
@@ -194,13 +187,13 @@ MAILEZINE_AUTH_DEV_FILE = "/conf/passwords.json"
 	}
 
 	// Explicit environment wins over the file.
-	t.Setenv("MAILEZINE_STORAGE_BACKEND", "maildir")
-	t.Setenv("MAILEZINE_MAILDIR_PATH", "/mail")
+	t.Setenv("MAILEZINE_STORAGE_BACKEND", "tidb")
+	t.Setenv("MAILEZINE_STORAGE_DSN", "root@tcp(tidb:4000)/test")
 	cfg, err = Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Storage.Backend != "maildir" || cfg.Storage.MaildirPath != "/mail" {
+	if cfg.Storage.Backend != "tidb" || cfg.Storage.DSN != "root@tcp(tidb:4000)/test" {
 		t.Fatalf("env should override toml: %+v", cfg)
 	}
 }

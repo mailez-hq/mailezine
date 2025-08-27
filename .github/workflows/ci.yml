@@ -9,8 +9,8 @@ permissions:
   contents: read
 
 jobs:
-  # Full quality gate on Linux: format, tidy, vet, race-enabled tests
-  # (maildir tests run here — the backend is POSIX-only) and build.
+  # Full quality gate on Linux: format, tidy, vet, race-enabled tests and
+  # build.
   verify:
     runs-on: ubuntu-latest
     steps:
@@ -35,37 +35,6 @@ jobs:
       - run: go vet ./...
       - run: go test ./... -count=1
       - run: go build ./...
-
-  # RocksDB backend (cgo): compile with -tags rocksdb against librocksdb and
-  # run the KV contract suite (TestStoreRocks) plus the full test set.
-  #
-  # Distro-packaged librocksdb (Debian/Ubuntu) ships a trimmed c.h without
-  # rocksdb_slice_t, so we build the official grocksdb dist (RocksDB 10.10.1
-  # static libs) once and cache it; -tags rocksdb,testing makes the cgo
-  # flags point at that dist instead of system headers.
-  rocksdb:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26.x"
-          cache: true
-      - name: Build RocksDB static libs (cached)
-        run: |
-          apt-get update
-          apt-get install -y cmake make gcc g++ wget ca-certificates
-          cd "$(go env GOMODCACHE)/github.com/linx!gnu/grocksdb@v1.10.8"
-          test -f dist/linux_amd64/lib/librocksdb.a || make libs
-        env:
-          CGO_ENABLED: "1"
-      - name: Test with rocksdb tag
-        run: go test -tags rocksdb,testing ./... -count=1
-      - name: Cache RocksDB dist
-        uses: actions/cache@v4
-        with:
-          path: $(go env GOMODCACHE)/github.com/linx!gnu/grocksdb@v1.10.8/dist
-          key: grocksdb-dist-${{ runner.os }}-${{ runner.arch }}
 
   # Real rspamd container e2e: the /checkv2 client against a live rspamd and
   # the full SMTP→classify→store path. Tagged tests are skipped otherwise.

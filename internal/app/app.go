@@ -760,7 +760,7 @@ func (a *App) closeTermBackendsLocked() {
 		}
 	}
 	if a.qmDone != nil {
-		<-a.qmDone // queue drained before Pebble/RocksDB closes underneath it
+		<-a.qmDone // queue drained before the KV store closes underneath it
 	}
 	if a.arch != nil {
 		a.arch.Close()

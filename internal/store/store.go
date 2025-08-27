@@ -367,9 +367,9 @@ func (s *Store) DeleteEmailAtomically(
 				return err
 			}
 			if cur-size < 0 {
-			return errors.New("store: quota underflow on delete")
-		}
-		t.Append(Op{Key: quotaKey, Value: beUint64(uint64(cur - size))})
+				return errors.New("store: quota underflow on delete")
+			}
+			t.Append(Op{Key: quotaKey, Value: beUint64(uint64(cur - size))})
 		}
 
 		// Change log (allocate the next change ID in the same commit).

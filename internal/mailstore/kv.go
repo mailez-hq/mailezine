@@ -1,5 +1,5 @@
 // KV is a mailstore over the logical store (account → collection → document
-// + blob), for the RocksDB/Pebble + MinIO/FS storage mode.
+// + blob), for the Pebble/TiDB + MinIO/FS storage modes.
 package mailstore
 
 import (

@@ -91,9 +91,8 @@ type ListenersConfig struct {
 
 // StorageConfig selects the storage backend (ARCHITECTURE.md §3).
 type StorageConfig struct {
-	Backend     string // maildir|rocksdb|pebble|tidb
-	MaildirPath string
-	RocksPath   string
+	Backend   string // pebble|tidb
+	RocksPath string
 	// DSN is the TiDB/MySQL connection string used when Backend is "tidb".
 	DSN string
 	// S3 (MinIO/cloud) blob settings. Empty Endpoint ⇒ local FS blob
@@ -111,8 +110,7 @@ type StorageConfig struct {
 // FTSConfig enables the embedded full-text index (bleve).
 type FTSConfig struct {
 	Enabled bool
-	// Path is the index directory; empty derives <rockspath>.fts (or the
-	// maildir .mailezine/fts).
+	// Path is the index directory; empty derives <rockspath>.fts.
 	Path string
 	// TikaURL optionally enables attachment text extraction (Apache Tika
 	// /tika endpoint); failures degrade to indexing without attachments.
@@ -308,8 +306,7 @@ func Load() (Config, error) {
 			POP3S:       getenv("MAILEZINE_POP3S_ADDR", ""),
 		},
 		Storage: StorageConfig{
-			Backend:     getenv("MAILEZINE_STORAGE_BACKEND", "maildir"),
-			MaildirPath: getenv("MAILEZINE_MAILDIR_PATH", ""),
+			Backend:     getenv("MAILEZINE_STORAGE_BACKEND", "pebble"),
 			RocksPath:   getenv("MAILEZINE_ROCKS_PATH", ""),
 			DSN:         getenv("MAILEZINE_STORAGE_DSN", ""),
 			S3Endpoint:  getenv("MAILEZINE_S3_ENDPOINT", ""),
@@ -428,20 +425,16 @@ func (c Config) Validate() error {
 		}
 	}
 	switch c.Storage.Backend {
-	case "maildir":
-		if c.Storage.MaildirPath == "" {
-			return fmt.Errorf("config: storage backend maildir requires MAILEZINE_MAILDIR_PATH")
-		}
-	case "rocksdb", "pebble":
+	case "pebble":
 		if c.Storage.RocksPath == "" {
-			return fmt.Errorf("config: storage backend %s requires MAILEZINE_ROCKS_PATH", c.Storage.Backend)
+			return fmt.Errorf("config: storage backend pebble requires MAILEZINE_ROCKS_PATH")
 		}
 	case "tidb":
 		if c.Storage.DSN == "" {
 			return fmt.Errorf("config: storage backend tidb requires MAILEZINE_STORAGE_DSN")
 		}
 	default:
-		return fmt.Errorf("config: unsupported storage backend %q (want maildir|rocksdb|pebble|tidb)", c.Storage.Backend)
+		return fmt.Errorf("config: unsupported storage backend %q (want pebble|tidb)", c.Storage.Backend)
 	}
 	if c.Storage.S3Endpoint != "" {
 		if c.Storage.S3AccessKey == "" || c.Storage.S3SecretKey == "" || c.Storage.S3Bucket == "" {

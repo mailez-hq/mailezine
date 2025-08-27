@@ -1,7 +1,6 @@
 // Package mailstore defines the account-level mailbox operations that the
 // delivery and protocol layers depend on (ARCHITECTURE.md §2-§3). The
-// implementations are the two first-class backends: maildir (Maildir++,
-// POSIX-only) and KV+blob (RocksDB/Pebble + MinIO/FS).
+// implementation is the KV+blob backend (Pebble/TiDB + MinIO/FS).
 package mailstore
 
 import (
@@ -47,9 +46,8 @@ type Store interface {
 	QuotaUsedBytes(ctx context.Context, account string) (int64, error)
 }
 
-// MailboxStore is the full mailbox surface used by IMAP. Implementations:
-// KV+blob (RocksDB/Pebble + MinIO/FS) and maildir (POSIX-only). All
-// UID/mailbox operations are account-scoped.
+// MailboxStore is the full mailbox surface used by IMAP (KV+blob:
+// Pebble/TiDB + MinIO/FS). All UID/mailbox operations are account-scoped.
 type MailboxStore interface {
 	Store
 	// EnsureDefaultMailboxes creates and subscribes the stack's default

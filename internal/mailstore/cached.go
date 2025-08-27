@@ -22,7 +22,7 @@ type Cached struct {
 }
 
 // cachedBackend is the full surface Cached forwards to: mailbox operations
-// plus the Sieve and ACL sub-surfaces (both KV and maildir implement them).
+// plus the Sieve and ACL sub-surfaces.
 type cachedBackend interface {
 	MailboxStore
 	SieveStore

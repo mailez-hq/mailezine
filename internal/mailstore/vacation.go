@@ -1,7 +1,6 @@
 // Persistent vacation throttle state: RFC 5230 :days must survive engine
 // restarts (the in-memory map alone could send duplicate auto-replies after
-// a restart). KV backend stores under the meta space; maildir uses the
-// account sidecar.
+// a restart). The auto-reply state lives under the store's meta space.
 package mailstore
 
 import (
