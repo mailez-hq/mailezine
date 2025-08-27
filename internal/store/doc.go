@@ -8,21 +8,25 @@ import (
 
 // CreateDocument allocates the next document ID in a collection and marks the
 // document as existing. IDs are monotonic and never reused (INV-UID).
-func (s *Store) CreateDocument(_ context.Context, accountID AccountID, collection byte) (uint64, error) {
+func (s *Store) CreateDocument(ctx context.Context, accountID AccountID, collection byte) (uint64, error) {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 
 	counterKey := CounterKey(uint32(accountID), CounterKindNextDoc, []byte{collection})
-	next, err := s.getCounter(counterKey)
+	var docID uint64
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		next, err := readCounter(t.Get, counterKey)
+		if err != nil {
+			return err
+		}
+		docID = next + 1
+		t.Append(
+			Op{Key: counterKey, Value: beUint64(docID)},
+			Op{Key: FieldKey(uint32(accountID), collection, docID, FieldMeta), Value: []byte{1}},
+		)
+		return nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	docID := next + 1
-	ops := []Op{
-		{Key: counterKey, Value: beUint64(docID)},
-		{Key: FieldKey(uint32(accountID), collection, docID, FieldMeta), Value: []byte{1}},
-	}
-	if err := s.kv.Batch(ops); err != nil {
 		return 0, err
 	}
 	return docID, nil

@@ -89,6 +89,8 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 		kv, err = openRocks(kvPath, logger)
 	case "pebble", "maildir":
 		kv, err = store.OpenPebble(kvPath)
+	case "tidb":
+		kv, err = store.OpenTiDB(cfg.Storage.DSN, "mailezine_kv")
 	default:
 		err = errors.New("storage: unknown backend (validated earlier)")
 	}

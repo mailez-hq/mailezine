@@ -91,9 +91,11 @@ type ListenersConfig struct {
 
 // StorageConfig selects the storage backend (ARCHITECTURE.md §3).
 type StorageConfig struct {
-	Backend     string // maildir|rocksdb
+	Backend     string // maildir|rocksdb|pebble|tidb
 	MaildirPath string
 	RocksPath   string
+	// DSN is the TiDB/MySQL connection string used when Backend is "tidb".
+	DSN string
 	// S3 (MinIO/cloud) blob settings. Empty Endpoint ⇒ local FS blob
 	// (decision D4).
 	S3Endpoint  string
@@ -309,6 +311,7 @@ func Load() (Config, error) {
 			Backend:     getenv("MAILEZINE_STORAGE_BACKEND", "maildir"),
 			MaildirPath: getenv("MAILEZINE_MAILDIR_PATH", ""),
 			RocksPath:   getenv("MAILEZINE_ROCKS_PATH", ""),
+			DSN:         getenv("MAILEZINE_STORAGE_DSN", ""),
 			S3Endpoint:  getenv("MAILEZINE_S3_ENDPOINT", ""),
 			S3AccessKey: getenv("MAILEZINE_S3_ACCESS_KEY", ""),
 			S3SecretKey: getenv("MAILEZINE_S3_SECRET_KEY", ""),
@@ -433,8 +436,12 @@ func (c Config) Validate() error {
 		if c.Storage.RocksPath == "" {
 			return fmt.Errorf("config: storage backend %s requires MAILEZINE_ROCKS_PATH", c.Storage.Backend)
 		}
+	case "tidb":
+		if c.Storage.DSN == "" {
+			return fmt.Errorf("config: storage backend tidb requires MAILEZINE_STORAGE_DSN")
+		}
 	default:
-		return fmt.Errorf("config: unsupported storage backend %q (want maildir|rocksdb|pebble)", c.Storage.Backend)
+		return fmt.Errorf("config: unsupported storage backend %q (want maildir|rocksdb|pebble|tidb)", c.Storage.Backend)
 	}
 	if c.Storage.S3Endpoint != "" {
 		if c.Storage.S3AccessKey == "" || c.Storage.S3SecretKey == "" || c.Storage.S3Bucket == "" {

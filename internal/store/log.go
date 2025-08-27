@@ -23,22 +23,25 @@ type Change struct {
 
 // AppendChange records one change and returns its monotonic change ID
 // (INV-CHANGE: the log is append-only, gapless and ordered per account).
-func (s *Store) AppendChange(_ context.Context, accountID AccountID, collection byte, docID uint64, op byte) (uint64, error) {
+func (s *Store) AppendChange(ctx context.Context, accountID AccountID, collection byte, docID uint64, op byte) (uint64, error) {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 
 	counterKey := CounterKey(uint32(accountID), CounterKindChange, nil)
-	next, err := s.getCounter(counterKey)
+	var changeID uint64
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		next, err := readCounter(t.Get, counterKey)
+		if err != nil {
+			return err
+		}
+		changeID = next + 1
+		t.Append(
+			Op{Key: counterKey, Value: beUint64(changeID)},
+			Op{Key: ChangeLogKey(uint32(accountID), collection, changeID), Value: encodeChangeValue(collection, docID, op)},
+		)
+		return nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	changeID := next + 1
-	value := encodeChangeValue(collection, docID, op)
-	ops := []Op{
-		{Key: counterKey, Value: beUint64(changeID)},
-		{Key: ChangeLogKey(uint32(accountID), collection, changeID), Value: value},
-	}
-	if err := s.kv.Batch(ops); err != nil {
 		return 0, err
 	}
 	return changeID, nil

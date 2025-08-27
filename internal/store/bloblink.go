@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
 	"errors"
 )
 
@@ -45,15 +44,5 @@ func (s *Store) BlobRefCount(_ context.Context, accountID AccountID, blobID stri
 }
 
 func (s *Store) blobRefs(key []byte) (int64, error) {
-	v, err := s.kv.Get(key)
-	if errors.Is(err, ErrNotFound) {
-		return 0, ErrNotFound
-	}
-	if err != nil {
-		return 0, err
-	}
-	if len(v) != 8 {
-		return 0, errors.New("store: corrupt blob link")
-	}
-	return int64(binary.BigEndian.Uint64(v)), nil
+	return blobRefValue(s.kv.Get, key)
 }

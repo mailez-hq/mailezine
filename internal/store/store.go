@@ -38,47 +38,60 @@ const (
 )
 
 // Store is a KV+Blob facade exposing account-scoped operations. It is safe
-// for concurrent use; per-account mutations are serialized by sharded locks
-// (ARCHITECTURE.md §7.2).
+// for concurrent use; conflicting mutations are serialized by sharded locks
+// as a single-node optimization, while correctness under concurrency is
+// carried by the backend transaction itself (TxnKV.WithTxn). Native TiDB
+// deployments can therefore run many processes against one cluster; buffer
+// backends (Pebble/MemoryKV) keep today's single-writer semantics.
 type Store struct {
 	kv   KV
 	blob Blob
 
 	metaMu    sync.Mutex
 	accountMu [64]sync.Mutex
+
+	txn TxnKV
 }
 
 // New builds a Store over a KV and a Blob. The caller owns both and must
 // close them (Close is not part of the facade to keep ownership explicit).
+// Plain KV engines are transparently upgraded with AsTxn.
 func New(kv KV, blob Blob) *Store {
-	return &Store{kv: kv, blob: blob}
+	return &Store{kv: kv, blob: blob, txn: AsTxn(kv)}
 }
 
 // CreateAccount registers a new account and returns its ID. Duplicate emails
-// are rejected with ErrExists.
-func (s *Store) CreateAccount(_ context.Context, email string) (AccountID, error) {
+// are rejected with ErrExists. The email registry is guarded by metaMu
+// single-node; under TiDB the existence check lives inside the transaction,
+// so concurrent creators race on the key itself and exactly one commits.
+func (s *Store) CreateAccount(ctx context.Context, email string) (AccountID, error) {
 	s.metaMu.Lock()
 	defer s.metaMu.Unlock()
 
-	if _, err := s.kv.Get(MetaEmailKey(email)); err == nil {
-		return 0, ErrExists
-	} else if !errors.Is(err, ErrNotFound) {
-		return 0, err
-	}
-	next, err := s.metaCounter()
+	var id AccountID
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		if _, err := t.Get(MetaEmailKey(email)); err == nil {
+			return ErrExists
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		next, err := metaNext(t.Get)
+		if err != nil {
+			return err
+		}
+		nid := uint32(next + 1)
+		t.Append(
+			Op{Key: MetaNextAccountKey(), Value: beUint64(next + 1)},
+			Op{Key: AccountKey(nid), Value: []byte(email)},
+			Op{Key: MetaEmailKey(email), Value: beUint32(nid)},
+		)
+		id = AccountID(nid)
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	id := uint32(next + 1)
-	ops := []Op{
-		{Key: MetaNextAccountKey(), Value: beUint64(next + 1)},
-		{Key: AccountKey(id), Value: []byte(email)},
-		{Key: MetaEmailKey(email), Value: beUint32(id)},
-	}
-	if err := s.kv.Batch(ops); err != nil {
-		return 0, err
-	}
-	return AccountID(id), nil
+	return id, nil
 }
 
 // AccountByEmail resolves an email to its account ID.
@@ -167,12 +180,17 @@ func (s *Store) BumpMailboxModSeq(ctx context.Context, accountID AccountID, mbID
 	defer unlock()
 
 	key := FieldKey(uint32(accountID), CollectionMailbox, mbID, FieldMailboxModSeq)
-	next, err := s.kv.Get(key)
-	if err != nil && !errors.Is(err, ErrNotFound) {
-		return 0, err
-	}
-	modseq := beUint64Value(next) + 1
-	if err := s.kv.Put(key, beUint64(modseq)); err != nil {
+	var modseq uint64
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		cur, err := t.Get(key)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		modseq = beUint64Value(cur) + 1
+		t.Put(key, beUint64(modseq))
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
 	return modseq, nil
@@ -189,17 +207,23 @@ func (s *Store) DeleteBlob(ctx context.Context, id string) error {
 }
 
 // NextCounter allocates the next value of a per-account counter (UIDs,
-// change IDs, …) atomically under the account lock (INV-UID).
-func (s *Store) NextCounter(_ context.Context, accountID AccountID, kind byte, sub []byte) (uint64, error) {
+// change IDs, …). The allocation reads and writes the counter inside one
+// transaction (INV-UID); the account lock remains as a contention filter.
+func (s *Store) NextCounter(ctx context.Context, accountID AccountID, kind byte, sub []byte) (uint64, error) {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 	key := CounterKey(uint32(accountID), kind, sub)
-	next, err := s.getCounter(key)
+	var next uint64
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		cur, err := readCounter(t.Get, key)
+		if err != nil {
+			return err
+		}
+		next = cur + 1
+		t.Put(key, beUint64(next))
+		return nil
+	})
 	if err != nil {
-		return 0, err
-	}
-	next++
-	if err := s.kv.Put(key, beUint64(next)); err != nil {
 		return 0, err
 	}
 	return next, nil
@@ -208,7 +232,7 @@ func (s *Store) NextCounter(_ context.Context, accountID AccountID, kind byte, s
 // CounterValue reads the current value of a per-account counter (0 when
 // never allocated). The next allocation is CounterValue+1.
 func (s *Store) CounterValue(_ context.Context, accountID AccountID, kind byte, sub []byte) (uint64, error) {
-	return s.getCounter(CounterKey(uint32(accountID), kind, sub))
+	return readCounter(s.kv.Get, CounterKey(uint32(accountID), kind, sub))
 }
 
 // AppendEmailAtomically commits an Email document together with its blob
@@ -217,7 +241,7 @@ func (s *Store) CounterValue(_ context.Context, accountID AccountID, kind byte, 
 // ID first (gaps are harmless; reuse is not). Extra ops (e.g. secondary
 // index maintenance) commit in the same batch.
 func (s *Store) AppendEmailAtomically(
-	_ context.Context,
+	ctx context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
@@ -229,41 +253,53 @@ func (s *Store) AppendEmailAtomically(
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 
-	ops := make([]Op, 0, len(fields)+5)
+	linkKey := BlobLinkKey(uint32(accountID), blobID)
+	quotaKey := QuotaKey(uint32(accountID))
+	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
+
+	return s.txn.WithTxn(ctx, func(t TxnOps) error {
+		t.Append(orderedFieldOps(accountID, collection, docID, fields)...)
+
+		// Blob link (reference count +1).
+		refs, err := blobRefValue(t.Get, linkKey)
+		if errors.Is(err, ErrNotFound) {
+			refs = 0
+		} else if err != nil {
+			return err
+		}
+		t.Append(Op{Key: linkKey, Value: beUint64(uint64(refs + 1))})
+
+		// Quota (used bytes + size).
+		cur, err := quotaValue(t.Get, quotaKey)
+		if err != nil {
+			return err
+		}
+		t.Append(Op{Key: quotaKey, Value: beUint64(uint64(cur + size))})
+
+		// Change log (allocate the next change ID in the same commit).
+		nextChange, err := readCounter(t.Get, changeCounter)
+		if err != nil {
+			return err
+		}
+		nextChange++
+		t.Append(
+			Op{Key: changeCounter, Value: beUint64(nextChange)},
+			Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpCreate)},
+		)
+
+		t.Append(extra...)
+		return nil
+	})
+}
+
+// orderedFieldOps converts a field map into per-field ops. The buffer keeps
+// map iteration order irrelevant: each key lands at most once either way.
+func orderedFieldOps(accountID AccountID, collection byte, docID uint64, fields map[byte][]byte) []Op {
+	ops := make([]Op, 0, len(fields))
 	for field, value := range fields {
 		ops = append(ops, Op{Key: FieldKey(uint32(accountID), collection, docID, field), Value: value})
 	}
-
-	// Blob link (reference count +1).
-	linkKey := BlobLinkKey(uint32(accountID), blobID)
-	refs, err := s.blobRefs(linkKey)
-	if errors.Is(err, ErrNotFound) {
-		refs = 0
-	} else if err != nil {
-		return err
-	}
-	ops = append(ops, Op{Key: linkKey, Value: beUint64(uint64(refs + 1))})
-
-	// Quota (used bytes + size).
-	quotaKey := QuotaKey(uint32(accountID))
-	cur, err := s.quotaCounter(quotaKey)
-	if err != nil {
-		return err
-	}
-	ops = append(ops, Op{Key: quotaKey, Value: beUint64(uint64(cur + size))})
-
-	// Change log (allocate the next change ID in the same batch).
-	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
-	nextChange, err := s.getCounter(changeCounter)
-	if err != nil {
-		return err
-	}
-	nextChange++
-	ops = append(ops,
-		Op{Key: changeCounter, Value: beUint64(nextChange)},
-		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpCreate)},
-	)
-	return s.kv.Batch(append(ops, extra...))
+	return ops
 }
 
 // DeleteEmailAtomically removes an Email document together with its blob
@@ -272,7 +308,7 @@ func (s *Store) AppendEmailAtomically(
 // by the caller when the link count reaches zero. Extra ops (e.g. secondary
 // index removal) commit in the same batch.
 func (s *Store) DeleteEmailAtomically(
-	_ context.Context,
+	ctx context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
@@ -282,75 +318,80 @@ func (s *Store) DeleteEmailAtomically(
 	defer unlock()
 
 	prefix := DocumentKey(uint32(accountID), collection, docID)
-	var blobID string
-	var size int64
-	var ops []Op
-	err := s.kv.Scan(prefix, func(k, v []byte) error {
-		key := append([]byte(nil), k...)
-		ops = append(ops, Op{Key: key, Delete: true})
-		switch field := k[len(k)-1]; field {
-		case EmailFieldBlob:
-			blobID = string(v)
-		case EmailFieldSize:
-			if len(v) == 8 {
-				size = int64(binary.BigEndian.Uint64(v))
+	quotaKey := QuotaKey(uint32(accountID))
+	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
+
+	return s.txn.WithTxn(ctx, func(t TxnOps) error {
+		var blobID string
+		var size int64
+		var ops []Op
+		err := s.kv.Scan(prefix, func(k, v []byte) error {
+			key := append([]byte(nil), k...)
+			ops = append(ops, Op{Key: key, Delete: true})
+			switch field := k[len(k)-1]; field {
+			case EmailFieldBlob:
+				blobID = string(v)
+			case EmailFieldSize:
+				if len(v) == 8 {
+					size = int64(binary.BigEndian.Uint64(v))
+				}
 			}
-		}
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	if len(ops) == 0 {
-		return ErrNotFound
-	}
-
-	// Blob link (reference count -1).
-	if blobID != "" {
-		linkKey := BlobLinkKey(uint32(accountID), blobID)
-		refs, err := s.blobRefs(linkKey)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
-		if refs > 1 {
-			ops = append(ops, Op{Key: linkKey, Value: beUint64(uint64(refs - 1))})
-		} else {
-			ops = append(ops, Op{Key: linkKey, Delete: true})
-		}
-	}
-
-	// Quota (used bytes - size).
-	if size != 0 {
-		quotaKey := QuotaKey(uint32(accountID))
-		cur, err := s.quotaCounter(quotaKey)
+			return nil
+		})
 		if err != nil {
 			return err
 		}
-		if cur-size < 0 {
+		if len(ops) == 0 {
+			return ErrNotFound
+		}
+		t.Append(ops...)
+
+		// Blob link (reference count -1).
+		if blobID != "" {
+			linkKey := BlobLinkKey(uint32(accountID), blobID)
+			refs, err := blobRefValue(t.Get, linkKey)
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			if refs > 1 {
+				t.Append(Op{Key: linkKey, Value: beUint64(uint64(refs - 1))})
+			} else {
+				t.Append(Op{Key: linkKey, Delete: true})
+			}
+		}
+
+		// Quota (used bytes - size).
+		if size != 0 {
+			cur, err := quotaValue(t.Get, quotaKey)
+			if err != nil {
+				return err
+			}
+			if cur-size < 0 {
 			return errors.New("store: quota underflow on delete")
 		}
-		ops = append(ops, Op{Key: quotaKey, Value: beUint64(uint64(cur - size))})
-	}
+		t.Append(Op{Key: quotaKey, Value: beUint64(uint64(cur - size))})
+		}
 
-	// Change log (delete).
-	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
-	nextChange, err := s.getCounter(changeCounter)
-	if err != nil {
-		return err
-	}
-	nextChange++
-	ops = append(ops,
-		Op{Key: changeCounter, Value: beUint64(nextChange)},
-		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpDelete)},
-	)
-	return s.kv.Batch(append(ops, extra...))
+		// Change log (allocate the next change ID in the same commit).
+		nextChange, err := readCounter(t.Get, changeCounter)
+		if err != nil {
+			return err
+		}
+		nextChange++
+		t.Append(
+			Op{Key: changeCounter, Value: beUint64(nextChange)},
+			Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpDelete)},
+		)
+		t.Append(extra...)
+		return nil
+	})
 }
 
 // UpdateDocumentAtomically writes fields and a changelog update entry in one
 // batch (INV-CHANGE: flag/keyword/mailbox moves are observable changes).
 // Extra ops (e.g. secondary index maintenance) commit in the same batch.
 func (s *Store) UpdateDocumentAtomically(
-	_ context.Context,
+	ctx context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
@@ -360,25 +401,58 @@ func (s *Store) UpdateDocumentAtomically(
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 
-	ops := make([]Op, 0, len(fields)+2)
-	for field, value := range fields {
-		ops = append(ops, Op{Key: FieldKey(uint32(accountID), collection, docID, field), Value: value})
-	}
 	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
-	nextChange, err := s.getCounter(changeCounter)
-	if err != nil {
-		return err
-	}
-	nextChange++
-	ops = append(ops,
-		Op{Key: changeCounter, Value: beUint64(nextChange)},
-		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpUpdate)},
-	)
-	return s.kv.Batch(append(ops, extra...))
+
+	return s.txn.WithTxn(ctx, func(t TxnOps) error {
+		t.Append(orderedFieldOps(accountID, collection, docID, fields)...)
+		nextChange, err := readCounter(t.Get, changeCounter)
+		if err != nil {
+			return err
+		}
+		nextChange++
+		t.Append(
+			Op{Key: changeCounter, Value: beUint64(nextChange)},
+			Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpUpdate)},
+		)
+		t.Append(extra...)
+		return nil
+	})
 }
 
-func (s *Store) metaCounter() (uint64, error) {
-	v, err := s.kv.Get(MetaNextAccountKey())
+// blobRefValue decodes a blob link count through get.
+func blobRefValue(get func([]byte) ([]byte, error), key []byte) (int64, error) {
+	v, err := get(key)
+	if errors.Is(err, ErrNotFound) {
+		return 0, ErrNotFound
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(v) != 8 {
+		return 0, errors.New("store: corrupt blob link")
+	}
+	return int64(binary.BigEndian.Uint64(v)), nil
+}
+
+// quotaValue decodes the quota counter through get; absent keys decode as 0.
+func quotaValue(get func([]byte) ([]byte, error), key []byte) (int64, error) {
+	v, err := get(key)
+	if errors.Is(err, ErrNotFound) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	if len(v) != 8 {
+		return 0, errors.New("store: corrupt quota counter")
+	}
+	return int64(binary.BigEndian.Uint64(v)), nil
+}
+
+// metaNext decodes the global account-id allocator through get (0 when the
+// key has never been written).
+func metaNext(get func([]byte) ([]byte, error)) (uint64, error) {
+	v, err := get(MetaNextAccountKey())
 	if errors.Is(err, ErrNotFound) {
 		return 0, nil
 	}
@@ -388,14 +462,10 @@ func (s *Store) metaCounter() (uint64, error) {
 	return binary.BigEndian.Uint64(v), nil
 }
 
-func (s *Store) lockAccount(id AccountID) func() {
-	mu := &s.accountMu[uint32(id)%uint32(len(s.accountMu))]
-	mu.Lock()
-	return mu.Unlock
-}
-
-func (s *Store) getCounter(key []byte) (uint64, error) {
-	v, err := s.kv.Get(key)
+// readCounter decodes a big-endian uint64 counter through get; absent keys
+// decode as zero.
+func readCounter(get func([]byte) ([]byte, error), key []byte) (uint64, error) {
+	v, err := get(key)
 	if errors.Is(err, ErrNotFound) {
 		return 0, nil
 	}
@@ -406,6 +476,12 @@ func (s *Store) getCounter(key []byte) (uint64, error) {
 		return 0, errors.New("store: corrupt counter")
 	}
 	return binary.BigEndian.Uint64(v), nil
+}
+
+func (s *Store) lockAccount(id AccountID) func() {
+	mu := &s.accountMu[uint32(id)%uint32(len(s.accountMu))]
+	mu.Lock()
+	return mu.Unlock
 }
 
 func beUint32(v uint32) []byte {
