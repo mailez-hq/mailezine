@@ -4,6 +4,7 @@ package imap
 
 import (
 	"context"
+	"strings"
 
 	"github.com/emersion/go-imap/v2"
 	"mailezine/internal/imapserver"
@@ -73,7 +74,11 @@ func applyStoreOp(current []string, store *imap.StoreFlags) []string {
 
 func hasStoreFlag(flags []imap.Flag, want string) bool {
 	for _, f := range flags {
-		if string(f) == want {
+		// RFC 3501 §9: keywords are matched case-insensitively. go-imap
+		// clients canonicalize keywords to lowercase on fetch, so comparing
+		// case-sensitively here would silently fail to remove flags stored
+		// with a different case (e.g. $Snoozed vs $snoozed).
+		if strings.EqualFold(string(f), want) {
 			return true
 		}
 	}
