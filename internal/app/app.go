@@ -21,10 +21,12 @@ import (
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
+	"mailezine/internal/dlp"
 	"mailezine/internal/fts"
 	"mailezine/internal/ha"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
+	"mailezine/internal/mailbuffer"
 	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
@@ -61,6 +63,7 @@ type App struct {
 	qm         *queue.Manager
 	qmDone     chan struct{}
 	arch       *archive.Spool
+	dlpCheck   dlp.Checker
 
 	leader   *ha.Leader
 	haCtx    context.Context
@@ -97,6 +100,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return nil, err
 	}
 	a.wireArchive()
+	a.wireDLP()
 	if err := a.wireServers(); err != nil {
 		a.Close()
 		return nil, err
@@ -285,6 +289,15 @@ func (a *App) wireArchive() {
 	a.logger.Info("archive", "enabled", true, "endpoint", a.cfg.Archive.URL)
 }
 
+// wireDLP builds the outbound content-filter client when enabled.
+func (a *App) wireDLP() {
+	if !a.cfg.DLP.Enabled {
+		return
+	}
+	a.dlpCheck = dlp.NewHTTP(a.cfg.DLP.URL, a.logger)
+	a.logger.Info("dlp", "enabled", true, "endpoint", a.cfg.DLP.URL)
+}
+
 // wireServers builds the protocol servers (listeners start in Run).
 func (a *App) wireServers() error {
 	trustedNets, err := parseNets(a.cfg.TrustedNets)
@@ -301,6 +314,28 @@ func (a *App) wireServers() error {
 	if a.arch != nil {
 		submitInbound = a.arch.Wrap("inbound", submit)
 		submitOutbound = a.arch.Wrap("outbound", submit)
+	}
+	if a.dlpCheck != nil {
+		base := submitOutbound
+		submitOutbound = func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error {
+			raw, err := data.ReadAll()
+			if err != nil {
+				return err
+			}
+			dec, derr := a.dlpCheck.Check(ctx, user, from, to, raw)
+			if derr != nil {
+				a.logger.Warn("dlp: check failed, fail open", "from", from, "err", derr)
+			} else if dec.Action == "block" {
+				a.logger.Info("dlp: blocked", "from", from, "to", to, "reason", dec.Reason)
+				return fmt.Errorf("dlp: blocked: %s", dec.Reason)
+			} else if dec.Action == "hold" {
+				// The control plane parked the message for approval; the
+				// submission is accepted but nothing is delivered yet.
+				a.logger.Info("dlp: held for approval", "from", from, "to", to, "pending", dec.ID)
+				return nil
+			}
+			return base(ctx, peer, user, from, to, data)
+		}
 	}
 
 	a.smtpInbound = smtp.NewServer(&smtp.Backend{

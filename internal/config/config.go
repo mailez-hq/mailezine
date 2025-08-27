@@ -62,6 +62,9 @@ type Config struct {
 	// Archive captures compliance copies of inbound/outbound mail and
 	// forwards them to the control plane archive store.
 	Archive ArchiveConfig
+	// DLP scans outbound submissions against control-plane rules
+	// (敏感词过滤 + 审批); failures fail open.
+	DLP DLPConfig
 }
 
 // LogConfig controls the structured logger.
@@ -206,6 +209,14 @@ type ArchiveConfig struct {
 	MaxAttempts int
 }
 
+// DLPConfig controls the outbound content filter client.
+type DLPConfig struct {
+	Enabled bool
+	// URL is the control-plane check endpoint; empty derives
+	// http://<BackendAddress>/stack/dlp/check.
+	URL string
+}
+
 // Load reads configuration from the environment and validates it.
 func Load() (Config, error) {
 	// Optional TOML overlay (MAILEZINE_CONFIG): a flat map of the same
@@ -328,6 +339,10 @@ func Load() (Config, error) {
 			URL:         getenv("MAILEZINE_ARCHIVE_URL", ""),
 			MaxAttempts: envInt("MAILEZINE_ARCHIVE_MAX_ATTEMPTS", 10),
 		},
+		DLP: DLPConfig{
+			Enabled: envBool("MAILEZINE_DLP_ENABLED", false),
+			URL:     getenv("MAILEZINE_DLP_URL", ""),
+		},
 		Management: ManagementConfig{
 			Addr:   getenv("MAILEZINE_MANAGEMENT_ADDR", ""),
 			Secret: getenv("MAILEZINE_MANAGEMENT_SECRET", ""),
@@ -382,6 +397,9 @@ func Load() (Config, error) {
 	}
 	if cfg.Archive.MaxAttempts <= 0 {
 		cfg.Archive.MaxAttempts = 10
+	}
+	if cfg.DLP.Enabled && cfg.DLP.URL == "" {
+		cfg.DLP.URL = "http://" + cfg.BackendAddress + "/stack/dlp/check"
 	}
 
 	if err := cfg.Validate(); err != nil {
