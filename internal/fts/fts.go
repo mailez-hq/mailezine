@@ -121,11 +121,16 @@ func (ix *Indexer) searchableText(ctx context.Context, data []byte) string {
 			out.WriteByte('\n')
 		}
 	}
-	var attachments [][]byte
+	var attachments []attachmentPart
 	walkParts(msg, &out, &attachments)
-	if ix.tikaURL != "" {
-		for _, att := range attachments {
-			if text, err := ix.tikaExtract(ctx, att); err == nil && text != "" {
+	for _, att := range attachments {
+		// Built-in extraction first (政企内网零依赖); Tika covers the long
+		// tail when configured.
+		if text := extractAttachmentText(att.Name, att.ContentType, att.Data); text != "" {
+			out.WriteString("\n")
+			out.WriteString(text)
+		} else if ix.tikaURL != "" {
+			if text, err := ix.tikaExtract(ctx, att.Data); err == nil && text != "" {
 				out.WriteString("\n")
 				out.WriteString(text)
 			}
@@ -159,9 +164,16 @@ func (ix *Indexer) tikaExtract(ctx context.Context, data []byte) (string, error)
 var htmlTagRe = regexp.MustCompile(`(?s)<[^>]+>`)
 var whitespaceRe = regexp.MustCompile(`\s+`)
 
+// attachmentPart is one non-text leaf with its MIME metadata.
+type attachmentPart struct {
+	Name        string
+	ContentType string
+	Data        []byte
+}
+
 // walkParts collects visible text into out and non-text attachment bodies
 // into attachments (bounded per part).
-func walkParts(msg *message.Entity, out *strings.Builder, attachments *[][]byte) {
+func walkParts(msg *message.Entity, out *strings.Builder, attachments *[]attachmentPart) {
 	mt, _, _ := msg.Header.ContentType()
 	if strings.HasPrefix(mt, "text/plain") || strings.HasPrefix(mt, "text/html") {
 		body, err := io.ReadAll(io.LimitReader(msg.Body, 4<<20))
@@ -191,7 +203,20 @@ func walkParts(msg *message.Entity, out *strings.Builder, attachments *[][]byte)
 	if mt != "" {
 		body, err := io.ReadAll(io.LimitReader(msg.Body, 8<<20))
 		if err == nil && len(body) > 0 {
-			*attachments = append(*attachments, body)
+			name := ""
+			if _, params, derr := msg.Header.ContentDisposition(); derr == nil && params != nil {
+				name = params["filename"]
+			}
+			if name == "" {
+				if _, params, cerr := msg.Header.ContentType(); cerr == nil && params != nil {
+					name = params["name"]
+				}
+			}
+			*attachments = append(*attachments, attachmentPart{
+				Name:        name,
+				ContentType: mt,
+				Data:        body,
+			})
 		}
 	}
 }
