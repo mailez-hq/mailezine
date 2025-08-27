@@ -21,12 +21,20 @@ import (
 // AccountID is a globally unique account identifier.
 type AccountID uint32
 
-// Email document field ids referenced by the store itself (atomic delete
-// needs the blob link and size for INV-BLOB / INV-QUOTA accounting).
-// mailstore defines the full field table; these must stay in sync.
+// Canonical Email document field ids (ARCHITECTURE.md §2.1). This is the
+// single source of truth for the full field table: mailstore aliases it on
+// the write path, and the atomic-delete accounting below references the same
+// constants so quota/blob bookkeeping can never drift from writes.
 const (
-	EmailFieldBlob byte = 1
-	EmailFieldSize byte = 7
+	EmailFieldBlob     byte = 1
+	EmailFieldUID      byte = 2
+	EmailFieldMailbox  byte = 3
+	EmailFieldFlags    byte = 4
+	EmailFieldDate     byte = 5
+	EmailFieldFrom     byte = 6
+	EmailFieldSize     byte = 7
+	EmailFieldKeywords byte = 8
+	EmailFieldModSeq   byte = 9
 )
 
 // Store is a KV+Blob facade exposing account-scoped operations. It is safe
@@ -206,7 +214,8 @@ func (s *Store) CounterValue(_ context.Context, accountID AccountID, kind byte, 
 // AppendEmailAtomically commits an Email document together with its blob
 // link, quota accounting and change-log entry in one KV batch
 // (INV-BLOB / INV-QUOTA / INV-CHANGE). Callers allocate the UID and document
-// ID first (gaps are harmless; reuse is not).
+// ID first (gaps are harmless; reuse is not). Extra ops (e.g. secondary
+// index maintenance) commit in the same batch.
 func (s *Store) AppendEmailAtomically(
 	_ context.Context,
 	accountID AccountID,
@@ -215,6 +224,7 @@ func (s *Store) AppendEmailAtomically(
 	fields map[byte][]byte,
 	blobID string,
 	size int64,
+	extra ...Op,
 ) error {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
@@ -253,18 +263,20 @@ func (s *Store) AppendEmailAtomically(
 		Op{Key: changeCounter, Value: beUint64(nextChange)},
 		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpCreate)},
 	)
-	return s.kv.Batch(ops)
+	return s.kv.Batch(append(ops, extra...))
 }
 
 // DeleteEmailAtomically removes an Email document together with its blob
 // link, quota accounting and a delete changelog entry in one batch
 // (INV-BLOB / INV-QUOTA / INV-CHANGE). The blob itself is garbage-collected
-// by the caller when the link count reaches zero.
+// by the caller when the link count reaches zero. Extra ops (e.g. secondary
+// index removal) commit in the same batch.
 func (s *Store) DeleteEmailAtomically(
 	_ context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
+	extra ...Op,
 ) error {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
@@ -331,17 +343,19 @@ func (s *Store) DeleteEmailAtomically(
 		Op{Key: changeCounter, Value: beUint64(nextChange)},
 		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpDelete)},
 	)
-	return s.kv.Batch(ops)
+	return s.kv.Batch(append(ops, extra...))
 }
 
 // UpdateDocumentAtomically writes fields and a changelog update entry in one
 // batch (INV-CHANGE: flag/keyword/mailbox moves are observable changes).
+// Extra ops (e.g. secondary index maintenance) commit in the same batch.
 func (s *Store) UpdateDocumentAtomically(
 	_ context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
 	fields map[byte][]byte,
+	extra ...Op,
 ) error {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
@@ -360,7 +374,7 @@ func (s *Store) UpdateDocumentAtomically(
 		Op{Key: changeCounter, Value: beUint64(nextChange)},
 		Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpUpdate)},
 	)
-	return s.kv.Batch(ops)
+	return s.kv.Batch(append(ops, extra...))
 }
 
 func (s *Store) metaCounter() (uint64, error) {

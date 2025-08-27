@@ -15,17 +15,28 @@ import (
 	"mailezine/internal/store"
 )
 
-// Document field ids for Email documents (ARCHITECTURE.md §2.1).
+// Error aliases for the protocol layers (IMAP/POP3/ManageSieve/management):
+// matching must go through these — not the store package — so consumers of
+// the MailboxStore interface never need to import internal/store. They are
+// the same error values the KV and maildir backends return.
+var (
+	ErrNotFound = store.ErrNotFound
+	ErrExists   = store.ErrExists
+)
+
+// Document field ids for Email documents (ARCHITECTURE.md §2.1) — aliases
+// to the canonical table in internal/store so the write path can never drift
+// from the atomic-delete accounting there.
 const (
-	fieldBlobID   byte = 1
-	fieldUID      byte = 2
-	fieldMailbox  byte = 3
-	fieldFlags    byte = 4
-	fieldDate     byte = 5
-	fieldFrom     byte = 6
-	fieldSize     byte = 7
-	fieldKeywords byte = 8
-	fieldModSeq   byte = 9
+	fieldBlobID   = store.EmailFieldBlob
+	fieldUID      = store.EmailFieldUID
+	fieldMailbox  = store.EmailFieldMailbox
+	fieldFlags    = store.EmailFieldFlags
+	fieldDate     = store.EmailFieldDate
+	fieldFrom     = store.EmailFieldFrom
+	fieldSize     = store.EmailFieldSize
+	fieldKeywords = store.EmailFieldKeywords
+	fieldModSeq   = store.EmailFieldModSeq
 )
 
 // Mailbox document fields (CollectionMailbox).
@@ -97,8 +108,10 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 		fieldKeywords: []byte(strings.Join(keywords, ",")),
 		fieldModSeq:   beUint64(modseq),
 	}
-	// Fields + blob link + quota + change log commit atomically.
-	if err := k.s.AppendEmailAtomically(ctx, acctID, store.CollectionEmail, docID, fields, blobID, size); err != nil {
+	// Fields + blob link + quota + change log + per-mailbox index commit
+	// atomically.
+	idx := store.Op{Key: store.IndexEmailKey(uint32(acctID), mbID, uid), Value: beUint64(docID)}
+	if err := k.s.AppendEmailAtomically(ctx, acctID, store.CollectionEmail, docID, fields, blobID, size, idx); err != nil {
 		return 0, err
 	}
 	return uint32(uid), nil
@@ -133,11 +146,27 @@ func (k *KV) ensureMailbox(ctx context.Context, acctID store.AccountID, mailbox 
 	if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionMailbox, docID, fields); err != nil {
 		return 0, err
 	}
+	if err := k.s.PutRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox), beUint64(docID)); err != nil {
+		return 0, err
+	}
 	return docID, nil
 }
 
-// mailboxDocID resolves a mailbox name to its document ID.
+// mailboxDocID resolves a mailbox name to its document ID. The primary path
+// is a single index GET; a missing or stale entry falls back to the linear
+// collection scan and repairs the index in place.
 func (k *KV) mailboxDocID(ctx context.Context, acctID store.AccountID, mailbox string) (uint64, error) {
+	key := store.IndexMailboxNameKey(uint32(acctID), mailbox)
+	if v, err := k.s.GetRaw(ctx, key); err == nil && len(v) == 8 {
+		id := binary.BigEndian.Uint64(v)
+		if fields, ferr := k.s.GetDocumentFields(ctx, acctID, store.CollectionMailbox, id); ferr == nil &&
+			string(fields[mbFieldName]) == mailbox {
+			return id, nil
+		}
+		// Stale (points at a deleted/renamed mailbox) — repair below.
+	} else if err != nil && !errors.Is(err, store.ErrNotFound) {
+		return 0, err
+	}
 	ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionMailbox)
 	if err != nil {
 		return 0, err
@@ -148,6 +177,9 @@ func (k *KV) mailboxDocID(ctx context.Context, acctID store.AccountID, mailbox s
 			return 0, err
 		}
 		if string(fields[mbFieldName]) == mailbox {
+			if err := k.s.PutRaw(ctx, key, beUint64(id)); err != nil {
+				return 0, err
+			}
 			return id, nil
 		}
 	}
@@ -242,27 +274,29 @@ func (e *Email) Seen() bool {
 	return false
 }
 
-// EmailByUID reads one email document. UID uniqueness is per mailbox.
+// EmailByUID reads one email document. UID uniqueness is per mailbox; the
+// lookup is a single index GET followed by one document read.
 func (k *KV) EmailByUID(ctx context.Context, account, mailbox string, uid uint32) (*Email, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionEmail)
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
 	if err != nil {
 		return nil, err
 	}
-	for _, id := range ids {
-		fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, id)
-		if err != nil {
-			return nil, err
-		}
-		if string(fields[fieldMailbox]) != mailbox || binary.BigEndian.Uint64(fields[fieldUID]) != uint64(uid) {
-			continue
-		}
-		return emailFromFields(id, fields), nil
+	docID, err := k.s.GetRaw(ctx, store.IndexEmailKey(uint32(acctID), mbID, uint64(uid)))
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, store.ErrNotFound
 	}
-	return nil, store.ErrNotFound
+	if err != nil || len(docID) != 8 {
+		return nil, store.ErrNotFound
+	}
+	fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, binary.BigEndian.Uint64(docID))
+	if err != nil {
+		return nil, err
+	}
+	return emailFromFields(binary.BigEndian.Uint64(docID), fields), nil
 }
 
 func emailFromFields(docID uint64, fields map[byte][]byte) *Email {

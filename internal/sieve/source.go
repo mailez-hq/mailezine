@@ -9,7 +9,6 @@ import (
 
 	"mailezine/internal/directory"
 	"mailezine/internal/mailstore"
-	"mailezine/internal/store"
 )
 
 // ScriptSource resolves the active script of an account.
@@ -39,7 +38,7 @@ type DefaultScriptSource struct {
 func (s DefaultScriptSource) ActiveSieveScript(ctx context.Context, account string) (string, bool, error) {
 	if s.Store != nil {
 		scripts, err := s.Store.ListSieveScripts(ctx, account)
-		if err != nil && !errors.Is(err, store.ErrNotFound) {
+		if err != nil && !errors.Is(err, mailstore.ErrNotFound) {
 			return "", false, err
 		}
 		for _, meta := range scripts {

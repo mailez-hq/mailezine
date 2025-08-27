@@ -21,7 +21,6 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/directory"
 	"mailezine/internal/mailstore"
-	"mailezine/internal/store"
 )
 
 // Server is the ManageSieve listener backend.
@@ -216,7 +215,7 @@ func (s *mSession) handleGetScript(ctx context.Context, fields []string) error {
 				return err
 			}
 			return s.status("OK", "")
-		} else if !errors.Is(err, store.ErrNotFound) {
+		} else if !errors.Is(err, mailstore.ErrNotFound) {
 			return s.status("NO", "script storage error")
 		}
 	}
@@ -276,7 +275,7 @@ func (s *mSession) handleSetActive(ctx context.Context, fields []string) error {
 	}
 	name := strings.Trim(fields[1], `"`)
 	if err := s.srv.Scripts.SetSieveActive(ctx, s.user, name); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return s.status("NO", "no such script")
 		}
 		return s.status("NO", "script storage error")
@@ -296,7 +295,7 @@ func (s *mSession) handleDeleteScript(ctx context.Context, fields []string) erro
 	}
 	name := strings.Trim(fields[1], `"`)
 	if err := s.srv.Scripts.DeleteSieveScript(ctx, s.user, name); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return s.status("NO", "no such script")
 		}
 		return s.status("NO", "script storage error")

@@ -21,6 +21,12 @@ const (
 	SpaceQuota    byte = 'u'
 )
 
+// Index tag bytes inside the index space (first byte after accountID).
+const (
+	IdxMailboxName byte = 'n' // (account, mailbox name) → mailbox docID
+	IdxEmailMbox   byte = 'e' // (account, mailbox docID, UID) → email docID
+)
+
 // Counter kinds inside the account space (ARCHITECTURE.md §5.1).
 const (
 	CounterKindNextDoc byte = 0x01 // per (account, collection)
@@ -145,6 +151,32 @@ func MetaEmailKey(email string) []byte {
 	k := []byte{SpaceMeta}
 	k = append(k, "email:"...)
 	return append(k, email...)
+}
+
+// IndexMailboxNameKey maps (account, mailbox name) to the mailbox document
+// ID. Maintained in the same batch as the mailbox document when practical;
+// a stale entry self-heals on resolution (mailstore falls back to a linear
+// scan and repairs).
+func IndexMailboxNameKey(accountID uint32, name string) []byte {
+	k := appendSpaceID(SpaceIndex, accountID)
+	k = append(k, IdxMailboxName)
+	return append(k, name...)
+}
+
+// IndexEmailKey maps (account, mailbox docID, UID) to the email document ID.
+// Ascending key order yields per-mailbox messages in UID order.
+func IndexEmailKey(accountID uint32, mbID, uid uint64) []byte {
+	k := appendSpaceID(SpaceIndex, accountID)
+	k = append(k, IdxEmailMbox)
+	k = appendUint64(k, mbID)
+	return appendUint64(k, uid)
+}
+
+// IndexEmailPrefix is the scan prefix of one mailbox's email index.
+func IndexEmailPrefix(accountID uint32, mbID uint64) []byte {
+	k := appendSpaceID(SpaceIndex, accountID)
+	k = append(k, IdxEmailMbox)
+	return appendUint64(k, mbID)
 }
 
 // MetaNextAccountKey is the global account-ID allocator.

@@ -8,6 +8,7 @@ package mailstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"sort"
@@ -144,7 +145,7 @@ func (k *KV) MailboxStatus(ctx context.Context, account, mailbox string) (Mailbo
 		Subscribed:    len(fields[mbFieldSubscribed]) == 1 && fields[mbFieldSubscribed][0] == 1,
 		HighestModSeq: beUint64Value(fields[store.FieldMailboxModSeq]),
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	emails, err := k.mailboxEmails(ctx, acctID, mbID)
 	if err != nil {
 		return Mailbox{}, err
 	}
@@ -185,6 +186,9 @@ func (k *KV) CreateMailbox(ctx context.Context, account, mailbox string) (uint32
 	if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionMailbox, docID, fields); err != nil {
 		return 0, err
 	}
+	if err := k.s.PutRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox), beUint64(docID)); err != nil {
+		return 0, err
+	}
 	return uint32(docID), nil
 }
 
@@ -199,20 +203,24 @@ func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
 	if err != nil {
 		return err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	emails, err := k.mailboxEmails(ctx, acctID, mbID)
 	if err != nil {
 		return err
 	}
 	for _, e := range emails {
-		if err := k.deleteEmail(ctx, acctID, e.DocID); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID); err != nil {
 			return err
 		}
 	}
-	return k.s.DeleteDocument(ctx, acctID, store.CollectionMailbox, mbID)
+	if err := k.s.DeleteDocument(ctx, acctID, store.CollectionMailbox, mbID); err != nil {
+		return err
+	}
+	return k.s.DeleteRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox))
 }
 
-// RenameMailbox moves the mailbox (messages keep their UIDs; the UID
-// counter is keyed by mailbox identity, not name).
+// RenameMailbox moves the mailbox (messages keep their UIDs; both the UID
+// counter and the per-mailbox email index are keyed by mailbox identity —
+// docID — so only the name index and each email's mailbox field change).
 func (k *KV) RenameMailbox(ctx context.Context, account, oldName, newName string) error {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
@@ -227,11 +235,15 @@ func (k *KV) RenameMailbox(ctx context.Context, account, oldName, newName string
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return err
 	}
+	nameIdx := []store.Op{
+		{Key: store.IndexMailboxNameKey(uint32(acctID), oldName), Delete: true},
+		{Key: store.IndexMailboxNameKey(uint32(acctID), newName), Value: beUint64(mbID)},
+	}
 	if err := k.s.UpdateDocumentAtomically(ctx, acctID, store.CollectionMailbox, mbID,
-		map[byte][]byte{mbFieldName: []byte(newName)}); err != nil {
+		map[byte][]byte{mbFieldName: []byte(newName)}, nameIdx...); err != nil {
 		return err
 	}
-	emails, err := k.emailsOf(ctx, acctID, oldName)
+	emails, err := k.mailboxEmails(ctx, acctID, mbID)
 	if err != nil {
 		return err
 	}
@@ -268,7 +280,11 @@ func (k *KV) ListMessages(ctx context.Context, account, mailbox string) ([]*Mess
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
+	if err != nil {
+		return nil, err
+	}
+	emails, err := k.mailboxEmails(ctx, acctID, mbID)
 	if err != nil {
 		return nil, err
 	}
@@ -279,22 +295,42 @@ func (k *KV) ListMessages(ctx context.Context, account, mailbox string) ([]*Mess
 	return out, nil
 }
 
+// emailDocIDByUID resolves one UID through the per-mailbox index (a single
+// GET) and returns the document with its fields.
+func (k *KV) emailByIndexUID(ctx context.Context, acctID store.AccountID, mbID, uid uint64) (*Email, error) {
+	val, err := k.s.GetRaw(ctx, store.IndexEmailKey(uint32(acctID), mbID, uid))
+	if errors.Is(err, store.ErrNotFound) || (err == nil && len(val) != 8) {
+		return nil, store.ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	docID := binary.BigEndian.Uint64(val)
+	fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, docID)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, store.ErrNotFound // stale index entry (pre-delete)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return emailFromFields(docID, fields), nil
+}
+
 // MessageByUID returns one message's metadata (without body).
 func (k *KV) MessageByUID(ctx context.Context, account, mailbox string, uid uint32) (*Message, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range emails {
-		if e.UID == uid {
-			return messageFromEmail(e), nil
-		}
+	e, err := k.emailByIndexUID(ctx, acctID, mbID, uint64(uid))
+	if err != nil {
+		return nil, err
 	}
-	return nil, store.ErrNotFound
+	return messageFromEmail(e), nil
 }
 
 // SetFlags replaces the system flags and keywords of one message.
@@ -307,27 +343,21 @@ func (k *KV) SetFlags(ctx context.Context, account, mailbox string, uid uint32, 
 	if err != nil {
 		return err
 	}
+	e, err := k.emailByIndexUID(ctx, acctID, mbID, uint64(uid))
+	if err != nil {
+		return err
+	}
 	modseq, err := k.s.BumpMailboxModSeq(ctx, acctID, mbID)
 	if err != nil {
 		return err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
-	if err != nil {
-		return err
-	}
-	for _, e := range emails {
-		if e.UID != uid {
-			continue
-		}
-		system, keywords := splitFlags(flags)
-		return k.s.UpdateDocumentAtomically(ctx, acctID, store.CollectionEmail, e.DocID,
-			map[byte][]byte{
-				fieldFlags:    []byte(strings.Join(system, ",")),
-				fieldKeywords: []byte(strings.Join(keywords, ",")),
-				fieldModSeq:   beUint64(modseq),
-			})
-	}
-	return store.ErrNotFound
+	system, keywords := splitFlags(flags)
+	return k.s.UpdateDocumentAtomically(ctx, acctID, store.CollectionEmail, e.DocID,
+		map[byte][]byte{
+			fieldFlags:    []byte(strings.Join(system, ",")),
+			fieldKeywords: []byte(strings.Join(keywords, ",")),
+			fieldModSeq:   beUint64(modseq),
+		})
 }
 
 // Append stores a message and returns its new UID (APPEND semantics).
@@ -342,17 +372,17 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
+	if err != nil {
+		return nil, err
+	}
+	emails, err := k.mailboxEmails(ctx, acctID, mbID)
 	if err != nil {
 		return nil, err
 	}
 	uidFilter := map[uint32]struct{}{}
 	for _, u := range uids {
 		uidFilter[u] = struct{}{}
-	}
-	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
-	if err != nil {
-		return nil, err
 	}
 	var deleted []uint32
 	for _, e := range emails {
@@ -363,7 +393,7 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 		} else if !e.HasFlag("\\Deleted") {
 			continue
 		}
-		if err := k.deleteEmail(ctx, acctID, e.DocID); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID); err != nil {
 			return deleted, err
 		}
 		deleted = append(deleted, e.UID)
@@ -382,7 +412,11 @@ func (k *KV) Copy(ctx context.Context, account, src, dst string, uids []uint32) 
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, src)
+	srcMBID, err := k.mailboxDocID(ctx, acctID, src)
+	if err != nil {
+		return nil, err
+	}
+	emails, err := k.mailboxEmails(ctx, acctID, srcMBID)
 	if err != nil {
 		return nil, err
 	}
@@ -428,7 +462,7 @@ func (k *KV) Move(ctx context.Context, account, src, dst string, uids []uint32) 
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, src)
+	emails, err := k.mailboxEmails(ctx, acctID, srcMBID)
 	if err != nil {
 		return nil, err
 	}
@@ -457,7 +491,7 @@ func (k *KV) Move(ctx context.Context, account, src, dst string, uids []uint32) 
 		if err != nil {
 			return mapping, err
 		}
-		if err := k.deleteEmail(ctx, acctID, e.DocID); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, srcMBID); err != nil {
 			return mapping, err
 		}
 		mapping[e.UID] = uint32(newUID)
@@ -476,33 +510,37 @@ func (k *KV) OpenMessage(ctx context.Context, account, mailbox string, uid uint3
 	if err != nil {
 		return nil, err
 	}
-	emails, err := k.emailsOf(ctx, acctID, mailbox)
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
 	if err != nil {
 		return nil, err
 	}
-	for _, e := range emails {
-		if e.UID != uid {
-			continue
-		}
-		var buf bytes.Buffer
-		if err := k.s.GetBlob(ctx, e.BlobID, &buf); err != nil {
-			return nil, err
-		}
-		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+	e, err := k.emailByIndexUID(ctx, acctID, mbID, uint64(uid))
+	if err != nil {
+		return nil, err
 	}
-	return nil, store.ErrNotFound
+	var buf bytes.Buffer
+	if err := k.s.GetBlob(ctx, e.BlobID, &buf); err != nil {
+		return nil, err
+	}
+	return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
 }
 
-// deleteEmail removes one email document and garbage-collects its blob.
-func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID uint64) error {
-	// Read the blob reference before deletion (the fields are removed in
-	// the same batch as the link decrement).
+// deleteEmail removes one email document (and its per-mailbox index entry,
+// committed in the same batch) and garbage-collects its blob.
+func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbID uint64) error {
+	// Read the blob reference and UID before deletion (the fields are
+	// removed in the same batch as the link decrement and index delete).
 	var blobID string
+	var idx []store.Op
 	fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, docID)
 	if err == nil {
 		blobID = string(fields[fieldBlobID])
+		if len(fields[fieldUID]) == 8 {
+			uid := binary.BigEndian.Uint64(fields[fieldUID])
+			idx = append(idx, store.Op{Key: store.IndexEmailKey(uint32(acctID), mbID, uid), Delete: true})
+		}
 	}
-	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID); err != nil {
+	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID, idx...); err != nil {
 		return err
 	}
 	// Garbage-collect the blob when the link count reaches zero.
@@ -515,7 +553,8 @@ func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID uint
 }
 
 // emailsOf lists every Email document of an account, optionally filtered by
-// mailbox, ordered by UID.
+// mailbox, ordered by UID. The unfiltered form is only used for account-wide
+// statistics; per-mailbox callers use mailboxEmails.
 func (k *KV) emailsOf(ctx context.Context, acctID store.AccountID, mailbox string) ([]*Email, error) {
 	ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionEmail)
 	if err != nil {
@@ -537,10 +576,108 @@ func (k *KV) emailsOf(ctx context.Context, acctID store.AccountID, mailbox strin
 	return out, nil
 }
 
+// Reindex backfills the secondary indexes (mailbox-name → docID,
+// per-mailbox (mbID, UID) → docID) from the document collections — the
+// one-time migration for data written before the indexes existed.
+// Idempotent: entries are only rewritten when missing or divergent, so it
+// is safe to run on every start-up of a KV-backed engine.
+func (k *KV) Reindex(ctx context.Context) (int, error) {
+	accounts, err := k.s.ListAccounts(ctx)
+	if err != nil {
+		return 0, err
+	}
+	fixed := 0
+	for _, account := range accounts {
+		acctID, err := k.s.AccountByEmail(ctx, account)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		} else if err != nil {
+			return fixed, err
+		}
+		// Mailbox documents → name index.
+		mbIDs, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionMailbox)
+		if err != nil {
+			return fixed, err
+		}
+		byName := map[string]uint64{}
+		for _, id := range mbIDs {
+			fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionMailbox, id)
+			if err != nil {
+				return fixed, err
+			}
+			name := string(fields[mbFieldName])
+			byName[name] = id
+			key := store.IndexMailboxNameKey(uint32(acctID), name)
+			if v, gerr := k.s.GetRaw(ctx, key); gerr != nil || len(v) != 8 ||
+				binary.BigEndian.Uint64(v) != id {
+				if err := k.s.PutRaw(ctx, key, beUint64(id)); err != nil {
+					return fixed, err
+				}
+				fixed++
+			}
+		}
+		// Email documents → per-mailbox index (keyed by mailbox identity,
+		// so renamed mailboxes keep their entries).
+		ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionEmail)
+		if err != nil {
+			return fixed, err
+		}
+		for _, id := range ids {
+			fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, id)
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			} else if err != nil {
+				return fixed, err
+			}
+			e := emailFromFields(id, fields)
+			mbID, ok := byName[e.Mailbox]
+			if !ok {
+				continue // mailbox deleted; nothing to hang the entry on
+			}
+			key := store.IndexEmailKey(uint32(acctID), mbID, uint64(e.UID))
+			if v, gerr := k.s.GetRaw(ctx, key); gerr != nil || len(v) != 8 ||
+				binary.BigEndian.Uint64(v) != id {
+				if err := k.s.PutRaw(ctx, key, beUint64(id)); err != nil {
+					return fixed, err
+				}
+				fixed++
+			}
+		}
+	}
+	return fixed, nil
+}
+
+// mailboxEmails lists the messages of one mailbox via the (mbID, UID) →
+// docID secondary index: a bounded prefix scan (the mailbox's own messages,
+// in ascending UID order) plus one document read per message. Stale entries
+// pointing at deleted documents are skipped.
+func (k *KV) mailboxEmails(ctx context.Context, acctID store.AccountID, mbID uint64) ([]*Email, error) {
+	var out []*Email
+	err := k.s.ScanRaw(ctx, store.IndexEmailPrefix(uint32(acctID), mbID), func(_ []byte, val []byte) error {
+		if len(val) != 8 {
+			return nil
+		}
+		docID := binary.BigEndian.Uint64(val)
+		fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, docID)
+		if errors.Is(err, store.ErrNotFound) {
+			return nil // stale index entry; deletion path cleans it up
+		}
+		if err != nil {
+			return err
+		}
+		out = append(out, emailFromFields(docID, fields))
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func messageFromEmail(e *Email) *Message {
 	return &Message{
-		UID:          e.UID,
-		From:         e.From,
+		UID:  e.UID,
+		From: e.From,
 		// Match the maildir backend: keywords are exposed through Flags so
 		// FETCH and SEARCH (KEYWORD) see them; SetFlags re-splits them.
 		Flags:        append(append([]string(nil), e.Flags...), e.Keywords...),

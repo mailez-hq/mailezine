@@ -21,7 +21,6 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/directory"
 	"mailezine/internal/mailstore"
-	"mailezine/internal/store"
 )
 
 // Server is the POP3 listener backend.
@@ -486,7 +485,7 @@ func (s *session) commit(ctx context.Context) error {
 	for uid := range s.deleted {
 		uids = append(uids, uid)
 	}
-	if _, err := s.srv.Store.Expunge(ctx, s.user, "INBOX", uids); err != nil && !errors.Is(err, store.ErrNotFound) {
+	if _, err := s.srv.Store.Expunge(ctx, s.user, "INBOX", uids); err != nil && !errors.Is(err, mailstore.ErrNotFound) {
 		s.srv.Logger.Error("pop3: expunge on quit", "user", s.user, "err", err)
 	}
 	return nil

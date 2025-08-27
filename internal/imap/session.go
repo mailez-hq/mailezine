@@ -15,7 +15,6 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/directory"
 	"mailezine/internal/mailstore"
-	"mailezine/internal/store"
 )
 
 // session is one IMAP connection. The mailbox field is the selected
@@ -64,7 +63,7 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	}
 	st, err := s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) || errors.Is(err, directory.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) || errors.Is(err, directory.ErrNotFound) {
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,
 				Code: imap.ResponseCodeNonExistent,
@@ -108,7 +107,7 @@ func (s *session) Unselect() error {
 
 func (s *session) Create(mailbox string, options *imap.CreateOptions) error {
 	_, err := s.srv.Store.CreateMailbox(context.Background(), s.user, mailbox)
-	if errors.Is(err, store.ErrExists) {
+	if errors.Is(err, mailstore.ErrExists) {
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
@@ -123,7 +122,7 @@ func (s *session) Delete(mailbox string) error {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be deleted"}
 	}
 	err := s.srv.Store.DeleteMailbox(context.Background(), s.user, mailbox)
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, mailstore.ErrNotFound) {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
 	}
 	return err
@@ -134,7 +133,7 @@ func (s *session) Rename(mailbox, newName string, options *imap.RenameOptions) e
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Text: "INBOX cannot be renamed"}
 	}
 	err := s.srv.Store.RenameMailbox(context.Background(), s.user, mailbox, newName)
-	if errors.Is(err, store.ErrNotFound) {
+	if errors.Is(err, mailstore.ErrNotFound) {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
 	}
 	return err
@@ -190,7 +189,7 @@ func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
 	mb, err := s.srv.Store.MailboxStatus(context.Background(), s.user, mailbox)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
 		}
 		return nil, err
@@ -216,7 +215,7 @@ func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 	}
 	uid, err := s.srv.Store.Append(context.Background(), s.user, mailbox, msg)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
 		}
 		return nil, err
@@ -406,7 +405,7 @@ func (s *session) Copy(numSet imap.NumSet, dest string) (*imap.CopyData, error) 
 	}
 	mapping, err := s.srv.Store.Copy(ctx, s.user, s.mbox, dest, uids)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
 		}
 		return nil, err
@@ -441,7 +440,7 @@ func (s *session) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string
 	}
 	mapping, err := s.srv.Store.Move(ctx, s.user, s.mbox, dest, uids)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
+		if errors.Is(err, mailstore.ErrNotFound) {
 			return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTryCreate, Text: "No such mailbox"}
 		}
 		return err

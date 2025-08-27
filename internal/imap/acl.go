@@ -16,7 +16,6 @@ import (
 	"mailezine/internal/imapserver"
 	"mailezine/internal/imapwire"
 	"mailezine/internal/mailstore"
-	"mailezine/internal/store"
 )
 
 // hasACL reports whether the server store provides RFC 4314 ACLs.
@@ -210,7 +209,7 @@ func aclError(err error) error {
 	if _, ok := err.(*imap.Error); ok {
 		return err
 	}
-	if err == store.ErrNotFound {
+	if err == mailstore.ErrNotFound {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
 	}
 	return fmt.Errorf("acl: %w", err)
