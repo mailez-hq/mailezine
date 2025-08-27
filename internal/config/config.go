@@ -37,9 +37,10 @@ type Config struct {
 	Management     ManagementConfig
 	BackendAddress string
 	Hostname       string
-	// RecipientDelimiter is the extended-address separator: mail to
-	// "user+tag@domain" delivers to the base user when the full address is
-	// unknown. Empty disables plus addressing.
+	// StackSecret authenticates the internal /stack API toward the mailez
+	// control plane (MAILEZINE_STACK_SECRET). Empty keeps the legacy
+	// unauthenticated local-dev mode; both sides must agree on the value.
+	StackSecret        string
 	RecipientDelimiter string
 	TrustedNets        []string // CIDRs that are authenticated by the gateway
 	Rspamd             RspamdConfig
@@ -348,6 +349,7 @@ func Load() (Config, error) {
 			Secret: getenv("MAILEZINE_MANAGEMENT_SECRET", ""),
 		},
 		BackendAddress: getenv("MAILEZINE_BACKEND_ADDRESS", "127.0.0.1:8080"),
+		StackSecret:    getenv("MAILEZINE_STACK_SECRET", ""),
 		TrustedNets:    splitCSV(getenv("MAILEZINE_TRUSTED_NETS", "127.0.0.1/8,::1/128")),
 		Rspamd: RspamdConfig{
 			URL:      getenv("MAILEZINE_RSPAMD_URL", ""),

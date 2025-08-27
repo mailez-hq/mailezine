@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"mailezine/internal/mailbuffer"
+	"mailezine/internal/stackhttp"
 )
 
 const (
@@ -78,8 +79,9 @@ type Spool struct {
 	started atomic.Bool
 }
 
-// New builds a spool. url is the control-plane ingest endpoint.
-func New(st backingStore, url string, maxAttempts int, logger *slog.Logger) *Spool {
+// New builds a spool. url is the control-plane ingest endpoint; the optional
+// secret authenticates the internal API (empty = unauthenticated local dev).
+func New(st backingStore, url string, maxAttempts int, logger *slog.Logger, secret ...string) *Spool {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -89,7 +91,7 @@ func New(st backingStore, url string, maxAttempts int, logger *slog.Logger) *Spo
 	return &Spool{
 		st:          st,
 		url:         url,
-		hc:          &http.Client{Timeout: 30 * time.Second},
+		hc:          stackhttp.New(stackhttp.First(secret), 30*time.Second),
 		maxAttempts: maxAttempts,
 		logger:      logger,
 		backoffBase: 15 * time.Second,

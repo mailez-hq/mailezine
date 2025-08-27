@@ -19,8 +19,9 @@ import (
 )
 
 // wireQueue builds the outbound queue with opportunistic DKIM signing,
-// metrics, bounce and delay-warning routing.
-func (a *App) wireQueue() error {
+// metrics, bounce and delay-warning routing under runCtx (the per-term
+// context when HA is enabled, so workers stop before the KV does).
+func (a *App) wireQueue(runCtx context.Context) error {
 	if !a.cfg.Outbound.Enabled {
 		return nil
 	}
@@ -61,7 +62,7 @@ func (a *App) wireQueue() error {
 		qOpts.DelayWarning = q.DelayWarning
 	}
 	a.qm = queue.New(a.st.kv, a.st.blob, deliverer, qOpts, a.logger)
-	a.qm.SetSigner(opportunisticSigner{dkim.NewSigner(a.cfg.DKIMVaultURL, a.logger), a.logger})
+	a.qm.SetSigner(opportunisticSigner{dkim.NewSigner(a.cfg.DKIMVaultURL, a.logger, a.cfg.StackSecret), a.logger})
 	a.qm.SetOnEvent(func(event string) {
 		a.m.QueueMessages.WithLabelValues(event).Inc()
 	})
@@ -76,7 +77,7 @@ func (a *App) wireQueue() error {
 	a.qmDone = make(chan struct{})
 	go func() {
 		defer close(a.qmDone)
-		if err := a.qm.Run(a.ctx); err != nil {
+		if err := a.qm.Run(runCtx); err != nil {
 			a.logger.Error("queue", "err", err)
 		}
 	}()
@@ -167,7 +168,7 @@ func newAuth(cfg config.Config, logger *slog.Logger) (auth.Service, error) {
 		return s, nil
 	case "mailez":
 		base := "http://" + cfg.BackendAddress + "/stack"
-		s := auth.NewMailez(base)
+		s := auth.NewMailez(base, cfg.StackSecret)
 		logger.Info("auth", "mode", "mailez", "base", base)
 		return s, nil
 	default:

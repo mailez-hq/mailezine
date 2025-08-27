@@ -17,7 +17,6 @@ import (
 
 	"mailezine/internal/mailstore"
 	"mailezine/internal/queue"
-	"mailezine/internal/store"
 )
 
 // Info is the read-only state the management API reports.
@@ -204,7 +203,7 @@ func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accou
 			http.Error(w, "unsupported action", http.StatusNotFound)
 			return
 		}
-		if errors.Is(opErr, store.ErrNotFound) {
+		if errors.Is(opErr, mailstore.ErrNotFound) {
 			http.Error(w, "message not found", http.StatusNotFound)
 			return
 		}

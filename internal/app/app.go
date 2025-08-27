@@ -2,16 +2,30 @@
 // wires every service (storage, delivery, queue, protocol servers) and runs
 // their lifecycle. The main package only parses flags, installs signal
 // handling and translates errors into exit codes.
+//
+// Lifecycle model:
+//
+//	non-HA: New assembles every service eagerly (startup failures surface
+//	        from New); Run binds all listeners and serves until cancelled.
+//	HA:     New bootstraps the lease infrastructure only; the instance binds
+//	        its health endpoint immediately (a standby answers probes and
+//	        reports role=standby) and activates the full write path only
+//	        while it holds the lease. Losing the lease — a foreign holder or
+//	        the fencing epoch moving past us detected at renewal — drains
+//	        SMTP gracefully, stops every writer and loops back to standby.
 package app
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
@@ -21,12 +35,10 @@ import (
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
-	"mailezine/internal/dlp"
 	"mailezine/internal/fts"
 	"mailezine/internal/ha"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
-	"mailezine/internal/mailbuffer"
 	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
@@ -44,13 +56,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// App is the fully assembled engine. New completes all startup work that can
-// fail (leadership acquisition, storage open, service wiring); Run serves
-// until ctx is cancelled and then drains gracefully. Close releases the
-// durable backends.
+// App is the fully assembled engine. Depending on mode, New completes part
+// or all of the startup work that can fail; Run serves until ctx is
+// cancelled and then drains gracefully. Close releases durable backends and
+// is safe to call in any lifecycle state.
 type App struct {
 	cfg    config.Config
-	ctx    context.Context
+	ctx    context.Context // root context supplied at construction
 	logger *slog.Logger
 	m      *metrics.Metrics
 
@@ -63,12 +75,8 @@ type App struct {
 	qm         *queue.Manager
 	qmDone     chan struct{}
 	arch       *archive.Spool
-	dlpCheck   dlp.Checker
 
-	leader   *ha.Leader
-	haCtx    context.Context
-	haCancel context.CancelFunc
-
+	tlsConf   *tls.Config
 	startedAt time.Time
 
 	smtpInbound    *gosmtp.Server
@@ -78,136 +86,112 @@ type App struct {
 	pop3Srv        *pop3.Server
 	healthSrv      *http.Server
 	mgmtSrv        *http.Server
+
+	leader     *ha.Leader
+	haCtx      context.Context    // app-lifetime; cancelled by Close
+	haCancel   context.CancelFunc // cancels haCtx
+	termCtx    context.Context    // current HA term scope (listeners, queue)
+	termCancel context.CancelFunc // cancels termCtx
+
+	ready      atomic.Bool // write path bound and served
+	assembled  bool        // services currently open on this process
+	teardownMu sync.Mutex  // serializes teardown paths (term loss + Close)
 }
 
-// New assembles every service. It blocks while a follower waits for the HA
-// lease, so the returned App is ready to serve.
+// New builds the engine.
+//
+//	non-HA: assembles everything that can fail here.
+//	HA:     bootstraps the lease store only; a follower returns immediately
+//	        instead of blocking, so its health endpoint can come up while it
+//	        waits for leadership.
 func New(ctx context.Context, cfg config.Config) (*App, error) {
 	logger := telemetry.NewLogger(cfg.Log.Level, cfg.Log.Format)
 	m := metrics.New()
 	logger.Info("starting", "version", version.Version, "summary", cfg.Summary())
 	a := &App{cfg: cfg, ctx: ctx, logger: logger, m: m, startedAt: time.Now()}
 
-	if err := a.acquireLeadership(ctx); err != nil {
-		return nil, err
+	if cfg.HA.Enabled {
+		if err := a.bootstrapHA(); err != nil {
+			return nil, err
+		}
+		return a, nil
 	}
 	if err := a.openServices(); err != nil {
 		a.Close()
 		return nil, err
 	}
-	if err := a.wirePipeline(); err != nil {
+	if err := a.wirePipeline(a.ctx); err != nil {
 		a.Close()
 		return nil, err
 	}
-	a.wireArchive()
-	a.wireDLP()
+	a.wireArchive(a.ctx)
 	if err := a.wireServers(); err != nil {
 		a.Close()
 		return nil, err
 	}
+	a.assembled = true
+	a.ready.Store(true)
 	return a, nil
 }
 
 // Run starts every listener and blocks until ctx is cancelled, then drains
-// the queue and shuts the servers down gracefully.
+// gracefully. In HA mode the instance additionally loops through
+// standby→leader terms until ctx ends.
 func (a *App) Run(ctx context.Context) error {
-	if err := a.serveListeners(ctx); err != nil {
+	if err := a.serveHealth(ctx); err != nil {
 		return err
 	}
-	<-ctx.Done()
+	a.logger.Info("listening", "component", "health", "addr", a.cfg.HealthAddr)
+
+	var runErr error
+	if a.cfg.HA.Enabled {
+		runErr = a.superviseTerms(ctx)
+	} else if err := a.serveManagement(ctx); err != nil {
+		runErr = err
+	} else if err := a.serveMailListeners(ctx); err != nil {
+		runErr = err
+	} else {
+		a.logger.Info("mail path ready", "inbound", a.cfg.Listeners.SMTP,
+			"submission", a.cfg.Listeners.Submission, "imap", a.cfg.Listeners.IMAP,
+			"managesieve", a.cfg.Listeners.ManageSieve)
+		<-ctx.Done()
+	}
 
 	a.logger.Info("shutting down")
-	// Drain queue workers before closing storage (Pebble/RocksDB must not
-	// be touched after Close).
-	if a.qmDone != nil {
-		<-a.qmDone
-	}
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	for _, srv := range []*gosmtp.Server{a.smtpInbound, a.smtpSubmission} {
-		if srv == nil {
-			continue
-		}
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			a.logger.Error("shutdown", "component", "smtp", "err", err)
-		}
-	}
-	if a.imapSrv != nil {
-		a.imapSrv.Close()
-	}
-	for _, srv := range []*http.Server{a.healthSrv, a.mgmtSrv} {
-		if srv == nil {
-			continue
-		}
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			a.logger.Error("shutdown", "component", srv.Addr, "err", err)
-			return err
-		}
-	}
+	// HA terms are torn down by their own supervisor before it returns; the
+	// non-HA assembly is drained here. Both paths are idempotent.
+	a.stopTerm("")
+	a.shutdownControlServers()
 	a.logger.Info("stopped")
-	return nil
+	return runErr
 }
 
-// Close releases the durable backends and the leadership lease. Idempotent.
+// shutdownControlServers stops the process-wide HTTP servers that outlive
+// individual HA terms.
+func (a *App) shutdownControlServers() {
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if a.healthSrv != nil {
+		if err := a.healthSrv.Shutdown(shutdownCtx); err != nil {
+			a.logger.Error("shutdown", "component", "health", "err", err)
+		}
+	}
+}
+
+// Close releases durable backends and any held leadership lease. Idempotent;
+// safe whether or not Run completed.
 func (a *App) Close() {
+	a.teardownMu.Lock()
+	defer a.teardownMu.Unlock()
+	a.closeTermBackendsLocked()
 	if a.haCancel != nil {
 		a.haCancel()
 	}
-	if a.leader != nil {
-		_ = a.leader.Release(context.Background())
-	}
-	if a.fts != nil {
-		_ = a.fts.Close()
-	}
-	if a.arch != nil {
-		a.arch.Close()
-	}
-	if a.st != nil {
-		_ = a.st.Close()
-	}
-	if a.auth != nil {
-		_ = a.auth.Close()
-	}
-	if a.dir != nil {
-		_ = a.dir.Close()
-	}
 }
 
-// acquireLeadership takes the active-passive lease before the single-writer
-// KV is opened; followers poll until the lease expires (D31).
-func (a *App) acquireLeadership(ctx context.Context) error {
-	if !a.cfg.HA.Enabled {
-		return nil
-	}
-	store, err := openHAStore(a.cfg, a.logger)
-	if err != nil {
-		return fmt.Errorf("ha: lease store: %w", err)
-	}
-	owner := a.cfg.Hostname + "-" + fmt.Sprint(os.Getpid())
-	ttl := time.Duration(a.cfg.HA.TTLSeconds) * time.Second
-	if ttl <= 0 {
-		ttl = 15 * time.Second
-	}
-	a.haCtx, a.haCancel = context.WithCancel(context.Background())
-	leader := ha.NewLeader(store, owner, ttl, a.logger)
-	a.leader = leader
-	for {
-		if err := leader.TryAcquire(a.haCtx); err == nil {
-			break
-		} else if !errors.Is(err, ha.ErrNotLeader) {
-			return fmt.Errorf("ha: lease acquire: %w", err)
-		}
-		a.logger.Info("ha: standby, waiting for leadership", "owner", owner)
-		select {
-		case <-a.haCtx.Done():
-			return errors.New("ha: interrupted while waiting for leadership")
-		case <-time.After(ttl / 2):
-		}
-	}
-	a.logger.Info("ha: leadership acquired", "owner", owner, "ttl", ttl)
-	go leader.Run(a.haCtx)
-	return nil
-}
+// ---------------------------------------------------------------------------
+// Service assembly (shared by non-HA eager start and per-term activation).
+// ---------------------------------------------------------------------------
 
 // openServices opens the directory, auth and storage backends plus FTS.
 func (a *App) openServices() error {
@@ -228,6 +212,23 @@ func (a *App) openServices() error {
 	if a.st, err = NewStorage(a.cfg, a.logger); err != nil {
 		return err
 	}
+	// One-shot backfill of the KV secondary indexes (name and per-mailbox
+	// email indexes). Idempotent — existing entries are only rewritten when
+	// divergent — so it is safe to repeat per HA term. Async: never block
+	// start-up on a large store.
+	if kvms, ok := a.st.mailbox.(*mailstore.KV); ok {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			defer cancel()
+			n, err := kvms.Reindex(ctx)
+			switch {
+			case err != nil:
+				a.logger.Warn("storage: index backfill incomplete", "fixed", n, "err", err)
+			case n > 0:
+				a.logger.Info("storage: index backfill", "entries", n)
+			}
+		}()
+	}
 	// Metadata cache: message/mailbox lists are memoized per account with a
 	// TTL safety net; every write path invalidates the affected mailboxes.
 	if a.cfg.MetaCacheSizeBytes > 0 {
@@ -242,8 +243,9 @@ func (a *App) openServices() error {
 	return nil
 }
 
-// wirePipeline builds the inbound pipeline and the outbound queue.
-func (a *App) wirePipeline() error {
+// wirePipeline builds the inbound pipeline and the outbound queue under
+// runCtx (per-term when HA is enabled).
+func (a *App) wirePipeline(runCtx context.Context) error {
 	verifier := &verify.Verifier{
 		Logger:   a.logger,
 		Resolver: newSystemResolver(),
@@ -271,34 +273,21 @@ func (a *App) wirePipeline() error {
 		// classifier must leave the field nil (delivery fails open).
 		a.pipeline.Classifier = classifier
 	}
-	if err := a.wireQueue(); err != nil {
-		return err
-	}
-	return nil
+	return a.wireQueue(runCtx)
 }
 
 // wireArchive builds the compliance-capture spool when enabled and starts
-// its forwarding worker. Captures survive restarts in the engine's KV/blob
-// store; the worker re-drains them on boot.
-func (a *App) wireArchive() {
+// its forwarding worker under runCtx.
+func (a *App) wireArchive(runCtx context.Context) {
 	if !a.cfg.Archive.Enabled || a.st == nil {
 		return
 	}
-	a.arch = archive.New(a.st.Facade(), a.cfg.Archive.URL, a.cfg.Archive.MaxAttempts, a.logger)
-	a.arch.Run(a.ctx)
+	a.arch = archive.New(a.st.Facade(), a.cfg.Archive.URL, a.cfg.Archive.MaxAttempts, a.logger, a.cfg.StackSecret)
+	a.arch.Run(runCtx)
 	a.logger.Info("archive", "enabled", true, "endpoint", a.cfg.Archive.URL)
 }
 
-// wireDLP builds the outbound content-filter client when enabled.
-func (a *App) wireDLP() {
-	if !a.cfg.DLP.Enabled {
-		return
-	}
-	a.dlpCheck = dlp.NewHTTP(a.cfg.DLP.URL, a.logger)
-	a.logger.Info("dlp", "enabled", true, "endpoint", a.cfg.DLP.URL)
-}
-
-// wireServers builds the protocol servers (listeners start in Run).
+// wireServers builds the protocol servers (listeners start later).
 func (a *App) wireServers() error {
 	trustedNets, err := parseNets(a.cfg.TrustedNets)
 	if err != nil {
@@ -308,34 +297,13 @@ func (a *App) wireServers() error {
 	if err != nil {
 		return err
 	}
+	a.tlsConf = tlsConf
 	submit := newSubmit(a.dir, a.pipeline, a.qm, a.logger)
 	submitInbound := submit
 	submitOutbound := submit
 	if a.arch != nil {
 		submitInbound = a.arch.Wrap("inbound", submit)
 		submitOutbound = a.arch.Wrap("outbound", submit)
-	}
-	if a.dlpCheck != nil {
-		base := submitOutbound
-		submitOutbound = func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error {
-			raw, err := data.ReadAll()
-			if err != nil {
-				return err
-			}
-			dec, derr := a.dlpCheck.Check(ctx, user, from, to, raw)
-			if derr != nil {
-				a.logger.Warn("dlp: check failed, fail open", "from", from, "err", derr)
-			} else if dec.Action == "block" {
-				a.logger.Info("dlp: blocked", "from", from, "to", to, "reason", dec.Reason)
-				return fmt.Errorf("dlp: blocked: %s", dec.Reason)
-			} else if dec.Action == "hold" {
-				// The control plane parked the message for approval; the
-				// submission is accepted but nothing is delivered yet.
-				a.logger.Info("dlp: held for approval", "from", from, "to", to, "pending", dec.ID)
-				return nil
-			}
-			return base(ctx, peer, user, from, to, data)
-		}
 	}
 
 	a.smtpInbound = smtp.NewServer(&smtp.Backend{
@@ -420,76 +388,92 @@ func listenerPort(addr string) string {
 	return port
 }
 
-// serveListeners binds and serves every HTTP and protocol listener.
-func (a *App) serveListeners(ctx context.Context) error {
-	cfg := a.cfg
-	a.healthSrv = a.healthServer()
-	if err := serveHTTP(ctx, a.healthSrv, a.logger); err != nil {
-		return fmt.Errorf("health: %w", err)
-	}
-	a.logger.Info("listening", "component", "health", "addr", cfg.HealthAddr)
+// ---------------------------------------------------------------------------
+// HTTP endpoints.
+// ---------------------------------------------------------------------------
 
-	if cfg.Management.Addr != "" {
-		mgmtHandler := management.WithSecret(
-			management.NewHandler(management.Info{
-				Version:       version.Version,
-				Storage:       cfg.Storage.Backend,
-				DirectoryMode: cfg.Directory.Mode,
-				AuthMode:      cfg.Auth.Mode,
-				StartedAt:     a.startedAt,
-			}, a.qm, a.st.mailbox, a.st.facade, a.logger),
-			cfg.Management.Secret,
-		)
-		a.mgmtSrv = &http.Server{Addr: cfg.Management.Addr, Handler: mgmtHandler}
-		if err := serveHTTP(ctx, a.mgmtSrv, a.logger); err != nil {
-			return fmt.Errorf("management: %w", err)
-		}
-		a.logger.Info("listening", "component", "management", "addr", cfg.Management.Addr)
-	}
-
-	if err := a.serveMailListeners(ctx); err != nil {
-		return err
-	}
-	a.logger.Info("mail path ready", "inbound", cfg.Listeners.SMTP, "submission", cfg.Listeners.Submission,
-		"imap", cfg.Listeners.IMAP, "managesieve", cfg.Listeners.ManageSieve)
-	return nil
-}
-
-// healthServer builds the health/readiness/metrics mux.
-func (a *App) healthServer() *http.Server {
+// serveHealth binds the health/readiness/metrics endpoint. It runs in every
+// lifecycle state: a standby answers probes too, reporting its role, so an
+// orchestrator no longer mistakes "waiting for the lease" for a dead pod.
+func (a *App) serveHealth(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		a.m.HealthChecks.WithLabelValues("/health").Inc()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q}`, version.Version)
+		fmt.Fprintf(w, `{"status":"ok","version":%q,"role":%q}`,
+			version.Version, a.role())
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		a.m.HealthChecks.WithLabelValues("/ready").Inc()
-		fmt.Fprintf(w, `{"status":"ok","storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
-			a.cfg.Storage.Backend, a.cfg.Directory.Mode, a.cfg.Rspamd.URL != "", a.cfg.Outbound.Enabled)
+		fmt.Fprintf(w, `{"status":"ok","role":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
+			a.role(), a.cfg.Storage.Backend, a.cfg.Directory.Mode,
+			a.cfg.Rspamd.URL != "", a.cfg.Outbound.Enabled)
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(a.m.Registry, promhttp.HandlerOpts{}))
-	return &http.Server{Addr: a.cfg.HealthAddr, Handler: mux}
+	a.healthSrv = &http.Server{Addr: a.cfg.HealthAddr, Handler: mux}
+	return serveHTTP(ctx, a.healthSrv, a.logger)
 }
 
+func (a *App) role() string {
+	if a.ready.Load() {
+		return "leader"
+	}
+	return "standby"
+}
+
+// serveManagement binds the management API when configured. In HA mode it
+// belongs to the leader term (it exposes the live queue manager).
+func (a *App) serveManagement(ctx context.Context) error {
+	if a.cfg.Management.Addr == "" {
+		return nil
+	}
+	handler := management.WithSecret(
+		management.NewHandler(management.Info{
+			Version:       version.Version,
+			Storage:       a.cfg.Storage.Backend,
+			DirectoryMode: a.cfg.Directory.Mode,
+			AuthMode:      a.cfg.Auth.Mode,
+			StartedAt:     a.startedAt,
+		}, a.qm, a.st.mailbox, a.st.facade, a.logger),
+		a.cfg.Management.Secret,
+	)
+	a.mgmtSrv = &http.Server{Addr: a.cfg.Management.Addr, Handler: handler}
+	if err := serveHTTP(ctx, a.mgmtSrv, a.logger); err != nil {
+		return fmt.Errorf("management: %w", err)
+	}
+	a.logger.Info("listening", "component", "management", "addr", a.cfg.Management.Addr)
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// Mail listeners.
+// ---------------------------------------------------------------------------
+
 // serveMailListeners starts SMTP (plain + implicit TLS), IMAP, ManageSieve
-// and POP3 listeners.
+// and POP3 listeners for the given scope. Empty addresses are skipped so a
+// deployment can bring up a subset of listeners.
 func (a *App) serveMailListeners(ctx context.Context) error {
 	cfg := a.cfg
 	lim := cfg.Limits
-	if err := serveSMTP(ctx, a.smtpInbound, cfg.Listeners.SMTP, lim.MaxConnections,
-		proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTP), nil, a.logger); err != nil {
-		return fmt.Errorf("smtp: %w", err)
+	if cfg.Listeners.SMTP != "" {
+		if err := serveSMTP(ctx, a.smtpInbound, cfg.Listeners.SMTP, lim.MaxConnections,
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTP), nil, a.logger); err != nil {
+			return fmt.Errorf("smtp: %w", err)
+		}
 	}
-	if err := serveSMTP(ctx, a.smtpSubmission, cfg.Listeners.Submission, lim.MaxConnections,
-		proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.Submission), nil, a.logger); err != nil {
-		return fmt.Errorf("submission: %w", err)
+	if cfg.Listeners.Submission != "" {
+		if err := serveSMTP(ctx, a.smtpSubmission, cfg.Listeners.Submission, lim.MaxConnections,
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.Submission), nil, a.logger); err != nil {
+			return fmt.Errorf("submission: %w", err)
+		}
 	}
-	if err := serveTCP(ctx, a.imapSrv, "imap", cfg.Listeners.IMAP, lim.MaxConnections,
-		proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAP), nil, a.logger); err != nil {
-		return fmt.Errorf("imap: %w", err)
+	if cfg.Listeners.IMAP != "" {
+		if err := serveTCP(ctx, a.imapSrv, "imap", cfg.Listeners.IMAP, lim.MaxConnections,
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAP), nil, a.logger); err != nil {
+			return fmt.Errorf("imap: %w", err)
+		}
 	}
-	tlsConf, _ := loadTLS(cfg, a.logger)
+	tlsConf := a.tlsConf
 	if cfg.Listeners.SMTPS != "" && tlsConf != nil {
 		if err := serveSMTP(ctx, a.smtpSubmission, cfg.Listeners.SMTPS, lim.MaxConnections,
 			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTPS), tlsConf, a.logger); err != nil {
@@ -502,33 +486,37 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 			return fmt.Errorf("imaps: %w", err)
 		}
 	}
-	msieve := &server.Listener{
-		Name:          "managesieve",
-		Addr:          cfg.Listeners.ManageSieve,
-		MaxConn:       lim.MaxConnections,
-		ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.ManageSieve),
-		Logger:        a.logger,
-		Handler:       a.sieveSrv.ManageSieveSession,
-	}
-	go func() {
-		if err := msieve.Serve(ctx); err != nil && ctx.Err() == nil {
-			a.logger.Error("managesieve server", "addr", cfg.Listeners.ManageSieve, "err", err)
-		}
-	}()
-	if cfg.Features.POP3Enabled {
-		pop3L := &server.Listener{
-			Name:          "pop3",
-			Addr:          cfg.Listeners.POP3,
+	if cfg.Listeners.ManageSieve != "" {
+		msieve := &server.Listener{
+			Name:          "managesieve",
+			Addr:          cfg.Listeners.ManageSieve,
 			MaxConn:       lim.MaxConnections,
-			ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.POP3),
+			ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.ManageSieve),
 			Logger:        a.logger,
-			Handler:       a.pop3Srv.ServeConn,
+			Handler:       a.sieveSrv.ManageSieveSession,
 		}
 		go func() {
-			if err := pop3L.Serve(ctx); err != nil && ctx.Err() == nil {
-				a.logger.Error("pop3 server", "addr", cfg.Listeners.POP3, "err", err)
+			if err := msieve.Serve(ctx); err != nil && ctx.Err() == nil {
+				a.logger.Error("managesieve server", "addr", cfg.Listeners.ManageSieve, "err", err)
 			}
 		}()
+	}
+	if cfg.Features.POP3Enabled {
+		if cfg.Listeners.POP3 != "" {
+			pop3L := &server.Listener{
+				Name:          "pop3",
+				Addr:          cfg.Listeners.POP3,
+				MaxConn:       lim.MaxConnections,
+				ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.POP3),
+				Logger:        a.logger,
+				Handler:       a.pop3Srv.ServeConn,
+			}
+			go func() {
+				if err := pop3L.Serve(ctx); err != nil && ctx.Err() == nil {
+					a.logger.Error("pop3 server", "addr", cfg.Listeners.POP3, "err", err)
+				}
+			}()
+		}
 		if cfg.Listeners.POP3S != "" && tlsConf != nil {
 			pop3sL := &server.Listener{
 				Name:          "pop3s",
@@ -546,5 +534,260 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 			}()
 		}
 	}
+	a.logger.Info("mail path ready", "inbound", cfg.Listeners.SMTP, "submission", cfg.Listeners.Submission,
+		"imap", cfg.Listeners.IMAP, "managesieve", cfg.Listeners.ManageSieve, "role", a.role())
 	return nil
+}
+
+// ---------------------------------------------------------------------------
+// HA lifecycle: bootstrap, standby wait, per-term activation, demotion.
+// ---------------------------------------------------------------------------
+
+// bootstrapHA opens the lease store and prepares the leader helper without
+// acquiring anything. Failures here are startup failures on purpose: they
+// are deterministic misconfiguration, safe to abort on.
+func (a *App) bootstrapHA() error {
+	store, err := openHAStore(a.cfg, a.logger)
+	if err != nil {
+		return fmt.Errorf("ha: lease store: %w", err)
+	}
+	owner := a.cfg.Hostname + "-" + fmt.Sprint(os.Getpid())
+	ttl := time.Duration(a.cfg.HA.TTLSeconds) * time.Second
+	if ttl <= 0 {
+		ttl = 15 * time.Second
+	}
+	a.haCtx, a.haCancel = context.WithCancel(context.Background())
+	a.leader = ha.NewLeader(store, owner, ttl, a.logger)
+	a.logger.Info("ha: standby starting", "owner", owner, "ttl", ttl)
+	return nil
+}
+
+// superviseTerms loops: acquire the lease → activate the write path → wait
+// for loss or shutdown → demote → repeat. It returns when ctx is done or a
+// terminal activation failure persists.
+func (a *App) superviseTerms(ctx context.Context) error {
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := a.waitForLeadership(); err != nil {
+			if errors.Is(err, context.Canceled) || a.haCtx.Err() != nil || ctx.Err() != nil {
+				return nil
+			}
+			a.logger.Error("ha: leadership wait failed", "err", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			continue
+		}
+		backoff = time.Second
+
+		if err := a.activateTerm(ctx); err != nil {
+			a.logger.Error("ha: term activation failed", "err", err)
+			_ = a.leader.Release(context.Background()) // pass the baton promptly
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(backoff):
+			}
+			backoff *= 2
+			if backoff > 30*time.Second {
+				backoff = 30 * time.Second
+			}
+			continue
+		}
+
+		lost := make(chan struct{})
+		var lostOnce sync.Once
+		notifyLost := func() {
+			lostOnce.Do(func() {
+				// Cancel the term BEFORE teardown inspects it: a cancelled
+				// termCtx is how stopTerm tells "lease lost" (never touch
+				// the record — a successor may already hold it) apart from
+				// a voluntary handover (release).
+				if a.termCancel != nil {
+					a.termCancel()
+				}
+				close(lost)
+			})
+		}
+		go a.leader.Run(a.termCtx, notifyLost)
+
+		select {
+		case <-ctx.Done():
+			a.stopTerm("shutdown")
+			return nil
+		case <-lost:
+			a.stopTerm("lease lost")
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Second): // brief cool-down before re-acquiring
+			}
+		}
+	}
+}
+
+// waitForLeadership polls TryAcquire until it wins, the lease error is not
+// retryable, or the app context ends. Followers log periodic standby notes.
+func (a *App) waitForLeadership() error {
+	ttl := a.leader.TTL()
+	interval := ttl / 2
+	if interval <= 0 {
+		interval = time.Second
+	}
+	notified := time.Now().Add(-interval / 2)
+	for {
+		err := a.leader.TryAcquire(a.haCtx)
+		switch {
+		case err == nil:
+			return nil
+		case errors.Is(err, context.Canceled), a.haCtx.Err() != nil:
+			return context.Canceled
+		case !errors.Is(err, ha.ErrNotLeader):
+			return fmt.Errorf("ha: lease acquire: %w", err)
+		}
+		if time.Since(notified) >= interval*4 {
+			a.logger.Info("ha: standby, waiting for leadership")
+			notified = time.Now()
+		}
+		select {
+		case <-a.haCtx.Done():
+			return context.Canceled
+		case <-time.After(interval):
+		}
+	}
+}
+
+// activateTerm assembles and binds the write path for a freshly acquired
+// lease. Every listener (SMTP drain included) and background worker lives
+// inside termCtx so teardown can scope them precisely.
+func (a *App) activateTerm(root context.Context) error {
+	a.teardownMu.Lock()
+	defer a.teardownMu.Unlock()
+
+	tctx, cancel := context.WithCancel(root)
+	a.termCtx, a.termCancel = tctx, cancel
+	reset := func() {
+		cancel()
+		a.termCtx, a.termCancel = nil, nil
+	}
+	cleanupAll := func(err error) error {
+		a.closeTermBackendsLocked()
+		reset()
+		return err
+	}
+
+	if err := a.openServices(); err != nil {
+		return cleanupAll(err)
+	}
+	if err := a.wirePipeline(tctx); err != nil {
+		return cleanupAll(err)
+	}
+	a.wireArchive(tctx)
+	if err := a.wireServers(); err != nil {
+		return cleanupAll(err)
+	}
+	if err := a.serveManagement(tctx); err != nil {
+		return cleanupAll(err)
+	}
+	if err := a.serveMailListeners(tctx); err != nil {
+		return cleanupAll(err)
+	}
+	a.assembled = true
+	a.ready.Store(true)
+	return nil
+}
+
+// stopTerm tears the write path down after a normal shutdown or a lease
+// loss. Safe against double invocation (supervisor exit + Run tail + Close):
+// every step guards on nil/empty state. The lease is released only when the
+// term is still ours to hand over — after a loss notification the holder is
+// unknown, so the record stays untouched.
+func (a *App) stopTerm(reason string) {
+	a.teardownMu.Lock()
+	a.closeTermBackendsLocked()
+	if a.termCancel != nil {
+		a.termCancel()
+		a.termCtx, a.termCancel = nil, nil
+	}
+	a.teardownMu.Unlock()
+	a.ready.Store(false)
+	if reason != "" {
+		a.logger.Warn("ha: term ended", "reason", reason)
+	}
+}
+
+// closeTermBackendsLocked stops serving, drains the queue and closes every
+// durable backend opened for the current assembly. Callers hold teardownMu.
+// The ordering below mirrors process shutdown: stop accepting first, then
+// drain workers, then close storage last.
+func (a *App) closeTermBackendsLocked() {
+	ctx := context.Background()
+	shutdownCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	// Decide about the lease BEFORE cancelling the term context: once
+	// termCtx is cancelled, "term still ours" is indistinguishable from a
+	// loss we have already handled. Releasing after a loss would delete the
+	// successor's lease, so the holder check below is load-bearing.
+	mayReleaseLease := false
+	if a.leader != nil {
+		mayReleaseLease = a.termCtx == nil || a.termCtx.Err() == nil
+	}
+
+	for _, srv := range []*gosmtp.Server{a.smtpInbound, a.smtpSubmission} {
+		if srv != nil {
+			if err := srv.Shutdown(shutdownCtx); err != nil {
+				a.logger.Error("shutdown", "component", "smtp", "err", err)
+			}
+		}
+	}
+	if a.imapSrv != nil {
+		_ = a.imapSrv.Close()
+	}
+	// Cancelling the term context stops the ManageSieve/POP3 accept loops,
+	// the management server and the queue workers.
+	if a.termCancel != nil && a.termCtx != nil && a.termCtx.Err() == nil {
+		a.termCancel()
+	}
+	if a.mgmtSrv != nil {
+		if err := a.mgmtSrv.Shutdown(shutdownCtx); err != nil {
+			a.logger.Error("shutdown", "component", a.mgmtSrv.Addr, "err", err)
+		}
+	}
+	if a.qmDone != nil {
+		<-a.qmDone // queue drained before Pebble/RocksDB closes underneath it
+	}
+	if a.arch != nil {
+		a.arch.Close()
+		a.arch = nil
+	}
+	if a.fts != nil {
+		_ = a.fts.Close()
+		a.fts = nil
+	}
+	if a.st != nil {
+		_ = a.st.Close()
+		a.st = nil
+	}
+	if a.auth != nil {
+		_ = a.auth.Close()
+		a.auth = nil
+	}
+	if a.dir != nil {
+		_ = a.dir.Close()
+		a.dir = nil
+	}
+	if mayReleaseLease {
+		_ = a.leader.Release(ctx)
+	}
+	a.smtpInbound, a.smtpSubmission = nil, nil
+	a.imapSrv, a.sieveSrv, a.pop3Srv = nil, nil, nil
+	a.mgmtSrv, a.qm, a.qmDone, a.pipeline, a.classifier = nil, nil, nil, nil, nil
+	a.tlsConf = nil
+	a.assembled = false
 }

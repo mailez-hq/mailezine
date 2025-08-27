@@ -5,8 +5,10 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -78,6 +80,23 @@ func haReady(addr string) bool {
 	}
 	_ = conn.Close()
 	return true
+}
+
+// haRole fetches the /health role ("leader"/"standby"); "" when unreachable.
+func haRole(t *testing.T, addr string) string {
+	t.Helper()
+	resp, err := http.Get("http://" + addr + "/health")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var out struct {
+		Role string `json:"role"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return ""
+	}
+	return out.Role
 }
 
 func haSubmit(t *testing.T, addr, subject string) {
@@ -183,8 +202,10 @@ func TestHAFailover(t *testing.T) {
 			_, _ = a.Process.Wait()
 		}
 	})
+	// Wait for actual leadership (health answers from process start; only
+	// the leader role guarantees the mail listeners are bound).
 	deadline := time.Now().Add(15 * time.Second)
-	for !haReady(aHealth) {
+	for haRole(t, aHealth) != "leader" {
 		if time.Now().After(deadline) {
 			t.Fatal("engine A did not become leader")
 		}
@@ -200,16 +221,28 @@ func TestHAFailover(t *testing.T) {
 			_, _ = b.Process.Wait()
 		}
 	})
-	time.Sleep(1500 * time.Millisecond)
-	if haReady(bHealth) {
-		t.Fatal("engine B must stay on standby while A leads")
+	// B starts and stays on standby: its health endpoint answers (an
+	// orchestrator must not mistake a follower for a dead pod) but reports
+	// the standby role and never binds mail listeners.
+	deadline = time.Now().Add(15 * time.Second)
+	for haRole(t, bHealth) != "standby" {
+		if time.Now().After(deadline) {
+			t.Fatal("engine B did not report role=standby while A leads")
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if haReady(bIMAP) {
+		t.Fatal("engine B must not bind mail listeners while A leads")
 	}
 
 	// A dies; B takes over within TTL + retry.
 	_ = a.Process.Kill()
 	_, _ = a.Process.Wait()
+	// The health endpoint is up the whole time (standbys answer probes);
+	// takeover completes only when the role flips to leader, which happens
+	// after the mail listeners are already bound.
 	deadline = time.Now().Add(20 * time.Second)
-	for !haReady(bHealth) {
+	for haRole(t, bHealth) != "leader" {
 		if time.Now().After(deadline) {
 			t.Fatal("engine B did not take over after A failed")
 		}
