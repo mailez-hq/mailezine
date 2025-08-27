@@ -42,7 +42,11 @@ type Service interface {
 	Domain(ctx context.Context, name string) (Domain, error)
 	Aliases(ctx context.Context, addr string) ([]string, error)
 	Relay(ctx context.Context, email string) (Relay, error)
-	Sender(ctx context.Context, email string) (Sender, error)
+	// Sender reports whether user may use email as the envelope sender and
+	// which addresses are allowed. The authenticated user is passed through
+	// so the control plane can enforce send-as grants (own address, alias,
+	// delegated mailbox) instead of trusting any valid address.
+	Sender(ctx context.Context, user, email string) (Sender, error)
 	SenderRate(ctx context.Context, sender string) (SenderRate, error)
 	SRSForward(ctx context.Context, sender string) (string, error)
 	SRSRestore(ctx context.Context, recipient string) (string, error)

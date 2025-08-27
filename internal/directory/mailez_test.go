@@ -36,6 +36,14 @@ func mockMailez(t *testing.T) (*httptest.Server, *atomic.Int64) {
 		_, _ = w.Write([]byte(`{"domain":"relay.example.net","transport":"smtp:relay.example.net:25"}`))
 	})
 	mux.HandleFunc("/directory/senders/", func(w http.ResponseWriter, r *http.Request) {
+		// The control plane only permits an address when the authenticated
+		// user (X-Auth-User) matches it (own address, alias or grant).
+		user := r.Header.Get("X-Auth-User")
+		email := strings.TrimPrefix(r.URL.Path, "/directory/senders/")
+		if user == "" || !strings.EqualFold(user, email) {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"allowed":true,"addresses":["alice@example.com"]}`))
 	})
@@ -100,9 +108,12 @@ func TestMailezDirectory(t *testing.T) {
 	if err != nil || r.Transport == "" {
 		t.Fatalf("relay: %+v err=%v", r, err)
 	}
-	s, err := m.Sender(ctx, "alice@example.com")
+	s, err := m.Sender(ctx, "alice@example.com", "alice@example.com")
 	if err != nil || !s.Allowed {
 		t.Fatalf("sender: %+v err=%v", s, err)
+	}
+	if _, err := m.Sender(ctx, "mallory@example.com", "alice@example.com"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for foreign sender, got %v", err)
 	}
 	rewritten, err := m.SRSForward(ctx, "bob@remote.net")
 	if err != nil || rewritten == "" {

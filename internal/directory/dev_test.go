@@ -92,12 +92,18 @@ func TestDevRelaySender(t *testing.T) {
 	if r.Transport != "smtp:relay.example.net:25" {
 		t.Fatalf("unexpected relay: %+v", r)
 	}
-	s, err := d.Sender(context.Background(), "alice@example.com")
+	s, err := d.Sender(context.Background(), "alice@example.com", "alice@example.com")
 	if err != nil || !s.Allowed {
 		t.Fatalf("sender: %+v err=%v", s, err)
 	}
-	if _, err := d.Sender(context.Background(), "mallory@example.com"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected ErrNotFound, got %v", err)
+	// An authenticated user may not use another user's address without a
+	// send-as grant.
+	if _, err := d.Sender(context.Background(), "mallory@example.com", "alice@example.com"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for foreign sender, got %v", err)
+	}
+	// A send-as grant in Senders[user] allows that user's address.
+	if _, err := d.Sender(context.Background(), "bob@example.com", "alice@example.com"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound without grant, got %v", err)
 	}
 }
 

@@ -93,9 +93,9 @@ func (m *Mailez) Relay(ctx context.Context, email string) (Relay, error) {
 	return r, nil
 }
 
-func (m *Mailez) Sender(ctx context.Context, email string) (Sender, error) {
+func (m *Mailez) Sender(ctx context.Context, user, email string) (Sender, error) {
 	var s Sender
-	if err := m.getJSON(ctx, "sender:"+email, "/senders/"+url.PathEscape(email), &s); err != nil {
+	if err := m.getJSONWithUser(ctx, "sender:"+user+":"+email, user, "/senders/"+url.PathEscape(email), &s); err != nil {
 		return Sender{}, err
 	}
 	return s, nil
@@ -201,6 +201,60 @@ func (m *Mailez) getJSON(ctx context.Context, key, path string, out any) error {
 		lastErr = err
 	}
 	return lastErr
+}
+
+// getJSONWithUser performs a GET like getJSON but tags the request with the
+// authenticated user so the control plane can enforce send-as grants. The
+// cache key includes the user so grants never leak across identities.
+func (m *Mailez) getJSONWithUser(ctx context.Context, key, user, path string, out any) error {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Duration(i) * 500 * time.Millisecond):
+			}
+		}
+		retry, err := m.tryGetJSONWithUser(ctx, key, user, path, out)
+		if err == nil {
+			return nil
+		}
+		if !retry {
+			return err
+		}
+		lastErr = err
+	}
+	return lastErr
+}
+
+func (m *Mailez) tryGetJSONWithUser(ctx context.Context, key, user, path string, out any) (retry bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, m.base+path, nil)
+	if err != nil {
+		return true, err
+	}
+	req.Header.Set("X-Auth-User", user)
+	resp, err := m.hc.Do(req)
+	if err != nil {
+		return true, err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		m.cache.PutNegative(key)
+		return false, ErrNotFound
+	case resp.StatusCode == http.StatusServiceUnavailable || resp.StatusCode == http.StatusBadGateway ||
+		resp.StatusCode == http.StatusGatewayTimeout:
+		return true, fmt.Errorf("directory: %s: status %d", path, resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return false, fmt.Errorf("directory: %s: status %d: %s", path, resp.StatusCode, body)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return false, fmt.Errorf("directory: decode %s: %w", path, err)
+	}
+	return false, nil
 }
 
 // tryGetJSON performs one request. retry=false marks a definitive outcome

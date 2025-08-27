@@ -124,14 +124,21 @@ func (d *Dev) Relay(_ context.Context, email string) (Relay, error) {
 	return r, nil
 }
 
-func (d *Dev) Sender(_ context.Context, email string) (Sender, error) {
+func (d *Dev) Sender(_ context.Context, user, email string) (Sender, error) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	if addrs, ok := d.data.Senders[email]; ok {
-		return Sender{Allowed: true, Addresses: append([]string(nil), addrs...)}, nil
-	}
-	if _, ok := d.data.Users[email]; ok {
+	// The dev directory's Senders map lists, per authenticated user, the
+	// extra addresses that user may send as (delegation / send-as). The
+	// user's own address is always allowed.
+	if strings.EqualFold(user, email) {
 		return Sender{Allowed: true, Addresses: []string{email}}, nil
+	}
+	if addrs, ok := d.data.Senders[user]; ok {
+		for _, a := range addrs {
+			if strings.EqualFold(a, email) {
+				return Sender{Allowed: true, Addresses: []string{email}}, nil
+			}
+		}
 	}
 	return Sender{}, ErrNotFound
 }

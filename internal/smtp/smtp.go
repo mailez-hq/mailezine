@@ -154,7 +154,7 @@ func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
 	// from addresses the directory permits. Trusted-peer inbound mail
 	// (gateway-forwarded external senders) is not restricted here.
 	if s.user != "" {
-		sender, err := s.backend.Directory.Sender(context.Background(), from)
+		sender, err := s.backend.Directory.Sender(context.Background(), s.user, from)
 		switch {
 		case err == nil && sender.Allowed:
 			if len(sender.Addresses) > 0 && !containsString(sender.Addresses, from) {
