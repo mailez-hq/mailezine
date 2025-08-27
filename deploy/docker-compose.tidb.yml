@@ -7,7 +7,7 @@
 # This is the ENGINE-ONLY development/e2e surface (no mailez control plane).
 # For the unified product stack (control plane + engine + TiDB in one compose
 # project) use the mailez repo:
-#   mailez/deploy/docker-compose.tidb.yml + deploy/mailezctl.[ps1|sh]
+#   mailez/deploy/docker-compose.prod.yml + deploy/mailezctl.[ps1|sh]
 #
 # All protocol ports are mapped on 127.0.0.1 high ports so this stack can
 # coexist with a full mailez compose stack (25/465/587/1143/1587/4190) on the
