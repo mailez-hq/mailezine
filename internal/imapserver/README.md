@@ -3,6 +3,9 @@
 This package is `github.com/emersion/go-imap/v2/imapserver` v2.0.0-beta.8
 (MIT, see [LICENSE](LICENSE)), vendored and extended for mailezine:
 
+Upstream anchor: `v2.0.0-beta.8` — the same tag pinned in the root go.mod.
+Diff local changes with `scripts/vendor-diff.sh imapserver`.
+
 - `SessionExtension` + `ExtensionWriter` (`extension.go`): a minimal hook
   that dispatches commands not covered by the upstream session interface
   (e.g. RFC 4314 ACL). `Conn` hands unknown authenticated-state commands to

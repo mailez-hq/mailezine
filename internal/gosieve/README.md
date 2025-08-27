@@ -1,5 +1,11 @@
 # vendored go-sieve (fork of foxcpp/go-sieve)
 
+Upstream anchor: `github.com/foxcpp/go-sieve`
+`v0.0.0-20260523221512-9ae51b269e52` (commit `9ae51b269e52`, 2026-05-23) —
+the same pseudo-version pinned in the root go.mod, which still supplies the
+unmodified `lexer`/`parser` packages. Regenerate/diff against it with
+`scripts/vendor-diff.sh gosieve`.
+
 The mailez control plane's default Sieve template requires extensions the
 upstream interpreter does not implement (vacation, spamtestplus, editheader,
 index, regex, date, mailbox). This directory vendors `foxcpp/go-sieve` (MIT):

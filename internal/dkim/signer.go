@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/emersion/go-msgauth/dkim"
+
+	"mailezine/internal/stackhttp"
 )
 
 const (
@@ -61,14 +63,16 @@ type cacheEntry struct {
 	negative time.Time
 }
 
-// NewSigner builds a signer against the mailez DKIM vault.
-func NewSigner(vaultBase string, logger *slog.Logger) *Signer {
+// NewSigner builds a signer against the mailez DKIM vault. The optional
+// secret authenticates requests to the /stack API; empty keeps the legacy
+// unauthenticated local-dev mode.
+func NewSigner(vaultBase string, logger *slog.Logger, secret ...string) *Signer {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &Signer{
 		logger: logger,
-		hc:     &http.Client{Timeout: 5 * time.Second},
+		hc:     stackhttp.New(stackhttp.First(secret), 5*time.Second),
 		vault:  strings.TrimSuffix(vaultBase, "/") + "/v1/dkim/",
 		cache:  map[string]cacheEntry{},
 	}

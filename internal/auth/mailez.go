@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"mailezine/internal/stackhttp"
 )
 
 // Mailez is a Service backed by the mailez auth contract.
@@ -24,32 +26,27 @@ type Mailez struct {
 	hc   *http.Client
 }
 
-// NewMailez returns an auth client for the mailez control plane.
-func NewMailez(base string) *Mailez {
+// NewMailez returns an auth client for the mailez control plane. The optional
+// secret authenticates the internal API (empty/unset keeps the
+// unauthenticated local-dev mode).
+func NewMailez(base string, secret ...string) *Mailez {
 	return &Mailez{
 		base: base,
-		hc:   &http.Client{Timeout: 6 * time.Second},
+		hc:   stackhttp.New(stackhttp.First(secret), 6*time.Second),
 	}
 }
 
 func (m *Mailez) Authenticate(ctx context.Context, email, password string, opts Options) (bool, error) {
-	const attempts = 3
-	var lastErr error
-	for i := 0; i < attempts; i++ {
-		if i > 0 {
-			select {
-			case <-ctx.Done():
-				return false, ctx.Err()
-			case <-time.After(time.Duration(i) * 500 * time.Millisecond):
-			}
-		}
-		ok, err := m.attempt(ctx, email, password, opts)
-		if err == nil {
-			return ok, nil
-		}
-		lastErr = err
+	var ok bool
+	err := stackhttp.Retry(ctx, 3, 500*time.Millisecond, func() (bool, error) {
+		var err error
+		ok, err = m.attempt(ctx, email, password, opts)
+		return err != nil, err
+	})
+	if err != nil {
+		return false, err
 	}
-	return false, lastErr
+	return ok, nil
 }
 
 func (m *Mailez) attempt(ctx context.Context, email, password string, opts Options) (bool, error) {

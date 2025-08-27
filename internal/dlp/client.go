@@ -13,6 +13,8 @@ import (
 	"mime/multipart"
 	"net/http"
 	"time"
+
+	"mailezine/internal/stackhttp"
 )
 
 // Decision is the control plane's verdict for one submission.
@@ -34,14 +36,15 @@ type HTTP struct {
 	logger *slog.Logger
 }
 
-// NewHTTP builds the control-plane DLP client.
-func NewHTTP(url string, logger *slog.Logger) *HTTP {
+// NewHTTP builds the control-plane DLP client. The optional secret
+// authenticates the internal API.
+func NewHTTP(url string, logger *slog.Logger, secret ...string) *HTTP {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	return &HTTP{
 		url:    url,
-		hc:     &http.Client{Timeout: 10 * time.Second},
+		hc:     stackhttp.New(stackhttp.First(secret), 10*time.Second),
 		logger: logger,
 	}
 }
