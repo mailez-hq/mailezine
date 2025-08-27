@@ -135,6 +135,12 @@ func (s *Store) DeleteRaw(_ context.Context, key []byte) error {
 	return s.kv.Delete(key)
 }
 
+// ScanRaw visits every raw key with the given prefix in ascending order.
+// Returning an error from fn aborts the scan and is propagated.
+func (s *Store) ScanRaw(_ context.Context, prefix []byte, fn func(key, value []byte) error) error {
+	return s.kv.Scan(prefix, fn)
+}
+
 // MailboxModSeq returns the mailbox's current modification sequence
 // (CONDSTORE HIGHESTMODSEQ; 0 when the mailbox has no modseq yet).
 func (s *Store) MailboxModSeq(ctx context.Context, accountID AccountID, mbID uint64) (uint64, error) {

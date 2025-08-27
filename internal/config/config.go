@@ -59,6 +59,9 @@ type Config struct {
 	// AuthCacheSizeBytes is the weight budget of the authentication-result
 	// cache.
 	AuthCacheSizeBytes int64
+	// Archive captures compliance copies of inbound/outbound mail and
+	// forwards them to the control plane archive store.
+	Archive ArchiveConfig
 }
 
 // LogConfig controls the structured logger.
@@ -192,6 +195,17 @@ type FeaturesConfig struct {
 	JMAPEnabled bool
 }
 
+// ArchiveConfig controls the compliance copy capture (enterprise-style 归档).
+type ArchiveConfig struct {
+	Enabled bool
+	// URL is the control-plane ingest endpoint; empty derives
+	// http://<BackendAddress>/stack/archive.
+	URL string
+	// MaxAttempts bounds the forwarding retries per message; copies that
+	// exhaust it stay spooled (marked failed) for manual recovery.
+	MaxAttempts int
+}
+
 // Load reads configuration from the environment and validates it.
 func Load() (Config, error) {
 	// Optional TOML overlay (MAILEZINE_CONFIG): a flat map of the same
@@ -309,6 +323,11 @@ func Load() (Config, error) {
 			Mode:             getenv("MAILEZINE_AUTH_MODE", "dev"),
 			DevPasswordsFile: getenv("MAILEZINE_AUTH_DEV_FILE", ""),
 		},
+		Archive: ArchiveConfig{
+			Enabled:     envBool("MAILEZINE_ARCHIVE_ENABLED", false),
+			URL:         getenv("MAILEZINE_ARCHIVE_URL", ""),
+			MaxAttempts: envInt("MAILEZINE_ARCHIVE_MAX_ATTEMPTS", 10),
+		},
 		Management: ManagementConfig{
 			Addr:   getenv("MAILEZINE_MANAGEMENT_ADDR", ""),
 			Secret: getenv("MAILEZINE_MANAGEMENT_SECRET", ""),
@@ -357,6 +376,12 @@ func Load() (Config, error) {
 	cfg.AuthCacheSizeBytes = envInt64("MAILEZINE_AUTH_CACHE_SIZE", 1<<20)
 	if cfg.DKIMVaultURL == "" {
 		cfg.DKIMVaultURL = "http://" + cfg.BackendAddress + "/stack/rspamd/vault"
+	}
+	if cfg.Archive.Enabled && cfg.Archive.URL == "" {
+		cfg.Archive.URL = "http://" + cfg.BackendAddress + "/stack/archive"
+	}
+	if cfg.Archive.MaxAttempts <= 0 {
+		cfg.Archive.MaxAttempts = 10
 	}
 
 	if err := cfg.Validate(); err != nil {

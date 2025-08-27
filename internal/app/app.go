@@ -16,6 +16,7 @@ import (
 
 	gosmtp "github.com/emersion/go-smtp"
 
+	"mailezine/internal/archive"
 	"mailezine/internal/auth"
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
@@ -59,6 +60,7 @@ type App struct {
 	classifier *spam.Client
 	qm         *queue.Manager
 	qmDone     chan struct{}
+	arch       *archive.Spool
 
 	leader   *ha.Leader
 	haCtx    context.Context
@@ -94,6 +96,7 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		a.Close()
 		return nil, err
 	}
+	a.wireArchive()
 	if err := a.wireServers(); err != nil {
 		a.Close()
 		return nil, err
@@ -151,6 +154,9 @@ func (a *App) Close() {
 	}
 	if a.fts != nil {
 		_ = a.fts.Close()
+	}
+	if a.arch != nil {
+		a.arch.Close()
 	}
 	if a.st != nil {
 		_ = a.st.Close()
@@ -267,6 +273,18 @@ func (a *App) wirePipeline() error {
 	return nil
 }
 
+// wireArchive builds the compliance-capture spool when enabled and starts
+// its forwarding worker. Captures survive restarts in the engine's KV/blob
+// store; the worker re-drains them on boot.
+func (a *App) wireArchive() {
+	if !a.cfg.Archive.Enabled || a.st == nil {
+		return
+	}
+	a.arch = archive.New(a.st.Facade(), a.cfg.Archive.URL, a.cfg.Archive.MaxAttempts, a.logger)
+	a.arch.Run(a.ctx)
+	a.logger.Info("archive", "enabled", true, "endpoint", a.cfg.Archive.URL)
+}
+
 // wireServers builds the protocol servers (listeners start in Run).
 func (a *App) wireServers() error {
 	trustedNets, err := parseNets(a.cfg.TrustedNets)
@@ -278,6 +296,12 @@ func (a *App) wireServers() error {
 		return err
 	}
 	submit := newSubmit(a.dir, a.pipeline, a.qm, a.logger)
+	submitInbound := submit
+	submitOutbound := submit
+	if a.arch != nil {
+		submitInbound = a.arch.Wrap("inbound", submit)
+		submitOutbound = a.arch.Wrap("outbound", submit)
+	}
 
 	a.smtpInbound = smtp.NewServer(&smtp.Backend{
 		Hostname:           a.cfg.Hostname,
@@ -292,7 +316,7 @@ func (a *App) wireServers() error {
 		MaxLineLength:      a.cfg.Limits.MaxLineLength,
 		TLSConfig:          tlsConf,
 		Logger:             a.logger,
-		Submit:             submit,
+		Submit:             submitInbound,
 	})
 	a.smtpSubmission = smtp.NewServer(&smtp.Backend{
 		Hostname:           a.cfg.Hostname,
@@ -308,7 +332,7 @@ func (a *App) wireServers() error {
 		MaxLineLength:      a.cfg.Limits.MaxLineLength,
 		TLSConfig:          tlsConf,
 		Logger:             a.logger,
-		Submit:             submit,
+		Submit:             submitOutbound,
 	})
 
 	imapCfg := &imap.Server{
