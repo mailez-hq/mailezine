@@ -382,6 +382,12 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 		}
 		finalData := applyHeaderEdits(stored, sieveRes)
 		for _, mailbox := range mailboxes {
+			// Sieve scripts are authored with the display spelling ("Inbox/Sub").
+			// Only the exact "INBOX" name is the special mailbox on the wire,
+			// so rewrite the prefix before storing — otherwise the message
+			// lands in a literal "Inbox" folder that IMAP clients selecting
+			// "INBOX/Sub" can never reach.
+			mailbox = normalizeMailboxName(mailbox)
 			msg := &mailstore.Message{
 				From:         from,
 				To:           targets,
@@ -403,6 +409,19 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 		p.Logger.Debug("delivered", "to", target, "mailboxes", mailboxes, "bytes", size)
 	}
 	return nil
+}
+
+// normalizeMailboxName rewrites the display spelling of the special inbox and
+// its children ("Inbox", "Inbox/Sub") to the protocol form ("INBOX",
+// "INBOX/Sub") used on the IMAP wire.
+func normalizeMailboxName(name string) string {
+	if strings.EqualFold(name, "inbox") {
+		return "INBOX"
+	}
+	if idx := strings.IndexByte(name, '/'); idx >= 0 && strings.EqualFold(name[:idx], "inbox") {
+		return "INBOX" + name[idx:]
+	}
+	return name
 }
 
 // activeScript resolves the script to run for one account.

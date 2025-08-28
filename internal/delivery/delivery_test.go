@@ -20,6 +20,28 @@ import (
 	"mailezine/internal/store"
 )
 
+func TestNormalizeMailboxName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"INBOX", "INBOX"},
+		{"Inbox", "INBOX"},
+		{"inbox", "INBOX"},
+		{"Inbox/Sub", "INBOX/Sub"},
+		{"INBOX/Sub", "INBOX/Sub"},
+		{"inbox/Sub/Folder", "INBOX/Sub/Folder"},
+		// Literal folder names that only share a prefix must stay untouched.
+		{"Inboxx", "Inboxx"},
+		{"Inboxx/Sub", "Inboxx/Sub"},
+		{"Sent", "Sent"},
+		{"Projects/Inbox", "Projects/Inbox"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := normalizeMailboxName(c.in); got != c.want {
+			t.Errorf("normalizeMailboxName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func newTestPipeline(t *testing.T, quotaLimit int64) (*Pipeline, *mailstore.KV, *directory.Dev) {
 	t.Helper()
 	dir := directory.NewDev(directory.DevData{
