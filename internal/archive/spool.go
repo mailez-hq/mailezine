@@ -141,7 +141,9 @@ func (sp *Spool) Capture(ctx context.Context, ev Event) error {
 	if err != nil {
 		return err
 	}
-	blobID := "arch/" + id
+	// Blob IDs must stay in the safe character set (no path separators):
+	// the store rejects "/" to prevent path escape. Use a dash prefix.
+	blobID := "arch-" + id
 	if _, err := sp.st.PutBlob(ctx, blobID, int64(len(ev.Raw)), bytesReader(ev.Raw)); err != nil {
 		return fmt.Errorf("archive: spool blob: %w", err)
 	}
@@ -173,7 +175,8 @@ func (sp *Spool) CaptureBuffer(ctx context.Context, ev Event, buf mailbuffer.Buf
 	if err != nil {
 		return err
 	}
-	blobID := "arch/" + id
+	// Same safe-ID constraint as Capture: blob IDs must not contain "/".
+	blobID := "arch-" + id
 	r, err := buf.Open()
 	if err != nil {
 		return err
