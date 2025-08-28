@@ -155,6 +155,30 @@ func TestValidate(t *testing.T) {
 	})
 }
 
+func TestAuthCacheTTLDefaultAndOverride(t *testing.T) {
+	t.Setenv("MAILEZINE_STORAGE_BACKEND", "pebble")
+	t.Setenv("MAILEZINE_ROCKS_PATH", "/data/rocks")
+	t.Setenv("MAILEZINE_DIRECTORY_FILE", "/data/directory.json")
+	t.Setenv("MAILEZINE_AUTH_DEV_FILE", "/data/passwords.json")
+	t.Setenv("MAILEZINE_AUTH_CACHE_TTL", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.AuthCacheTTL != 10*time.Minute {
+		t.Fatalf("default auth cache TTL = %v, want 10m", cfg.AuthCacheTTL)
+	}
+
+	t.Setenv("MAILEZINE_AUTH_CACHE_TTL", "90")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("load override: %v", err)
+	}
+	if cfg.AuthCacheTTL != 90*time.Second {
+		t.Fatalf("overridden auth cache TTL = %v, want 90s", cfg.AuthCacheTTL)
+	}
+}
+
 func TestSummary(t *testing.T) {
 	s := base().Summary()
 	if s == "" || s == " " {

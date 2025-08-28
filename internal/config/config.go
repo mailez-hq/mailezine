@@ -61,6 +61,14 @@ type Config struct {
 	// AuthCacheSizeBytes is the weight budget of the authentication-result
 	// cache.
 	AuthCacheSizeBytes int64
+	// AuthCacheTTL bounds how long a successful authentication stays cached
+	// (MAILEZINE_AUTH_CACHE_TTL, integer seconds).
+	// The key is the credential pair, so a password change invalidates the new
+	// password immediately; the old pair remains valid for at most one TTL,
+	// same as legacy IMAP's auth_cache_ttl. Keep it >= the control-plane IMAP
+	// connection-pool idle time so a re-dial after pool eviction still hits
+	// the cache instead of paying a full control-plane round trip.
+	AuthCacheTTL time.Duration
 	// Archive captures compliance copies of inbound/outbound mail and
 	// forwards them to the control plane archive store.
 	Archive ArchiveConfig
@@ -397,6 +405,7 @@ func Load() (Config, error) {
 	cfg.IMAPCacheSizeBytes = envInt64("MAILEZINE_CACHE_SIZE", 8<<20)
 	cfg.MetaCacheSizeBytes = envInt64("MAILEZINE_META_CACHE_SIZE", 32<<20)
 	cfg.AuthCacheSizeBytes = envInt64("MAILEZINE_AUTH_CACHE_SIZE", 1<<20)
+	cfg.AuthCacheTTL = envDuration("MAILEZINE_AUTH_CACHE_TTL", 10*time.Minute)
 	if cfg.DKIMVaultURL == "" {
 		cfg.DKIMVaultURL = "http://" + cfg.BackendAddress + "/stack/rspamd/vault"
 	}

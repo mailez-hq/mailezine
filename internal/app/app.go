@@ -207,7 +207,7 @@ func (a *App) openServices() error {
 	// control-plane round trip from the hot AUTH path.
 	if a.cfg.AuthCacheSizeBytes > 0 {
 		a.auth = auth.NewCached(a.auth,
-			mailcache.NewCacheWithTTL(a.cfg.AuthCacheSizeBytes, 30*time.Second))
+			mailcache.NewCacheWithTTL(a.cfg.AuthCacheSizeBytes, a.cfg.AuthCacheTTL))
 	}
 	if a.st, err = NewStorage(a.cfg, a.logger); err != nil {
 		return err
