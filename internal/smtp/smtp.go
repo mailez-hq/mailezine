@@ -28,6 +28,7 @@ import (
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
 	"mailezine/internal/mailbuffer"
+	"mailezine/internal/metrics"
 )
 
 // Backend wires the SMTP server to the mailezine services.
@@ -48,6 +49,9 @@ type Backend struct {
 	MaxLineLength     int
 	TLSConfig         *tls.Config // optional; enables STARTTLS for direct deploys
 	Logger            *slog.Logger
+
+	// Metrics instruments the listener; nil disables.
+	Metrics *metrics.Metrics
 
 	// Submit enqueues a validated message. Called once per DATA with the
 	// peer address, authenticated user ("" for anonymous/trusted-peer
@@ -75,6 +79,7 @@ func NewServer(b *Backend) *gosmtp.Server {
 		b.MaxLineLength = 1000
 	}
 	s := gosmtp.NewServer(gosmtp.BackendFunc(func(c *gosmtp.Conn) (gosmtp.Session, error) {
+		b.Metrics.SMTPSessionOpened()
 		return &session{backend: b, conn: c, trusted: b.isTrusted(remoteIP(c.Conn().RemoteAddr()))}, nil
 	}))
 	s.Domain = b.Hostname
@@ -116,9 +121,11 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 			Port:     s.backend.Port,
 		})
 		if err != nil {
+			s.backend.Metrics.SMTPAuthFailed()
 			return err
 		}
 		if !ok {
+			s.backend.Metrics.SMTPAuthFailed()
 			return errors.New("smtp: invalid credentials")
 		}
 		s.user = username
@@ -249,6 +256,12 @@ func (s *session) Data(r io.Reader) error {
 	peer := remoteIP(s.conn.Conn().RemoteAddr())
 	if err := s.backend.Submit(ctx, peer, s.user, s.from, s.to, data); err != nil {
 		s.backend.Logger.Error("smtp: submit", "from", s.from, "to", s.to, "err", err)
+		outcome := "deferred"
+		switch {
+		case errors.Is(err, delivery.ErrReject), errors.Is(err, delivery.ErrSieveReject):
+			outcome = "rejected"
+		}
+		s.backend.Metrics.SMTPMessageIn(outcome)
 		switch {
 		case errors.Is(err, delivery.ErrReject):
 			return &gosmtp.SMTPError{Code: 554, Message: "message rejected by policy"}
@@ -259,6 +272,7 @@ func (s *session) Data(r io.Reader) error {
 		}
 		return &gosmtp.SMTPError{Code: 451, Message: "temporary delivery failure"}
 	}
+	s.backend.Metrics.SMTPMessageIn("accepted")
 	return nil
 }
 
@@ -267,7 +281,10 @@ func (s *session) Reset() {
 	s.to = nil
 }
 
-func (s *session) Logout() error { return nil }
+func (s *session) Logout() error {
+	s.backend.Metrics.SMTPSessionClosed()
+	return nil
+}
 
 func (b *Backend) isTrusted(ip net.IP) bool {
 	if ip == nil {

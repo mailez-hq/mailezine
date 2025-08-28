@@ -66,6 +66,7 @@ func (a *App) wireQueue(runCtx context.Context) error {
 	a.qm.SetOnEvent(func(event string) {
 		a.m.QueueMessages.WithLabelValues(event).Inc()
 	})
+	a.qm.SetMetrics(a.m, runCtx)
 	a.qm.SetBounceHandler(func(ctx context.Context, from string, msg *queue.Message, _ []byte, failures []queue.BounceFailure) {
 		dsnBytes, derr := queue.ComposeBounceDSN(from, msg, failures, a.cfg.Hostname)
 		a.routeDSN(ctx, from, dsnBytes, derr, "Delivery Status Notification (Failure)")

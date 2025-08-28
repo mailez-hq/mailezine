@@ -33,7 +33,13 @@ var _ imapserver.SessionAppendLimit = (*session)(nil)
 var _ imapserver.SessionExtension = (*session)(nil)
 var _ imapserver.SessionSort = (*session)(nil)
 
-func (s *session) Close() error { return nil }
+func (s *session) Close() error {
+	// Only authenticated sessions were counted on login.
+	if s.user != "" {
+		s.srv.Metrics.IMAPSessionClosed()
+	}
+	return nil
+}
 
 func (s *session) Login(username, password string) error {
 	ok, err := s.srv.Auth.Authenticate(context.Background(), username, password, auth.Options{
@@ -50,6 +56,7 @@ func (s *session) Login(username, password string) error {
 		return imapserver.ErrAuthFailed
 	}
 	s.user = username
+	s.srv.Metrics.IMAPSessionOpened()
 	return nil
 }
 

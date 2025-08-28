@@ -17,6 +17,7 @@ import (
 	"mailezine/internal/imapserver"
 	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
+	"mailezine/internal/metrics"
 )
 
 // mailboxDelim is the hierarchy separator exposed to clients (matches the
@@ -42,6 +43,9 @@ type Server struct {
 	FTS *fts.Indexer
 	// CacheSizeBytes bounds the envelope/body-structure memo (0 = default).
 	CacheSizeBytes int64
+
+	// Metrics instruments the server; nil disables.
+	Metrics *metrics.Metrics
 
 	// cache memoizes message-derived data (envelope, body structure) across
 	// sessions. nil disables caching.

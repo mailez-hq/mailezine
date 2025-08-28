@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mailezine/internal/metrics"
 	"mailezine/internal/store"
 )
 
@@ -113,6 +114,7 @@ type Manager struct {
 	onEvent   func(event string)
 	bounce    BounceHandler
 	delayWarn DelayWarningHandler
+	mtr       *metrics.Metrics // optional Prometheus instrumentation (SetMetrics)
 	logger    *slog.Logger
 	opts      Options
 
@@ -445,7 +447,9 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		return err
 	}
 
+	start := time.Now()
 	results, derr := m.deliver.Deliver(ctx, msg.From, pending, bytes.NewReader(body.Bytes()))
+	m.observeDelivery(time.Since(start), derr == nil)
 	if derr != nil {
 		// Transport-level failure: defer every pending recipient.
 		return m.deferAll(ctx, &msg, oldNext, derr, body.Bytes())

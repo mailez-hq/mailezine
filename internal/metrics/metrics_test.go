@@ -3,6 +3,7 @@ package metrics
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 )
@@ -41,4 +42,18 @@ func TestQueueMetricsRegistered(t *testing.T) {
 	if !runtimeFound {
 		t.Fatal("runtime/process metrics not in registry")
 	}
+}
+
+// TestNilReceiverSafety guards the instrumentation contract: call sites rely
+// on nil-safe helpers so an unwired *Metrics never changes behavior.
+func TestNilReceiverSafety(t *testing.T) {
+	var m *Metrics
+	m.SMTPSessionOpened()
+	m.SMTPSessionClosed()
+	m.SMTPMessageIn("accepted")
+	m.SMTPAuthFailed()
+	m.IMAPSessionOpened()
+	m.IMAPSessionClosed()
+	m.POP3SessionServed()
+	m.ObserveDelivery(time.Second, true)
 }

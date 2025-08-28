@@ -366,12 +366,14 @@ flush 队列元数据、关闭存储（RocksDB flush + close；maildir 释放文
 
 | 指标 | 用途 |
 |---|---|
-| `mailezine_smtp_messages_in_total{outcome}` | 入站结果 |
-| `mailezine_delivery_duration_seconds{domain,result}` | 出站投递延迟 |
-| `mailezine_queue_depth{state}` | 队列水位 |
-| `mailezine_storage_ops_total{backend,op}`、`storage_io_bytes` | 存储健康 |
-| `mailezine_imap_sessions_active`、`smtp_connections_active` | 容量 |
-| `mailezine_quota_errors_total` | 配额事件 |
+| `mailezine_smtp_connections_total`、`mailezine_smtp_connections_active` | SMTP 连接总数与活跃连接（入站 + 提交两个监听） |
+| `mailezine_smtp_messages_in_total{outcome}` | 入站结果（accepted/rejected/deferred） |
+| `mailezine_smtp_auth_failures_total` | SMTP 认证失败 |
+| `mailezine_delivery_duration_seconds{result}` | 出站投递延迟（ok/error） |
+| `mailezine_queue_depth{state}`、`mailezine_queue_messages_total{event}` | 队列水位（按状态抓取时盘点）与状态迁移 |
+| `mailezine_imap_sessions_active`、`mailezine_pop3_sessions_total` | 容量 |
+| `mailezine_storage_ops_total{backend,op}`、`storage_io_bytes` | 存储健康（规划中，未实现） |
+| `mailezine_quota_errors_total` | 配额事件（规划中，未实现） |
 
 ### 9.3 追踪与健康
 

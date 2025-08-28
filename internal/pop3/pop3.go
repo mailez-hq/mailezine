@@ -21,6 +21,7 @@ import (
 	"mailezine/internal/auth"
 	"mailezine/internal/directory"
 	"mailezine/internal/mailstore"
+	"mailezine/internal/metrics"
 )
 
 // Server is the POP3 listener backend.
@@ -31,6 +32,9 @@ type Server struct {
 	Port      string      // listening port, passed to auth so the control plane recognizes webmail ports
 	TLSConfig *tls.Config // optional; enables STLS for direct deploys
 	Logger    *slog.Logger
+
+	// Metrics instruments the listener; nil disables.
+	Metrics *metrics.Metrics
 }
 
 // ServeConn handles one POP3 session (server.Listener Handler).
@@ -38,6 +42,7 @@ func (s *Server) ServeConn(ctx context.Context, conn net.Conn) error {
 	if s.Logger == nil {
 		s.Logger = slog.Default()
 	}
+	s.Metrics.POP3SessionServed()
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(15 * time.Minute))
 	r := bufio.NewReader(conn)

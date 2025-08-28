@@ -319,6 +319,7 @@ func (a *App) wireServers() error {
 		MaxLineLength:      a.cfg.Limits.MaxLineLength,
 		TLSConfig:          tlsConf,
 		Logger:             a.logger,
+		Metrics:            a.m,
 		Submit:             submitInbound,
 	})
 	a.smtpSubmission = smtp.NewServer(&smtp.Backend{
@@ -335,6 +336,7 @@ func (a *App) wireServers() error {
 		MaxLineLength:      a.cfg.Limits.MaxLineLength,
 		TLSConfig:          tlsConf,
 		Logger:             a.logger,
+		Metrics:            a.m,
 		Submit:             submitOutbound,
 	})
 
@@ -348,6 +350,7 @@ func (a *App) wireServers() error {
 		Logger:          a.logger,
 		FTS:             a.fts,
 		CacheSizeBytes:  a.cfg.IMAPCacheSizeBytes,
+		Metrics:         a.m,
 	}
 	if classifier := a.classifier; classifier != nil {
 		// Junk-boundary learning on APPEND/COPY/MOVE across Junk.
@@ -374,6 +377,7 @@ func (a *App) wireServers() error {
 		Port:      listenerPort(a.cfg.Listeners.POP3),
 		TLSConfig: tlsConf,
 		Logger:    a.logger,
+		Metrics:   a.m,
 	}
 	return nil
 }
