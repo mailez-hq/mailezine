@@ -518,7 +518,7 @@ func (c Config) Validate() error {
 func (c Config) Summary() string {
 	lic := c.License.Edition
 	if c.License.IsEnterprise() {
-		lic = fmt.Sprintf("enterprise(max=%d,expires=%s)", c.License.MaxMailboxes, c.License.ExpiresAt)
+		lic = fmt.Sprintf("enterprise(max=%d,service=%s)", c.License.MaxMailboxes, c.License.ExpiresAt)
 	}
 	return fmt.Sprintf(
 		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v rspamd=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%v jmap=%v maxMsg=%d",
