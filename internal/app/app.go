@@ -437,6 +437,7 @@ func (a *App) serveManagement(ctx context.Context) error {
 			Storage:       a.cfg.Storage.Backend,
 			DirectoryMode: a.cfg.Directory.Mode,
 			AuthMode:      a.cfg.Auth.Mode,
+			License:       a.cfg.License.Status(time.Now()),
 			StartedAt:     a.startedAt,
 		}, a.qm, a.st.mailbox, a.st.facade, a.logger),
 		a.cfg.Management.Secret,

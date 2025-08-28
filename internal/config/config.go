@@ -15,6 +15,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"mailezine/internal/license"
 	"mailezine/internal/limits"
 )
 
@@ -66,6 +67,11 @@ type Config struct {
 	// DLP scans outbound submissions against control-plane rules
 	// (敏感词过滤 + 审批); failures fail open.
 	DLP DLPConfig
+	// License fields: the enterprise engine validates its license at startup.
+	LicenseFile     string
+	LicenseInline   string
+	LicenseRequired bool
+	License         license.License
 }
 
 // LogConfig controls the structured logger.
@@ -403,6 +409,14 @@ func Load() (Config, error) {
 	if cfg.DLP.Enabled && cfg.DLP.URL == "" {
 		cfg.DLP.URL = "http://" + cfg.BackendAddress + "/stack/dlp/check"
 	}
+	cfg.LicenseFile = getenv("MAILEZINE_LICENSE_FILE", "")
+	cfg.LicenseInline = getenv("MAILEZINE_LICENSE", "")
+	cfg.LicenseRequired = envBool("MAILEZINE_LICENSE_REQUIRED", false)
+	lic, err := license.Load(cfg.LicenseFile, cfg.LicenseInline, cfg.LicenseRequired)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.License = lic
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -502,10 +516,14 @@ func (c Config) Validate() error {
 
 // Summary is a one-line startup description for logs.
 func (c Config) Summary() string {
+	lic := c.License.Edition
+	if c.License.IsEnterprise() {
+		lic = fmt.Sprintf("enterprise(max=%d,expires=%s)", c.License.MaxMailboxes, c.License.ExpiresAt)
+	}
 	return fmt.Sprintf(
-		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v rspamd=%v outbound=%v health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%v jmap=%v maxMsg=%d",
-		c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Rspamd.URL != "", c.Outbound.Enabled, c.HealthAddr,
-		c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
+		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v rspamd=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%v jmap=%v maxMsg=%d",
+		c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Rspamd.URL != "", c.Outbound.Enabled,
+		lic, c.HealthAddr, c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
 		c.Features.POP3Enabled, c.Features.JunkEnabled, c.Features.JMAPEnabled,
 		c.Limits.MaxMessageSize,
 	)

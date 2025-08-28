@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"mailezine/internal/mailstore"
+	"mailezine/internal/license"
 	"mailezine/internal/queue"
 )
 
@@ -25,6 +26,7 @@ type Info struct {
 	Storage       string
 	DirectoryMode string
 	AuthMode      string
+	License       license.Status
 	StartedAt     time.Time
 }
 
@@ -55,6 +57,7 @@ func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accou
 			"storage":       info.Storage,
 			"directory":     info.DirectoryMode,
 			"auth":          info.AuthMode,
+			"license":       info.License,
 			"uptimeSeconds": int(time.Since(info.StartedAt).Seconds()),
 		}
 		if qm != nil {
