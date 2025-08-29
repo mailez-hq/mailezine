@@ -53,6 +53,10 @@ type Config struct {
 	Limits             limits.Config
 	Features           FeaturesConfig
 	Notify             NotifyConfig
+	// SnoozeInterval is the seconds between snooze wake-up sweeps; 0
+	// disables the sweeper (due messages then only resurface lazily when
+	// the snoozed view is opened).
+	SnoozeInterval int
 	// IMAPCacheSizeBytes is the weight budget (bytes) of the IMAP
 	// envelope/body-structure memo.
 	IMAPCacheSizeBytes int64
@@ -446,6 +450,7 @@ func Load() (Config, error) {
 	if cfg.Notify.Enabled && cfg.Notify.URL == "" {
 		cfg.Notify.URL = "http://" + cfg.BackendAddress + "/stack/notify/delivered"
 	}
+	cfg.SnoozeInterval = envInt("MAILEZINE_SNOOZE_INTERVAL", 60)
 	cfg.LicenseFile = getenv("MAILEZINE_LICENSE_FILE", "")
 	cfg.LicenseInline = getenv("MAILEZINE_LICENSE", "")
 	cfg.LicenseRequired = envBool("MAILEZINE_LICENSE_REQUIRED", false)

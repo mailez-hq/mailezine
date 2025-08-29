@@ -49,6 +49,7 @@ import (
 	"mailezine/internal/server"
 	"mailezine/internal/sieve"
 	"mailezine/internal/smtp"
+	"mailezine/internal/snooze"
 	"mailezine/internal/spam"
 	"mailezine/internal/telemetry"
 	"mailezine/internal/verify"
@@ -77,6 +78,7 @@ type App struct {
 	qm          *queue.Manager
 	qmDone      chan struct{}
 	arch        *archive.Spool
+	notifyClient *notify.Client
 
 	tlsConf   *tls.Config
 	startedAt time.Time
@@ -273,9 +275,24 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 	}
 	if a.cfg.Notify.Enabled {
 		// Delivery receipts: the control plane raises push/webhooks/SSE the
-		// moment mail lands instead of at its poller's next tick.
-		a.pipeline.Notifier = notify.New(a.cfg.Notify.URL, a.logger, a.cfg.StackSecret)
+		// moment mail lands instead of at its poller's next tick. The same
+		// client serves the snooze sweeper's wake-up receipts.
+		a.notifyClient = notify.New(a.cfg.Notify.URL, a.logger, a.cfg.StackSecret)
+		a.pipeline.Notifier = a.notifyClient
 		a.logger.Info("delivery notify", "url", a.cfg.Notify.URL)
+	}
+	if a.cfg.SnoozeInterval > 0 {
+		// Snooze wake-up sweeper: due messages return to the inbox unread
+		// and raise push/SSE immediately (the lazy wake in the snoozed
+		// view stays as fallback).
+		sw := &snooze.Sweeper{
+			Accounts: func(ctx context.Context) ([]string, error) { return a.st.Facade().ListAccounts(ctx) },
+			Store:    a.st.mailbox,
+			Notify:   a.notifyClient,
+			Logger:   a.logger,
+		}
+		go sw.Run(runCtx, time.Duration(a.cfg.SnoozeInterval)*time.Second)
+		a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval)
 	}
 	if classifier != nil {
 		// Never assign a typed nil to the interface: an unconfigured
