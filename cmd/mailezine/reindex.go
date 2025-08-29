@@ -90,6 +90,7 @@ func runReindex(args []string) int {
 		return 2
 	}
 	total := 0
+	skipped := 0
 	for _, account := range accounts {
 		boxes, err := st.Mailbox().ListMailboxes(ctx, account)
 		if err != nil {
@@ -105,23 +106,30 @@ func runReindex(args []string) int {
 			for _, msg := range msgs {
 				rc, err := st.Mailbox().OpenMessage(ctx, account, box.Name, msg.UID)
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "reindex: open %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
-					return 2
+					// A dangling doc (blob already gone) must not abort the
+					// whole backfill: the IMAP read path tolerates vanished
+					// messages, so the index builder does too. Counted and
+					// reported at the end instead.
+					fmt.Fprintf(os.Stderr, "reindex: skip %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
+					skipped++
+					continue
 				}
 				data, err := io.ReadAll(rc)
 				_ = rc.Close()
 				if err != nil {
-					fmt.Fprintf(os.Stderr, "reindex: read %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
-					return 2
+					fmt.Fprintf(os.Stderr, "reindex: skip %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
+					skipped++
+					continue
 				}
 				if err := ix.IndexMessage(ctx, account, box.Name, msg.UID, data); err != nil {
-					fmt.Fprintf(os.Stderr, "reindex: index %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
-					return 2
+					fmt.Fprintf(os.Stderr, "reindex: skip %s/%s/%d: %v\n", account, box.Name, msg.UID, err)
+					skipped++
+					continue
 				}
 				total++
 			}
 		}
 	}
-	fmt.Printf("reindexed %d messages from %d accounts into %s\n", total, len(accounts), *ftsPath)
+	fmt.Printf("reindexed %d messages from %d accounts into %s (skipped %d unreadable)\n", total, len(accounts), *ftsPath, skipped)
 	return 0
 }
