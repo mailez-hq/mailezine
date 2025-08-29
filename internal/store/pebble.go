@@ -49,7 +49,7 @@ func (p *PebbleKV) Delete(key []byte) error {
 func (p *PebbleKV) Scan(prefix []byte, fn func(k, v []byte) error) error {
 	opts := &pebble.IterOptions{LowerBound: prefix}
 	if len(prefix) > 0 {
-		opts.UpperBound = prefixEnd(prefix)
+		opts.UpperBound = PrefixEnd(prefix)
 	}
 	iter, err := p.db.NewIter(opts)
 	if err != nil {
@@ -91,7 +91,7 @@ func (p *PebbleKV) Close() error {
 
 // prefixEnd returns the smallest key greater than every key with the given
 // prefix, or nil when the prefix covers the entire key space.
-func prefixEnd(prefix []byte) []byte {
+func PrefixEnd(prefix []byte) []byte {
 	if len(prefix) == 0 {
 		return nil
 	}

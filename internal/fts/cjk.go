@@ -56,7 +56,7 @@ func (f cjkBigramFilter) Filter(in analysis.TokenStream) analysis.TokenStream {
 	i := 0
 	for i < len(atoms) {
 		if !atoms[i].cjk {
-			out = append(out, atoms[i].token(len(out) + 1))
+			out = append(out, atoms[i].token(len(out)+1))
 			i++
 			continue
 		}
@@ -69,9 +69,9 @@ func (f cjkBigramFilter) Filter(in analysis.TokenStream) analysis.TokenStream {
 			out = append(out, run[k].bigram(run[k+1], len(out)+1))
 		}
 		if len(run) == 1 {
-			out = append(out, run[0].token(len(out) + 1))
+			out = append(out, run[0].token(len(out)+1))
 		} else if f.indexMode {
-			out = append(out, run[len(run)-1].token(len(out) + 1))
+			out = append(out, run[len(run)-1].token(len(out)+1))
 		}
 		i = j
 	}

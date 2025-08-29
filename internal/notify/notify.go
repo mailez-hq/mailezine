@@ -17,7 +17,6 @@ import (
 	"mailezine/internal/stackhttp"
 )
 
-
 // Delivered names one stored copy: mailbox (wire spelling) plus its UID.
 type Delivered struct {
 	Mailbox string `json:"mailbox"`

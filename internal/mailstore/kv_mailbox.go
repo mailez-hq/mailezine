@@ -272,7 +272,8 @@ func (k *KV) DeleteAccount(ctx context.Context, account string) error {
 	return k.s.DeleteRaw(ctx, store.AccountKey(aid))
 }
 
-func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {	acctID, err := k.s.AccountByEmail(ctx, account)
+func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
+	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
 		return err
 	}

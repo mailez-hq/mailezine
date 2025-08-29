@@ -22,7 +22,6 @@ import (
 	"mailezine/internal/mailstore"
 	"mailezine/internal/notify"
 	"mailezine/internal/sieve"
-	"mailezine/internal/spam"
 )
 
 // ErrQuota is returned when storing a copy would exceed the account quota.
@@ -45,10 +44,21 @@ type Verifier interface {
 	Verify(ctx context.Context, peer net.IP, from string, data []byte) (header string, err error)
 }
 
+// Result is the classification of one message: the contract the pipeline
+// consumes. The community build has no classifier; the enterprise build
+// implements delivery.Classifier (e.g. the rspamd client) and produces
+// these.
+type Result struct {
+	Action        string // "no action", "greylist", "add header", "rewrite subject", "soft reject", "reject"
+	Score         float64
+	RequiredScore float64
+	Headers       []string // "Name: value" lines to prepend, in insertion order
+}
+
 // Classifier scans an inbound message and returns headers to prepend plus an
-// action. spam.Client satisfies it.
+// action. The enterprise rspamd client satisfies it.
 type Classifier interface {
-	Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (spam.Result, error)
+	Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (Result, error)
 }
 
 // Pipeline resolves and stores inbound messages.

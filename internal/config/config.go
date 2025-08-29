@@ -453,7 +453,7 @@ func Load() (Config, error) {
 	cfg.SnoozeInterval = envInt("MAILEZINE_SNOOZE_INTERVAL", 60)
 	cfg.LicenseFile = getenv("MAILEZINE_LICENSE_FILE", "")
 	cfg.LicenseInline = getenv("MAILEZINE_LICENSE", "")
-	cfg.LicenseRequired = envBool("MAILEZINE_LICENSE_REQUIRED", false)
+	cfg.LicenseRequired = envBool("MAILEZINE_LICENSE_REQUIRED", false) && license.EnterpriseBuild
 	lic, err := license.Load(cfg.LicenseFile, cfg.LicenseInline, cfg.LicenseRequired)
 	if err != nil {
 		return Config{}, err

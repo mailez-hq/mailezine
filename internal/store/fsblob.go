@@ -39,7 +39,7 @@ func newFSBlob(root string, compressed bool) (*FSBlob, error) {
 }
 
 func (b *FSBlob) Put(_ context.Context, id string, size int64, r io.Reader) (int64, error) {
-	if err := validateBlobID(id); err != nil {
+	if err := ValidateBlobID(id); err != nil {
 		return 0, err
 	}
 	path := filepath.Join(b.root, id)
@@ -111,7 +111,7 @@ func syncDir(dir string) {
 }
 
 func (b *FSBlob) Get(_ context.Context, id string, w io.Writer) error {
-	if err := validateBlobID(id); err != nil {
+	if err := ValidateBlobID(id); err != nil {
 		return err
 	}
 	f, err := os.Open(filepath.Join(b.root, id))
@@ -147,7 +147,7 @@ func (b *FSBlob) Get(_ context.Context, id string, w io.Writer) error {
 }
 
 func (b *FSBlob) Delete(_ context.Context, id string) error {
-	if err := validateBlobID(id); err != nil {
+	if err := ValidateBlobID(id); err != nil {
 		return err
 	}
 	err := os.Remove(filepath.Join(b.root, id))
@@ -158,7 +158,7 @@ func (b *FSBlob) Delete(_ context.Context, id string) error {
 }
 
 func (b *FSBlob) Stat(_ context.Context, id string) (int64, error) {
-	if err := validateBlobID(id); err != nil {
+	if err := ValidateBlobID(id); err != nil {
 		return 0, err
 	}
 	fi, err := os.Stat(filepath.Join(b.root, id))
@@ -173,7 +173,7 @@ func (b *FSBlob) Stat(_ context.Context, id string) (int64, error) {
 
 // validateBlobID restricts IDs to a safe, portable character set and rejects
 // anything that could traverse directories (path safety invariant INV-FS).
-func validateBlobID(id string) error {
+func ValidateBlobID(id string) error {
 	if id == "" || id == "." || id == ".." || len(id) > 128 {
 		return errors.New("store: invalid blob id")
 	}

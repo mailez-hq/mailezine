@@ -18,7 +18,6 @@ import (
 	"mailezine/internal/mailstore"
 	"mailezine/internal/notify"
 	"mailezine/internal/sieve"
-	"mailezine/internal/spam"
 	"mailezine/internal/store"
 )
 
@@ -159,17 +158,17 @@ func TestQuotaWriteBack(t *testing.T) {
 
 // stubClassifier returns a canned classification for the pipeline tests.
 type stubClassifier struct {
-	result spam.Result
+	result Result
 	err    error
 }
 
-func (s stubClassifier) Classify(context.Context, net.IP, string, []string, []byte) (spam.Result, error) {
+func (s stubClassifier) Classify(context.Context, net.IP, string, []string, []byte) (Result, error) {
 	return s.result, s.err
 }
 
 func TestDeliverRejectedBySpam(t *testing.T) {
 	p, _, _ := newTestPipeline(t, 1<<20)
-	p.Classifier = stubClassifier{result: spam.Result{Action: "reject"}}
+	p.Classifier = stubClassifier{result: Result{Action: "reject"}}
 	err := p.Deliver(context.Background(), nil, "s@remote.test", []string{"alice@example.com"},
 		[]byte("Subject: x\r\n\r\nbody\r\n"))
 	if !errors.Is(err, ErrReject) {
@@ -179,7 +178,7 @@ func TestDeliverRejectedBySpam(t *testing.T) {
 
 func TestDeliverGreylisted(t *testing.T) {
 	p, _, _ := newTestPipeline(t, 1<<20)
-	p.Classifier = stubClassifier{result: spam.Result{Action: "greylist"}}
+	p.Classifier = stubClassifier{result: Result{Action: "greylist"}}
 	err := p.Deliver(context.Background(), nil, "s@remote.test", []string{"alice@example.com"},
 		[]byte("Subject: x\r\n\r\nbody\r\n"))
 	if !errors.Is(err, ErrGreylist) {
@@ -189,7 +188,7 @@ func TestDeliverGreylisted(t *testing.T) {
 
 func TestDeliverAddsSpamHeaders(t *testing.T) {
 	p, ms, _ := newTestPipeline(t, 1<<20)
-	p.Classifier = stubClassifier{result: spam.Result{
+	p.Classifier = stubClassifier{result: Result{
 		Action:  "add header",
 		Score:   5.2,
 		Headers: []string{"X-Spam-Flag: YES", "X-Spam-Score: 5.2"},
@@ -226,11 +225,18 @@ func TestDeliverClassifierFailOpen(t *testing.T) {
 	}
 }
 
-// TestDeliverTypedNilClassifier guards the typed-nil trap: a nil *spam.Client
-// stored in the interface must behave like no classifier, not panic.
+// TestDeliverTypedNilClassifier guards the typed-nil trap: a nil pointer
+// with a method set stored in the interface must behave like no classifier,
+// not panic.
+type ptrStubClassifier struct{}
+
+func (*ptrStubClassifier) Classify(context.Context, net.IP, string, []string, []byte) (Result, error) {
+	return Result{}, nil
+}
+
 func TestDeliverTypedNilClassifier(t *testing.T) {
 	p, ms, _ := newTestPipeline(t, 1<<20)
-	var c *spam.Client
+	var c *ptrStubClassifier
 	p.Classifier = c
 	body := "Subject: x\r\n\r\nbody\r\n"
 	if err := p.Deliver(context.Background(), nil, "s@remote.test", []string{"alice@example.com"}, []byte(body)); err != nil {
@@ -632,7 +638,7 @@ func TestDeliverNoAutoReplyLoop(t *testing.T) {
 // classifier did not provide it, so spamtest keeps working.
 func TestDeliverSpamLevelFallback(t *testing.T) {
 	p, ms, _ := newTestPipeline(t, 1<<20)
-	p.Classifier = stubClassifier{result: spam.Result{Action: "add header", Score: 13, Headers: []string{"X-Spam-Flag: YES"}}}
+	p.Classifier = stubClassifier{result: Result{Action: "add header", Score: 13, Headers: []string{"X-Spam-Flag: YES"}}}
 	body := "From: s@remote.test\r\nSubject: spam\r\n\r\nbody\r\n"
 	if err := p.Deliver(context.Background(), nil, "s@remote.test", []string{"alice@example.com"}, []byte(body)); err != nil {
 		t.Fatal(err)
@@ -787,4 +793,3 @@ func TestDeliverVacationPersistentThrottle(t *testing.T) {
 		t.Fatalf("vacation replies = %d, want 1 (throttle must survive restart)", replies)
 	}
 }
-

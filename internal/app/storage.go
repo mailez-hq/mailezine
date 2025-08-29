@@ -6,12 +6,12 @@ package app
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 
 	"mailezine/internal/config"
 	"mailezine/internal/fts"
-	"mailezine/internal/ha"
 	"mailezine/internal/maildns"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/store"
@@ -64,7 +64,9 @@ func NewStorage(cfg config.Config, logger *slog.Logger) (*Storage, error) {
 }
 
 // OpenKVBlob picks the KV and blob implementations from the config:
-// Pebble or TiDB for KV; MinIO/S3 or local FS for blob.
+// Pebble for KV and the local FS for blobs in the community build; the
+// enterprise build additionally registers TiDB (KV) and S3 (blob) openers
+// into the store registry.
 func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, error) {
 	kvPath, blobRoot := cfg.Storage.RocksPath, cfg.Storage.RocksPath+".blobs"
 
@@ -74,7 +76,12 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 	case "pebble":
 		kv, err = store.OpenPebble(kvPath)
 	case "tidb":
-		kv, err = store.OpenTiDB(cfg.Storage.DSN, "mailezine_kv")
+		// Scale-out KV: registered by the enterprise build only.
+		if op := store.LookupKVOpener("tidb"); op != nil {
+			kv, err = op(cfg.Storage.DSN, "mailezine_kv")
+		} else {
+			err = fmt.Errorf("storage: backend %q requires the enterprise edition", cfg.Storage.Backend)
+		}
 	default:
 		err = errors.New("storage: unknown backend (validated earlier)")
 	}
@@ -84,23 +91,29 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 
 	var blob store.Blob
 	if cfg.Storage.S3Endpoint != "" {
-		newBlob := store.NewS3Blob
-		if cfg.Storage.Compression {
-			newBlob = store.NewS3BlobCompressed
+		op := store.S3BlobOpenerFor()
+		if op == nil {
+			_ = kv.Close()
+			return nil, nil, fmt.Errorf("storage: s3 blob backend requires the enterprise edition")
 		}
-		b, berr := newBlob(
+		b, berr := op(
 			cfg.Storage.S3Endpoint,
 			cfg.Storage.S3AccessKey,
 			cfg.Storage.S3SecretKey,
 			cfg.Storage.S3Bucket,
 			cfg.Storage.S3UseSSL,
+			cfg.Storage.Compression,
 		)
 		if berr != nil {
 			_ = kv.Close()
 			return nil, nil, berr
 		}
-		if berr := b.EnsureBucket(context.Background()); berr != nil {
-			logger.Warn("storage: s3 bucket ensure", "err", berr)
+		if s3c, ok := b.(interface {
+			EnsureBucket(ctx context.Context) error
+		}); ok {
+			if berr := s3c.EnsureBucket(context.Background()); berr != nil {
+				logger.Warn("storage: s3 bucket ensure", "err", berr)
+			}
 		}
 		blob = b
 		logger.Info("storage: blob", "backend", "s3", "bucket", cfg.Storage.S3Bucket, "compressed", cfg.Storage.Compression)
@@ -137,21 +150,6 @@ func openFTS(cfg config.Config, logger *slog.Logger) *fts.Indexer {
 	}
 	logger.Info("fts: enabled", "path", path, "tika", cfg.FTS.TikaURL != "")
 	return idx
-}
-
-// openHAStore picks the leadership lease store: an explicit FS path (shared
-// volume) first, then the S3 bucket when configured.
-func openHAStore(cfg config.Config, logger *slog.Logger) (ha.Store, error) {
-	if cfg.HA.LeasePath != "" {
-		logger.Info("ha: lease store", "backend", "fs", "path", cfg.HA.LeasePath)
-		return ha.NewFSStore(cfg.HA.LeasePath), nil
-	}
-	if cfg.Storage.S3Endpoint != "" {
-		logger.Info("ha: lease store", "backend", "s3", "bucket", cfg.Storage.S3Bucket)
-		return ha.NewS3Store(cfg.Storage.S3Endpoint, cfg.Storage.S3AccessKey,
-			cfg.Storage.S3SecretKey, cfg.Storage.S3Bucket, "mailezine/lease", cfg.Storage.S3UseSSL)
-	}
-	return nil, errors.New("ha: enabled but no shared lease storage (set MAILEZINE_HA_LEASE_PATH or MAILEZINE_S3_*)")
 }
 
 func newSystemResolver() *maildns.SystemResolver {

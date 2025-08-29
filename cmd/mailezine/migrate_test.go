@@ -4,62 +4,16 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"io"
-	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
-	"mailezine/internal/config"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/store"
 	maildirpkg "mailezine/internal/store/maildir"
-	"mailezine/internal/store/s3test"
 )
-
-// TestMigrateMaildirToPebbleS3Blob verifies the --s3-* path of migrate:
-// blobs land in the object store (not the local FS).
-func TestMigrateMaildirToPebbleS3Blob(t *testing.T) {
-	endpoint, objects, cleanup := s3test.New(t)
-	defer cleanup()
-	s3 := s3Flags{endpoint: endpoint, accessKey: "test", secretKey: "test", bucket: "blobs"}
-
-	src := t.TempDir()
-	acct, err := maildirpkg.OpenAccount(filepath.Join(src, "alice@example.com"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	inbox, err := acct.OpenMailbox("INBOX")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := inbox.Append(strings.NewReader("From: a@x.test\r\nSubject: s3 one\r\n\r\ns3 body one\r\n"),
-		[]maildirpkg.Flag{maildirpkg.FlagSeen}, mustTime(t, "2026-01-01T00:00:00Z")); err != nil {
-		t.Fatal(err)
-	}
-	u2, err := inbox.Append(strings.NewReader("From: b@x.test\r\nSubject: s3 two\r\n\r\ns3 body two\r\n"),
-		nil, mustTime(t, "2026-01-02T00:00:00Z"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := inbox.SetKeywords(u2, []string{"s3label"}); err != nil {
-		t.Fatal(err)
-	}
-
-	// maildir → KV with S3 blob: the KV lives on local disk, blobs in S3.
-	kvPath := filepath.Join(t.TempDir(), "rocks")
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if code := migrateMaildirToKV(src, s3.storageConfig("pebble", kvPath), false, logger); code != 0 {
-		t.Fatalf("migrate maildir→pebble(s3) exit = %d", code)
-	}
-	if got := len(objects()); got == 0 {
-		t.Fatal("no blobs landed in the object store")
-	}
-}
 
 func TestMigrateMaildirToPebble(t *testing.T) {
 	ctx := context.Background()
@@ -155,71 +109,6 @@ func TestMigrateMaildirToPebble(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "body one") {
 		t.Fatalf("body: %q", body)
-	}
-}
-
-// TestMigrateMaildirToTiDB exercises the -to tidb target against a live
-// server (env-gated, MAILEZINE_TEST_TIDB_DSN). The engine's fixed
-// mailezine_kv table is dropped before and after the run.
-func TestMigrateMaildirToTiDB(t *testing.T) {
-	dsn := os.Getenv("MAILEZINE_TEST_TIDB_DSN")
-	if dsn == "" {
-		t.Skip("set MAILEZINE_TEST_TIDB_DSN to exercise the TiDB migration target")
-	}
-	db, err := sql.Open("mysql", dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	drop := func() {
-		if _, err := db.Exec("DROP TABLE IF EXISTS mailezine_kv"); err != nil {
-			t.Fatalf("drop kv table: %v", err)
-		}
-	}
-	drop()
-	t.Cleanup(func() {
-		drop()
-		db.Close()
-	})
-
-	src := t.TempDir()
-	acct, err := maildirpkg.OpenAccount(filepath.Join(src, "alice@example.com"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	inbox, err := acct.OpenMailbox("INBOX")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := inbox.Append(strings.NewReader("From: a@x.test\r\nSubject: one\r\n\r\nbody one\r\n"),
-		[]maildirpkg.Flag{maildirpkg.FlagSeen}, mustTime(t, "2026-01-01T00:00:00Z")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := inbox.Append(strings.NewReader("From: b@x.test\r\nSubject: two\r\n\r\nbody two\r\n"),
-		nil, mustTime(t, "2026-01-02T00:00:00Z")); err != nil {
-		t.Fatal(err)
-	}
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if code := migrateMaildirToKV(src, config.StorageConfig{Backend: "tidb", DSN: dsn}, false, logger); code != 0 {
-		t.Fatalf("migrate maildir→tidb exit = %d", code)
-	}
-
-	// Read back through the TiDB-backed store.
-	kv, err := store.OpenTiDB(dsn, "mailezine_kv")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer kv.Close()
-	ms := mailstore.NewKV(store.New(kv, store.NewMemoryBlob()))
-	msgs, err := ms.ListMessages(context.Background(), "alice@example.com", "INBOX")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(msgs) != 2 {
-		t.Fatalf("tidb message count = %d, want 2", len(msgs))
-	}
-	if !mailstore.HasFlag(msgs[0].Flags, "\\Seen") {
-		t.Fatalf("flags lost: %+v", msgs[0].Flags)
 	}
 }
 

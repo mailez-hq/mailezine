@@ -62,4 +62,21 @@ jobs:
           docker logs rspamd
           exit 1
       - name: Real rspamd e2e
-        run: go test -tags docker ./... -run "TestRealRspamdCheckV2|TestEndToEndRspamd" -count=1 -v
+        run: go test -tags "docker mailez_ee" ./... -run "TestRealRspamdCheckV2|TestEndToEndRspamd" -count=1 -v
+
+  # Enterprise edition: the same battery with -tags mailez_ee, plus the
+  # community-purity assertion (the no-tag dependency graph must never
+  # reach internal/ee). Runs only in the private CI (the public CE mirror
+  # has no internal/ee at all).
+  verify-ee:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          cache: true
+      - run: make check-ce-purity
+      - run: make vet-ee
+      - run: go test -tags mailez_ee ./... -count=1 -race
+      - run: go build -tags mailez_ee ./...

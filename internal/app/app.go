@@ -18,25 +18,21 @@ package app
 import (
 	"context"
 	"crypto/tls"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	gosmtp "github.com/emersion/go-smtp"
 
-	"mailezine/internal/archive"
 	"mailezine/internal/auth"
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
 	"mailezine/internal/fts"
-	"mailezine/internal/ha"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
 	"mailezine/internal/mailcache"
@@ -50,13 +46,40 @@ import (
 	"mailezine/internal/sieve"
 	"mailezine/internal/smtp"
 	"mailezine/internal/snooze"
-	"mailezine/internal/spam"
 	"mailezine/internal/telemetry"
 	"mailezine/internal/verify"
 	"mailezine/internal/version"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// Open-core seams (edition split): the interfaces below are the complete
+// contract the app holds on enterprise subsystems. The community build
+// leaves every field nil; the enterprise build (build tag mailez_ee)
+// registers live implementations through the paired hook files.
+
+// spamClassifier is the ML spam-scanning surface (rspamd): verdicts for the
+// inbound pipeline plus Junk-boundary learning for IMAP.
+type spamClassifier interface {
+	delivery.Classifier
+	LearnWithFuzzy(ctx context.Context, isSpam bool, data []byte) error
+}
+
+// complianceSpool is the compliance-capture archive (SMTP wrap + durable
+// store + forwarder to the control plane).
+type complianceSpool interface {
+	Run(ctx context.Context)
+	Wrap(direction string, next submitHandler) submitHandler
+	Close()
+}
+
+// leaderLease is the HA leadership lease; nil means single-node.
+type leaderLease interface {
+	TTL() time.Duration
+	TryAcquire(ctx context.Context) error
+	Release(ctx context.Context) error
+	Run(ctx context.Context, onLost func())
+}
 
 // App is the fully assembled engine. Depending on mode, New completes part
 // or all of the startup work that can fail; Run serves until ctx is
@@ -68,16 +91,16 @@ type App struct {
 	logger *slog.Logger
 	m      *metrics.Metrics
 
-	dir         directory.Service
-	auth        auth.Service
-	st          *Storage
-	fts         *fts.Indexer
-	pipeline    *delivery.Pipeline
-	classifier  *spam.Client
-	sieveEngine *sieve.Engine
-	qm          *queue.Manager
-	qmDone      chan struct{}
-	arch        *archive.Spool
+	dir          directory.Service
+	auth         auth.Service
+	st           *Storage
+	fts          *fts.Indexer
+	pipeline     *delivery.Pipeline
+	classifier   spamClassifier
+	sieveEngine  *sieve.Engine
+	qm           *queue.Manager
+	qmDone       chan struct{}
+	arch         complianceSpool
 	notifyClient *notify.Client
 
 	tlsConf   *tls.Config
@@ -91,7 +114,7 @@ type App struct {
 	healthSrv      *http.Server
 	mgmtSrv        *http.Server
 
-	leader     *ha.Leader
+	leader     leaderLease
 	haCtx      context.Context    // app-lifetime; cancelled by Close
 	haCancel   context.CancelFunc // cancels haCtx
 	termCtx    context.Context    // current HA term scope (listeners, queue)
@@ -114,11 +137,18 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	logger.Info("starting", "version", version.Version, "summary", cfg.Summary())
 	a := &App{cfg: cfg, ctx: ctx, logger: logger, m: m, startedAt: time.Now()}
 
-	if cfg.HA.Enabled {
+	if cfg.HA.Enabled && haAvailable() {
 		if err := a.bootstrapHA(); err != nil {
 			return nil, err
 		}
 		return a, nil
+	}
+	if cfg.HA.Enabled {
+		// HA (shared lease + standby/leader terms) is an enterprise
+		// capability; a copied config must never wedge community startup,
+		// so degrade to single-node with a loud warning.
+		a.logger.Warn("ha: requires the enterprise edition; continuing single-node")
+		cfg.HA.Enabled = false
 	}
 	if err := a.openServices(); err != nil {
 		a.Close()
@@ -256,9 +286,9 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		Hostname: a.cfg.Hostname,
 		LocalIP:  localIP(a.cfg.Hostname),
 	}
-	var classifier *spam.Client
+	var classifier spamClassifier
 	if a.cfg.Rspamd.URL != "" {
-		classifier = spam.New(a.cfg.Rspamd.URL, a.cfg.Rspamd.LearnURL, a.cfg.Rspamd.Password, a.cfg.Hostname, a.logger)
+		classifier = newSpamClassifier(a.cfg, a.logger)
 	}
 	a.classifier = classifier
 	a.sieveEngine = sieve.NewEngine(a.logger)
@@ -300,17 +330,6 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		a.pipeline.Classifier = classifier
 	}
 	return a.wireQueue(runCtx)
-}
-
-// wireArchive builds the compliance-capture spool when enabled and starts
-// its forwarding worker under runCtx.
-func (a *App) wireArchive(runCtx context.Context) {
-	if !a.cfg.Archive.Enabled || a.st == nil {
-		return
-	}
-	a.arch = archive.New(a.st.Facade(), a.cfg.Archive.URL, a.cfg.Archive.MaxAttempts, a.logger, a.cfg.StackSecret)
-	a.arch.Run(runCtx)
-	a.logger.Info("archive", "enabled", true, "endpoint", a.cfg.Archive.URL)
 }
 
 // wireServers builds the protocol servers (listeners start later).
@@ -438,7 +457,7 @@ func (a *App) serveHealth(ctx context.Context) error {
 		a.m.HealthChecks.WithLabelValues("/ready").Inc()
 		fmt.Fprintf(w, `{"status":"ok","role":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
 			a.role(), a.cfg.Storage.Backend, a.cfg.Directory.Mode,
-			a.cfg.Rspamd.URL != "", a.cfg.Outbound.Enabled)
+			a.classifier != nil, a.cfg.Outbound.Enabled)
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(a.m.Registry, promhttp.HandlerOpts{}))
 	a.healthSrv = &http.Server{Addr: a.cfg.HealthAddr, Handler: mux}
@@ -569,129 +588,6 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 	a.logger.Info("mail path ready", "inbound", cfg.Listeners.SMTP, "submission", cfg.Listeners.Submission,
 		"imap", cfg.Listeners.IMAP, "managesieve", cfg.Listeners.ManageSieve, "role", a.role())
 	return nil
-}
-
-// ---------------------------------------------------------------------------
-// HA lifecycle: bootstrap, standby wait, per-term activation, demotion.
-// ---------------------------------------------------------------------------
-
-// bootstrapHA opens the lease store and prepares the leader helper without
-// acquiring anything. Failures here are startup failures on purpose: they
-// are deterministic misconfiguration, safe to abort on.
-func (a *App) bootstrapHA() error {
-	store, err := openHAStore(a.cfg, a.logger)
-	if err != nil {
-		return fmt.Errorf("ha: lease store: %w", err)
-	}
-	owner := a.cfg.Hostname + "-" + fmt.Sprint(os.Getpid())
-	ttl := time.Duration(a.cfg.HA.TTLSeconds) * time.Second
-	if ttl <= 0 {
-		ttl = 15 * time.Second
-	}
-	a.haCtx, a.haCancel = context.WithCancel(context.Background())
-	a.leader = ha.NewLeader(store, owner, ttl, a.logger)
-	a.logger.Info("ha: standby starting", "owner", owner, "ttl", ttl)
-	return nil
-}
-
-// superviseTerms loops: acquire the lease → activate the write path → wait
-// for loss or shutdown → demote → repeat. It returns when ctx is done or a
-// terminal activation failure persists.
-func (a *App) superviseTerms(ctx context.Context) error {
-	backoff := time.Second
-	for {
-		if ctx.Err() != nil {
-			return nil
-		}
-		if err := a.waitForLeadership(); err != nil {
-			if errors.Is(err, context.Canceled) || a.haCtx.Err() != nil || ctx.Err() != nil {
-				return nil
-			}
-			a.logger.Error("ha: leadership wait failed", "err", err)
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(backoff):
-			}
-			continue
-		}
-		backoff = time.Second
-
-		if err := a.activateTerm(ctx); err != nil {
-			a.logger.Error("ha: term activation failed", "err", err)
-			_ = a.leader.Release(context.Background()) // pass the baton promptly
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(backoff):
-			}
-			backoff *= 2
-			if backoff > 30*time.Second {
-				backoff = 30 * time.Second
-			}
-			continue
-		}
-
-		lost := make(chan struct{})
-		var lostOnce sync.Once
-		notifyLost := func() {
-			lostOnce.Do(func() {
-				// Cancel the term BEFORE teardown inspects it: a cancelled
-				// termCtx is how stopTerm tells "lease lost" (never touch
-				// the record — a successor may already hold it) apart from
-				// a voluntary handover (release).
-				if a.termCancel != nil {
-					a.termCancel()
-				}
-				close(lost)
-			})
-		}
-		go a.leader.Run(a.termCtx, notifyLost)
-
-		select {
-		case <-ctx.Done():
-			a.stopTerm("shutdown")
-			return nil
-		case <-lost:
-			a.stopTerm("lease lost")
-			select {
-			case <-ctx.Done():
-				return nil
-			case <-time.After(time.Second): // brief cool-down before re-acquiring
-			}
-		}
-	}
-}
-
-// waitForLeadership polls TryAcquire until it wins, the lease error is not
-// retryable, or the app context ends. Followers log periodic standby notes.
-func (a *App) waitForLeadership() error {
-	ttl := a.leader.TTL()
-	interval := ttl / 2
-	if interval <= 0 {
-		interval = time.Second
-	}
-	notified := time.Now().Add(-interval / 2)
-	for {
-		err := a.leader.TryAcquire(a.haCtx)
-		switch {
-		case err == nil:
-			return nil
-		case errors.Is(err, context.Canceled), a.haCtx.Err() != nil:
-			return context.Canceled
-		case !errors.Is(err, ha.ErrNotLeader):
-			return fmt.Errorf("ha: lease acquire: %w", err)
-		}
-		if time.Since(notified) >= interval*4 {
-			a.logger.Info("ha: standby, waiting for leadership")
-			notified = time.Now()
-		}
-		select {
-		case <-a.haCtx.Done():
-			return context.Canceled
-		case <-time.After(interval):
-		}
-	}
 }
 
 // activateTerm assembles and binds the write path for a freshly acquired

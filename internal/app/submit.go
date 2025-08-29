@@ -17,10 +17,15 @@ import (
 	"mailezine/internal/queue"
 )
 
+// submitHandler is the SMTP layer's Submit callback shape. It is a type
+// alias (not a definition) so every named use stays assignable to the raw
+// signature; the compliance seam wraps it per edition.
+type submitHandler = func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error
+
 // newSubmit routes envelope recipients: local addresses go through the
 // delivery pipeline; external addresses are spooled for relay when the
 // outbound queue is enabled.
-func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Manager, logger *slog.Logger) func(context.Context, net.IP, string, string, []string, mailbuffer.Buffer) error {
+func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Manager, logger *slog.Logger) submitHandler {
 	return func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error {
 		// Outbound mail never carries internal Received chains or client
 		// fingerprints collected on the way in. The filter streams so large

@@ -1,3 +1,5 @@
+//go:build mailez_ee
+
 // HA failover e2e: two engine processes share one KV volume and one lease
 // file. A is leader and accepts mail; B stays on standby (no listeners).
 // When A exits, B takes over and serves the same data.

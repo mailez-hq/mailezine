@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"testing"
-
-	"mailezine/internal/store/s3test"
 )
 
 // TestFSBlobCompressionRoundTrip: compressed blobs read back identical, and
@@ -55,35 +53,5 @@ func TestFSBlobCompressionRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(got.Bytes(), payload) {
 		t.Fatal("legacy round trip mismatch")
-	}
-}
-
-// TestS3BlobCompressionRoundTrip covers the S3 path with the in-process
-// S3-compatible server.
-func TestS3BlobCompressionRoundTrip(t *testing.T) {
-	endpoint, _, cleanup := s3test.New(t)
-	t.Cleanup(cleanup)
-	b, err := NewS3BlobCompressed(endpoint, "test", "test", "blobs", false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	if err := b.EnsureBucket(ctx); err != nil {
-		t.Fatal(err)
-	}
-	payload := bytes.Repeat([]byte("attachment payload data "), 64)
-	n, err := b.Put(ctx, "email-2-1", int64(len(payload)), bytes.NewReader(payload))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if n != int64(len(payload)) {
-		t.Fatalf("put returned %d, want %d", n, len(payload))
-	}
-	var got bytes.Buffer
-	if err := b.Get(ctx, "email-2-1", &got); err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(got.Bytes(), payload) {
-		t.Fatal("s3 round trip mismatch")
 	}
 }
