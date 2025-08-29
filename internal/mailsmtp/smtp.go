@@ -98,6 +98,9 @@ type ConnOptions struct {
 	// DANE holds the TLSA records for Host. When non-empty, TLS is required
 	// and the presented chain must match one record (RFC 7672).
 	DANE []maildns.TLSA
+	// Timeout caps the whole session (greeting, STARTTLS, AUTH, envelope,
+	// DATA) with one absolute connection deadline; zero disables it.
+	Timeout time.Duration
 }
 
 // Client is one SMTP session over a network connection.
@@ -131,6 +134,13 @@ func Dial(ctx context.Context, addr string, opts ConnOptions) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mailsmtp: dial %s: %w", addr, err)
 	}
+	// A whole-session cap: without one, a hostile or wedged server that
+	// accepts the connection but never answers (or dribbles bytes) hangs a
+	// queue worker until the process restarts. The absolute deadline covers
+	// greeting, handshake, and the full DATA transfer.
+	if opts.Timeout > 0 {
+		_ = conn.SetDeadline(time.Now().Add(opts.Timeout))
+	}
 	host := opts.Host
 	if host == "" {
 		host, _, _ = net.SplitHostPort(addr)
@@ -145,6 +155,12 @@ func Dial(ctx context.Context, addr string, opts ConnOptions) (*Client, error) {
 	}
 
 	return c, nil
+}
+
+// TLSEnabled reports whether the active connection is TLS-encrypted.
+func (c *Client) TLSEnabled() bool {
+	_, ok := c.conn.(*tls.Conn)
+	return ok
 }
 
 // Greet sends EHLO and parses capabilities, then applies the TLS policy:
@@ -165,6 +181,9 @@ func (c *Client) Greet(ctx context.Context, ehloName string, mode TLSMode, dane 
 		return err
 	}
 
+	if noTLS && mode == TLSModeRequired {
+		return fmt.Errorf("mailsmtp: %s: plaintext fallback cannot satisfy required TLS", c.host)
+	}
 	if noTLS {
 		return nil
 	}
@@ -552,7 +571,39 @@ func VerifyDANE(state tls.ConnectionState, records []maildns.TLSA, serverName st
 				}
 			}
 		case 2: // DANE-TA
-			candidates = append(candidates, state.PeerCertificates[len(state.PeerCertificates)-1])
+			// The record pins a trust anchor: the leaf must verify against
+			// that anchor (with the presented intermediates and the SMTP
+			// name check) per RFC 6698 §2.1.1. The anchor is either one of
+			// the presented certificates, or carried by the record itself
+			// (selector 0, full certificate) when the server omits it from
+			// its chain. Merely hashing the last presented cert would
+			// accept an anchor that never anchors anything.
+			anchors := x509.NewCertPool()
+			anchorAdded := false
+			for _, cand := range state.PeerCertificates {
+				if tlsaMatches(cand, rec) {
+					anchors.AddCert(cand)
+					anchorAdded = true
+				}
+			}
+			if anchor, err := x509.ParseCertificate(rec.Cert); err == nil && tlsaMatches(anchor, rec) {
+				anchors.AddCert(anchor)
+				anchorAdded = true
+			}
+			if anchorAdded {
+				inter := x509.NewCertPool()
+				for _, c := range state.PeerCertificates[1:] {
+					inter.AddCert(c)
+				}
+				if _, err := leaf.Verify(x509.VerifyOptions{
+					Roots:         anchors,
+					Intermediates: inter,
+					DNSName:       serverName,
+				}); err == nil {
+					return nil
+				}
+			}
+			continue
 		case 3: // DANE-EE
 			candidates = append(candidates, leaf)
 		default:

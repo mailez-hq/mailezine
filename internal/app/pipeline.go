@@ -35,6 +35,9 @@ func (a *App) wireQueue(runCtx context.Context) error {
 		FixedPort: a.cfg.Outbound.FixedPort,
 		Username:  a.cfg.Outbound.SmarthostUsername,
 		Password:  a.cfg.Outbound.SmarthostPassword,
+		// Credentials over plaintext are an explicit opt-in (loopback
+		// smarthosts); default is TLS-only AUTH.
+		AllowPlaintextAuth: a.cfg.Outbound.SmarthostAllowPlaintextAuth,
 		// MTA-STS/DANE policy for outbound TLS (opportunistic fallback).
 		PolicyResolver: dnsResolver,
 		MTSTS:          mailmtasts.NewFetcher(),

@@ -238,19 +238,22 @@ func TestSMTPDeliverNoRoute(t *testing.T) {
 }
 
 // TestSMTPDeliverSmarthostAuth verifies that a smarthost delivery with
-// configured credentials authenticates with SASL PLAIN.
+// configured credentials authenticates with SASL PLAIN. The fake smarthost
+// is plaintext, so this exercises the explicit AllowPlaintextAuth opt-in
+// (loopback/LAN smarthosts).
 func TestSMTPDeliverSmarthostAuth(t *testing.T) {
 	srv, port := newTestSMTPServer(t, nil)
 	srv.auth = true
 
 	d := &SMTPDeliverer{
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Hostname:  "mail.mailez.test",
-		Dialer:    &net.Dialer{},
-		FixedHost: "127.0.0.1",
-		FixedPort: port,
-		Username:  "relayuser",
-		Password:  "relaypass",
+		Logger:             slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Hostname:           "mail.mailez.test",
+		Dialer:             &net.Dialer{},
+		FixedHost:          "127.0.0.1",
+		FixedPort:          port,
+		Username:           "relayuser",
+		Password:           "relaypass",
+		AllowPlaintextAuth: true,
 	}
 	results, err := d.Deliver(context.Background(), "sender@example.com",
 		[]string{"rcpt@remote.test"}, strings.NewReader("Subject: x\r\n\r\nbody\r\n"))
@@ -270,6 +273,35 @@ func TestSMTPDeliverSmarthostAuth(t *testing.T) {
 	}
 	if string(decoded) != "\x00relayuser\x00relaypass" {
 		t.Fatalf("auth payload = %q", decoded)
+	}
+}
+
+// TestSMTPDeliverSmarthostPlaintextAuthRefused: without the explicit opt-in,
+// credentials must never travel over an unencrypted connection even when the
+// smarthost advertises AUTH PLAIN.
+func TestSMTPDeliverSmarthostPlaintextAuthRefused(t *testing.T) {
+	srv, port := newTestSMTPServer(t, nil)
+	srv.auth = true
+
+	d := &SMTPDeliverer{
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Hostname:  "mail.mailez.test",
+		Dialer:    &net.Dialer{},
+		FixedHost: "127.0.0.1",
+		FixedPort: port,
+		Username:  "relayuser",
+		Password:  "relaypass",
+	}
+	results, err := d.Deliver(context.Background(), "sender@example.com",
+		[]string{"rcpt@remote.test"}, strings.NewReader("Subject: x\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if srv.gotAuth != "" {
+		t.Fatalf("credentials sent over plaintext: %q", srv.gotAuth)
+	}
+	if len(results) != 1 || results[0].OK {
+		t.Fatalf("expected delivery failure without plaintext AUTH: %+v", results)
 	}
 }
 

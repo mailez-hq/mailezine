@@ -765,7 +765,14 @@ func (a *App) closeTermBackendsLocked() {
 		}
 	}
 	if a.qmDone != nil {
-		<-a.qmDone // queue drained before the KV store closes underneath it
+		// The queue workers exit on termCancel; a wedged delivery must not
+		// hang shutdown (and the KV close below is what finally unblocks
+		// anything still stuck in a transaction).
+		select {
+		case <-a.qmDone:
+		case <-time.After(30 * time.Second):
+			a.logger.Error("shutdown: queue drain timed out after 30s; closing stores anyway")
+		}
 	}
 	if a.arch != nil {
 		a.arch.Close()

@@ -43,6 +43,22 @@ func TestOutboundTLSPolicy(t *testing.T) {
 		}
 	})
 
+	t.Run("unvalidated tlsa falls back to opportunistic", func(t *testing.T) {
+		// RFC 7672 §5: TLSA records from an answer without the DNSSEC
+		// authenticated-data bit are not actionable — enforcing them would
+		// let an on-path spoofer pin (or break) transport.
+		r := &testdns.Resolver{
+			TLSA: map[string][]maildns.TLSA{
+				"mx.example.com": {{Usage: 3, Selector: 1, MatchingType: 1, Cert: make([]byte, 32)}},
+			},
+			TLSAValidated: map[string]bool{"mx.example.com": false},
+		}
+		mode, dane, err := outboundTLSPolicy(ctx, r, nil, logger, "example.com", "mx.example.com")
+		if err != nil || mode != mailsmtp.TLSModeOpportunistic || len(dane) != 0 {
+			t.Fatalf("mode=%v dane=%v err=%v", mode, dane, err)
+		}
+	})
+
 	t.Run("ip host skips dane", func(t *testing.T) {
 		r := &testdns.Resolver{}
 		mode, _, err := outboundTLSPolicy(ctx, r, nil, logger, "example.com", "192.0.2.10")

@@ -185,6 +185,10 @@ type OutboundConfig struct {
 	// a configured smarthost (directory relay transport "smtp:[host]").
 	SmarthostUsername string
 	SmarthostPassword string
+	// SmarthostAllowPlaintextAuth opts into SASL AUTH before STARTTLS
+	// (trusted loopback/LAN smarthost only). Credentials are otherwise
+	// sent exclusively over TLS.
+	SmarthostAllowPlaintextAuth bool
 }
 
 // TLSConfig enables STARTTLS for direct (non-gateway) deployments. Both
@@ -372,12 +376,13 @@ func Load() (Config, error) {
 		},
 		DKIMVaultURL: getenv("MAILEZINE_DKIM_VAULT_URL", ""),
 		Outbound: OutboundConfig{
-			Enabled:           envBool("MAILEZINE_OUTBOUND_ENABLED", true),
-			Port:              envInt("MAILEZINE_OUTBOUND_PORT", 25),
-			FixedHost:         getenv("MAILEZINE_OUTBOUND_FIXED_HOST", ""),
-			FixedPort:         envInt("MAILEZINE_OUTBOUND_FIXED_PORT", 0),
-			SmarthostUsername: getenv("MAILEZINE_OUTBOUND_SMTP_USERNAME", ""),
-			SmarthostPassword: getenv("MAILEZINE_OUTBOUND_SMTP_PASSWORD", ""),
+			Enabled:                     envBool("MAILEZINE_OUTBOUND_ENABLED", true),
+			Port:                        envInt("MAILEZINE_OUTBOUND_PORT", 25),
+			FixedHost:                   getenv("MAILEZINE_OUTBOUND_FIXED_HOST", ""),
+			FixedPort:                   envInt("MAILEZINE_OUTBOUND_FIXED_PORT", 0),
+			SmarthostUsername:           getenv("MAILEZINE_OUTBOUND_SMTP_USERNAME", ""),
+			SmarthostPassword:           getenv("MAILEZINE_OUTBOUND_SMTP_PASSWORD", ""),
+			SmarthostAllowPlaintextAuth: envBool("MAILEZINE_OUTBOUND_SMTP_ALLOW_PLAINTEXT_AUTH", false),
 		},
 		TLS: TLSConfig{
 			CertFile: getenv("MAILEZINE_TLS_CERT_FILE", ""),

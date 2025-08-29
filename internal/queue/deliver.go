@@ -56,6 +56,10 @@ type SMTPDeliverer struct {
 	// deliveries; ignored for direct MX deliveries.
 	Username string
 	Password string
+	// AllowPlaintextAuth opts into sending credentials over unencrypted
+	// connections (smarthost on a trusted loopback/LAN). Default false:
+	// AUTH is attempted only after STARTTLS succeeded.
+	AllowPlaintextAuth bool
 	// PolicyResolver drives MTA-STS/DANE lookups for outbound TLS policy.
 	// nil disables policy enforcement (opportunistic TLS only).
 	PolicyResolver maildns.Resolver
@@ -197,12 +201,16 @@ func (d *SMTPDeliverer) deliverToHost(ctx context.Context, from string, to []str
 
 func (d *SMTPDeliverer) deliverGroup(ctx context.Context, from, host string, addrs []string, body []byte, port int, tlsMode mailsmtp.TLSMode, daneRecords []maildns.TLSA) ([]mailsmtp.Response, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
+	// Whole-session cap so a wedged server cannot pin a queue worker
+	// forever (large bodies over slow links still fit in 10 minutes).
+	const sessionTimeout = 10 * time.Minute
 	connect := func(noTLS bool) (*mailsmtp.Client, error) {
 		client, err := mailsmtp.Dial(ctx, addr, mailsmtp.ConnOptions{
 			Dialer:  d.Dialer,
 			Host:    host,
 			TLSMode: tlsMode,
 			DANE:    daneRecords,
+			Timeout: sessionTimeout,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("queue: dial %s: %w", host, err)
@@ -212,8 +220,13 @@ func (d *SMTPDeliverer) deliverGroup(ctx context.Context, from, host string, add
 			return nil, fmt.Errorf("queue: smtp handshake with %s: %w", host, err)
 		}
 		if d.Username != "" && d.FixedHost != "" && client.Capabilities().AdvertisesAuth("PLAIN") {
-			// Third-party smarthost relays: authenticate with SASL PLAIN
-			// when advertised.
+			// Credentials only travel over TLS: SASL PLAIN base64 is not
+			// encryption, and the plaintext reconnect fallback would
+			// otherwise leak them to any on-path observer.
+			if !client.TLSEnabled() && !d.AllowPlaintextAuth {
+				_ = client.Close()
+				return nil, fmt.Errorf("queue: %s offers AUTH PLAIN without TLS: refusing to send credentials (enable STARTTLS or set allow-plaintext-auth)", host)
+			}
 			if err := client.AuthPlain(ctx, d.Username, d.Password); err != nil {
 				_ = client.Close()
 				return nil, fmt.Errorf("queue: smtp auth with %s: %w", host, err)

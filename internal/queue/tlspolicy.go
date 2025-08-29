@@ -46,12 +46,26 @@ func outboundTLSPolicy(ctx context.Context, resolver maildns.Resolver, msts mtas
 		}
 	}
 
-	// DANE: TLSA records exist → require TLS and verify them.
+	// DANE: TLSA records exist → require TLS and verify them. RFC 7672 §5:
+	// only DNSSEC-validated TLSA records are actionable — a spoofable
+	// insecure answer could pin a wrong certificate (or break delivery), so
+	// an unvalidated answer falls back to opportunistic TLS instead.
 	if net.ParseIP(host) == nil {
-		tlsas, err := resolver.LookupTLSA(ctx, 25, "tcp", host)
-		if err == nil && len(tlsas) > 0 {
+		tlsas, validated, err := lookupTLSAForDANE(ctx, resolver, host)
+		if err == nil && len(tlsas) > 0 && validated {
 			return mailsmtp.TLSModeRequired, tlsas, nil
 		}
 	}
 	return mailsmtp.TLSModeOpportunistic, nil, nil
+}
+
+// lookupTLSAForDANE fetches TLSA records together with their DNSSEC verdict
+// when the resolver can report one; a plain Resolver keeps the legacy
+// records-at-face-value behavior (test seams, custom resolvers).
+func lookupTLSAForDANE(ctx context.Context, resolver maildns.Resolver, host string) ([]maildns.TLSA, bool, error) {
+	if vr, ok := resolver.(maildns.ValidatingResolver); ok {
+		return vr.LookupTLSAValidated(ctx, 25, "tcp", host)
+	}
+	tlsas, err := resolver.LookupTLSA(ctx, 25, "tcp", host)
+	return tlsas, true, err
 }

@@ -19,6 +19,9 @@ type Resolver struct {
 	IPs  map[string][]net.IPAddr
 	PTR  map[string][]string
 	TLSA map[string][]maildns.TLSA
+	// TLSAValidated overrides the DNSSEC verdict per host (absent → true,
+	// preserving legacy DANE tests).
+	TLSAValidated map[string]bool
 }
 
 func (r *Resolver) LookupTXT(_ context.Context, name string) ([]string, error) {
@@ -79,3 +82,17 @@ func (r *Resolver) LookupTLSA(_ context.Context, _ int, _ string, host string) (
 	}
 	return nil, &net.DNSError{Err: "no tlsa", Name: host, IsNotFound: true}
 }
+
+// LookupTLSAValidated reports records plus a scripted DNSSEC verdict.
+func (r *Resolver) LookupTLSAValidated(_ context.Context, port int, proto, host string) ([]maildns.TLSA, bool, error) {
+	recs, err := r.LookupTLSA(nil, port, proto, host)
+	if err != nil {
+		return nil, false, err
+	}
+	if v, ok := r.TLSAValidated[host]; ok {
+		return recs, v, nil
+	}
+	return recs, true, nil
+}
+
+var _ maildns.ValidatingResolver = (*Resolver)(nil)

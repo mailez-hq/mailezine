@@ -32,6 +32,18 @@ type Resolver interface {
 	LookupTLSA(ctx context.Context, port int, proto, name string) ([]TLSA, error)
 }
 
+// ValidatingResolver is implemented by resolvers that can report whether a
+// TLSA answer was DNSSEC-validated (AD bit set by a validating recursive
+// resolver). DANE (RFC 7672 §2.2) may only act on TLSA records whose
+// authenticity is cryptographically established; resolvers without this
+// capability keep the legacy take-records-at-face-value behavior.
+type ValidatingResolver interface {
+	Resolver
+	// LookupTLSAValidated returns TLSA records plus whether the answer
+	// carried the authenticated-data bit.
+	LookupTLSAValidated(ctx context.Context, port int, proto, name string) ([]TLSA, bool, error)
+}
+
 // SystemResolver answers with the system resolver (net.DefaultResolver plus
 // miekg/dns for TLSA). DNSSEC validation is left to the configured
 // resolver; records are returned verbatim and authenticated-data handling
@@ -70,20 +82,45 @@ func (r *SystemResolver) LookupAddr(ctx context.Context, addr string) ([]string,
 	return net.DefaultResolver.LookupAddr(ctx, addr)
 }
 
-// LookupTLSA queries TLSA records via the system DNS servers.
+// LookupTLSA queries TLSA records via the system DNS servers. The query
+// sets the DNSSEC OK (DO) bit so validating resolvers establish the chain
+// and set the authenticated-data flag; records are returned verbatim.
 func (r *SystemResolver) LookupTLSA(ctx context.Context, port int, proto, name string) ([]TLSA, error) {
+	recs, _, err := r.lookupTLSA(ctx, port, proto, name)
+	return recs, err
+}
+
+// LookupTLSAValidated additionally reports whether the answer carried the
+// DNSSEC authenticated-data bit (a secure answer). An insecure or
+// unvalidated answer yields validated=false even when records exist.
+func (r *SystemResolver) LookupTLSAValidated(ctx context.Context, port int, proto, name string) ([]TLSA, bool, error) {
+	return r.lookupTLSA(ctx, port, proto, name)
+}
+
+var _ ValidatingResolver = (*SystemResolver)(nil)
+
+func (r *SystemResolver) lookupTLSA(ctx context.Context, port int, proto, name string) ([]TLSA, bool, error) {
 	servers, err := r.serversLocked()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	fqdn := dns.Fqdn(fmt.Sprintf("_%d._%s.%s", port, proto, name))
 	var lastErr error
 	for _, srv := range servers {
 		msg := new(dns.Msg)
 		msg.SetQuestion(fqdn, dns.TypeTLSA)
+		msg.RecursionDesired = true
+		// DNSSEC OK: without DO a validating resolver performs validation
+		// upstream but RFC 6840 §5.7 forbids setting AD on the answer, so
+		// the caller could never distinguish secure from insecure.
+		msg.SetEdns0(4096, true)
 		resp, _, err := r.dnsClient.ExchangeContext(ctx, msg, srv)
 		if err != nil {
 			lastErr = err
+			continue
+		}
+		if resp.Rcode != dns.RcodeSuccess {
+			lastErr = fmt.Errorf("maildns: tlsa lookup %s: %s", fqdn, dns.RcodeToString[resp.Rcode])
 			continue
 		}
 		var out []TLSA
@@ -103,12 +140,12 @@ func (r *SystemResolver) LookupTLSA(ctx context.Context, port int, proto, name s
 				Cert:         cert,
 			})
 		}
-		return out, nil
+		return out, resp.AuthenticatedData, nil
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("maildns: no TLSA response for %s", fqdn)
 	}
-	return nil, lastErr
+	return nil, false, lastErr
 }
 
 func (r *SystemResolver) serversLocked() ([]string, error) {
