@@ -377,6 +377,23 @@ func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 	for i, msg := range before {
 		seqOf[msg.UID] = uint32(i) + 1
 	}
+	if uids != nil {
+		// RFC 4315 §2.1: UID EXPUNGE removes messages that BOTH carry the
+		// \Deleted flag AND appear in the given set — the set narrows the
+		// candidates, it never bypasses the flag precondition. Filter to
+		// \Deleted here so the store primitive keeps its exact-set contract
+		// (POP3 QUIT depends on it).
+		want := make(map[uint32]bool, len(uidList))
+		for _, u := range uidList {
+			want[u] = true
+		}
+		uidList = uidList[:0]
+		for _, msg := range before {
+			if want[msg.UID] && mailstore.HasFlag(msg.Flags, "\\Deleted") {
+				uidList = append(uidList, msg.UID)
+			}
+		}
+	}
 	deleted, err := s.srv.Store.Expunge(ctx, s.user, s.mbox, uidList)
 	if err != nil {
 		return err

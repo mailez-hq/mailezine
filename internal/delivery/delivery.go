@@ -139,17 +139,58 @@ func (p *Pipeline) Deliver(ctx context.Context, peer net.IP, from string, to []s
 
 // hasHeader reports whether the message header block contains the field.
 func hasHeader(data []byte, key string) bool {
-	key = strings.ToLower(key) + ":"
+	return headerValue(data, key) != ""
+}
+
+// headerValue returns the first value of a header field ("" when absent).
+// Folding continuation lines are joined; the value is returned unfolded.
+func headerValue(data []byte, key string) string {
+	prefix := strings.ToLower(key) + ":"
 	block := string(data)
 	if i := strings.Index(block, "\r\n\r\n"); i >= 0 {
 		block = block[:i]
 	}
+	matched := false
+	var sb strings.Builder
 	for _, line := range strings.Split(block, "\r\n") {
-		if strings.HasPrefix(strings.ToLower(line), key) {
-			return true
+		if line == "" {
+			break
+		}
+		if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+			if matched {
+				sb.WriteString(" ")
+				sb.WriteString(strings.TrimSpace(line))
+			}
+			continue
+		}
+		if matched {
+			break // the next header field starts: stop folding this one
+		}
+		if strings.HasPrefix(strings.ToLower(line), prefix) {
+			matched = true
+			sb.Reset()
+			sb.WriteString(strings.TrimSpace(line[len(prefix):]))
 		}
 	}
-	return false
+	if !matched {
+		return ""
+	}
+	return sb.String()
+}
+
+// suppressesAutoReply reports whether the message headers request no
+// automatic response. RFC 3834 §5.1: an Auto-Submitted value of "no" is the
+// explicit "this is a human message" marker and must NOT suppress replies;
+// any other non-empty value (auto-replied, auto-generated, …) does.
+func suppressesAutoReply(data []byte) bool {
+	if headerValue(data, "X-Auto-Response-Suppress") != "" {
+		return true
+	}
+	v := headerValue(data, "Auto-Submitted")
+	if v == "" {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(v), "no")
 }
 
 // headersContain reports whether the "Name: value" header list has the field.
@@ -227,7 +268,7 @@ func (p *Pipeline) sendVacation(ctx context.Context, account, from string, to []
 		p.Logger.Warn("delivery: vacation skipped (no outbound queue)", "account", account, "to", from)
 		return nil
 	}
-	if hasHeader(data, "Auto-Submitted") || hasHeader(data, "X-Auto-Response-Suppress") {
+	if suppressesAutoReply(data) {
 		return nil
 	}
 	if from == "" {
@@ -237,13 +278,17 @@ func (p *Pipeline) sendVacation(ctx context.Context, account, from string, to []
 	if days <= 0 {
 		days = 7
 	}
-	key := account + "\x00" + from
+	// Throttle key and persisted state are case-normalized: envelope
+	// addresses vary in case between senders' retries, and each variant
+	// would otherwise get an independent reply budget.
+	sender := strings.ToLower(from)
+	key := account + "\x00" + sender
 	// Persisted throttle when the store supports it; otherwise fall back
 	// to the in-memory map (still prevents same-process storms).
 	var last time.Time
 	if vs, ok := p.Store.(mailstore.VacationStateStore); ok {
 		var err error
-		last, err = vs.VacationLastSent(ctx, account, from)
+		last, err = vs.VacationLastSent(ctx, account, sender)
 		if err != nil {
 			p.Logger.Warn("delivery: vacation state read", "account", account, "err", err)
 		}
@@ -257,7 +302,7 @@ func (p *Pipeline) sendVacation(ctx context.Context, account, from string, to []
 	}
 	now := time.Now()
 	if vs, ok := p.Store.(mailstore.VacationStateStore); ok {
-		if err := vs.SetVacationLastSent(ctx, account, from, now); err != nil {
+		if err := vs.SetVacationLastSent(ctx, account, sender, now); err != nil {
 			p.Logger.Warn("delivery: vacation state write", "account", account, "err", err)
 		}
 	} else {
@@ -269,21 +314,30 @@ func (p *Pipeline) sendVacation(ctx context.Context, account, from string, to []
 		p.vacationMu.Unlock()
 	}
 
-	sender := v.From
-	if sender == "" {
-		sender = account
+	replyFrom := v.From
+	if replyFrom == "" {
+		replyFrom = account
 	}
 	subject := v.Subject
 	if subject == "" {
 		subject = "Re: your message"
 	}
-	reply := fmt.Sprintf("Auto-Submitted: auto-replied\r\n"+
+	// RFC 5230 §5.2: replies carry their own Message-ID and thread into the
+	// original via In-Reply-To/References when the source has one.
+	var hdrs strings.Builder
+	fmt.Fprintf(&hdrs, "Auto-Submitted: auto-replied\r\n"+
 		"X-Auto-Response-Suppress: All\r\n"+
 		"From: %s\r\n"+
 		"To: %s\r\n"+
 		"Subject: %s\r\n"+
-		"Date: %s\r\n\r\n%s\r\n",
-		sender, from, subject, time.Now().Format(time.RFC1123Z), v.Body)
+		"Date: %s\r\n"+
+		"Message-ID: <vac-%s@mailezine>\r\n",
+		replyFrom, from, subject, time.Now().Format(time.RFC1123Z), newMessageID())
+	if orig := headerValue(data, "Message-Id"); orig != "" {
+		hdrs.WriteString("In-Reply-To: " + orig + "\r\n")
+		hdrs.WriteString("References: " + orig + "\r\n")
+	}
+	reply := hdrs.String() + "\r\n" + v.Body + "\r\n"
 	p.Logger.Debug("delivery: vacation reply", "account", account, "to", from, "days", days)
 	return p.Redirect(ctx, "", from, []byte(reply))
 }
@@ -326,6 +380,10 @@ func classifierNil(c Classifier) bool {
 }
 
 func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw []byte) error {
+	// envTo is the original envelope recipient: alias expansion and
+	// +tag-stripping below narrow the DELIVERY targets, but Sieve envelope
+	// tests must still see the address the sender actually used.
+	envTo := rcpt
 	targets, err := p.Directory.Aliases(ctx, rcpt)
 	if errors.Is(err, directory.ErrNotFound) && p.RecipientDelimiter != "" {
 		if base, ok := directory.SplitDelimited(rcpt, p.RecipientDelimiter); ok {
@@ -349,7 +407,7 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 			if serr != nil {
 				p.Logger.Warn("delivery: sieve fetch", "account", target, "err", serr)
 			} else if ok {
-				res, rerr := p.Sieve.Route(ctx, script, from, targets, stored)
+				res, rerr := p.Sieve.Route(ctx, script, from, envTo, stored)
 				sieveRes = res
 				if rerr != nil {
 					// A broken script must never lose mail: keep INBOX.
@@ -381,6 +439,13 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 			}
 		}
 		finalData := applyHeaderEdits(stored, sieveRes)
+		// INV-QUOTA (conservative pre-check): every fileinto copy is stored
+		// and charged separately, so the pre-check must budget all of them —
+		// checking one raw copy while writing N final copies lets accounts
+		// grow past their limit.
+		if err := p.checkQuota(ctx, target, int64(len(finalData))*int64(len(mailboxes))); err != nil {
+			return err
+		}
 		for _, mailbox := range mailboxes {
 			// Sieve scripts are authored with the display spelling ("Inbox/Sub").
 			// Only the exact "INBOX" name is the special mailbox on the wire,
@@ -392,6 +457,7 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 				From:         from,
 				To:           targets,
 				Data:         finalData,
+				Flags:        sieveRes.Flags, // imap4flags: setflag/keep :flags land here
 				InternalDate: time.Now(),
 			}
 			uid, err := p.Store.Deliver(ctx, target, mailbox, msg)

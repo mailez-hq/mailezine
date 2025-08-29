@@ -13,7 +13,7 @@ func discardLogger() *slog.Logger {
 
 func route(t *testing.T, script, from string, data []byte) Result {
 	t.Helper()
-	res, err := NewEngine(discardLogger()).Route(context.Background(), script, from, []string{"alice@example.com"}, data)
+	res, err := NewEngine(discardLogger()).Route(context.Background(), script, from, "alice@example.com", data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,9 +57,26 @@ if header :contains "Subject" "news" {
 	}
 }
 
+// fileinto :copy "Inbox" plus the implicit keep target the SAME mailbox with
+// different spelling: delivery normalizes the prefix, so a case-sensitive
+// dedupe would store two copies. RFC 5228 mailbox names are case-sensitive
+// per se, but the inbox is not — and our normalizeMailboxName folds exactly
+// that prefix, so the dedupe must be fold-aware to match.
+func TestFileIntoCopyInboxDedupe(t *testing.T) {
+	script := `require "fileinto";
+require "copy";
+if header :contains "Subject" "news" {
+  fileinto :copy "Inbox";
+}`
+	res := route(t, script, "s@x.test", []byte("From: s@x.test\r\nSubject: news today\r\n\r\nbody\r\n"))
+	if len(res.Mailboxes) != 1 {
+		t.Fatalf("fileinto :copy Inbox + implicit keep must dedupe to one mailbox, got %v", res.Mailboxes)
+	}
+}
+
 func TestBrokenScriptFails(t *testing.T) {
 	if _, err := NewEngine(discardLogger()).Route(context.Background(),
-		"require \"fileinto\"; if {", "s@x.test", []string{"a@b.c"}, []byte("Subject: x\r\n\r\nb\r\n")); err == nil {
+		"require \"fileinto\"; if {", "s@x.test", "a@b.c", []byte("Subject: x\r\n\r\nb\r\n")); err == nil {
 		t.Fatal("expected compile error")
 	}
 }
@@ -68,7 +85,7 @@ func TestEnvelopeTest(t *testing.T) {
 	script := `require "envelope";
 if envelope :is "to" "postmaster@example.com" { discard; }`
 	res, err := NewEngine(discardLogger()).Route(context.Background(), script, "s@x.test",
-		[]string{"postmaster@example.com"}, []byte("Subject: x\r\n\r\nb\r\n"))
+		"postmaster@example.com", []byte("Subject: x\r\n\r\nb\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,7 +97,7 @@ if envelope :is "to" "postmaster@example.com" { discard; }`
 func TestRedirect(t *testing.T) {
 	script := `if header :contains "Subject" "fwd" { redirect "forward@remote.test"; }`
 	res, err := NewEngine(discardLogger()).Route(context.Background(), script, "s@x.test",
-		[]string{"alice@example.com"}, []byte("From: s@x.test\r\nSubject: fwd me\r\n\r\nbody\r\n"))
+		"alice@example.com", []byte("From: s@x.test\r\nSubject: fwd me\r\n\r\nbody\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +114,7 @@ func TestReject(t *testing.T) {
 	script := `require "reject";
 if header :contains "Subject" "vip only" { reject "this list is not for you"; }`
 	res, err := NewEngine(discardLogger()).Route(context.Background(), script, "s@x.test",
-		[]string{"alice@example.com"}, []byte("From: s@x.test\r\nSubject: vip only\r\n\r\nbody\r\n"))
+		"alice@example.com", []byte("From: s@x.test\r\nSubject: vip only\r\n\r\nbody\r\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

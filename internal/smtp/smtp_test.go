@@ -431,6 +431,22 @@ func TestAuthSenderIdentityEnforced(t *testing.T) {
 	}
 }
 
+// RFC 5321 §4.5.5: the null reverse-path ("MAIL FROM:<>") is how remote MTAs
+// deliver bounce DSNs; rejecting it blackholes bounces server-wide.
+func TestNullSenderAccepted(t *testing.T) {
+	b, cap := testBackend(t, false)
+	client := startTestServer(t, b)
+	err := sendMessage(t, client, "", []string{"alice@example.com"}, "From: <>\r\nTo: alice@example.com\r\nSubject: bounce\r\n\r\nfailed\r\n")
+	if err != nil {
+		t.Fatalf("null sender rejected: %v", err)
+	}
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	if cap.submits != 1 || cap.from != "" {
+		t.Fatalf("submits = %d from = %q, want 1 and empty", cap.submits, cap.from)
+	}
+}
+
 func TestSMTPProxyProtocolPeerIP(t *testing.T) {
 	b, cap := testBackend(t, false)
 	srv := NewServer(b)

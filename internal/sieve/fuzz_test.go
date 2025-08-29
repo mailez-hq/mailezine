@@ -17,6 +17,6 @@ func FuzzRoute(f *testing.F) {
 	f.Fuzz(func(t *testing.T, script, msg string) {
 		e := NewEngine(slog.New(slog.NewTextHandler(io.Discard, nil)))
 		_, _ = e.Route(context.Background(), script, "sender@x.test",
-			[]string{"a@example.com"}, []byte(msg))
+			"a@example.com", []byte(msg))
 	})
 }

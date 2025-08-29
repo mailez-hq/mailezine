@@ -135,7 +135,10 @@ func (s *session) Auth(mech string) (sasl.Server, error) {
 }
 
 func (s *session) Mail(from string, _ *gosmtp.MailOptions) error {
-	if from == "" || !strings.Contains(from, "@") {
+	// RFC 5321 §4.5.5: the null reverse-path ("MAIL FROM:<>") is valid — it
+	// is how remote MTAs send bounce DSNs. Only a non-empty address must
+	// contain "@".
+	if from != "" && !strings.Contains(from, "@") {
 		return &gosmtp.SMTPError{Code: 501, Message: "syntax error in MAIL FROM"}
 	}
 	if s.backend.RequireAuth && !s.trusted {
@@ -267,6 +270,11 @@ func (s *session) Data(r io.Reader) error {
 			return &gosmtp.SMTPError{Code: 554, Message: "message rejected by policy"}
 		case errors.Is(err, delivery.ErrSieveReject):
 			return &gosmtp.SMTPError{Code: 550, EnhancedCode: gosmtp.EnhancedCode{5, 7, 0}, Message: "message rejected by recipient policy"}
+		case errors.Is(err, delivery.ErrQuota):
+			// Quota exhaustion is a permanent verdict for this message
+			// (ARCHITECTURE.md §4.1): a 451 would make the sender retry for
+			// days with the same outcome.
+			return &gosmtp.SMTPError{Code: 552, EnhancedCode: gosmtp.EnhancedCode{5, 2, 2}, Message: "mailbox full"}
 		case errors.Is(err, delivery.ErrGreylist), errors.Is(err, delivery.ErrSoftReject):
 			return &gosmtp.SMTPError{Code: 451, Message: "try again later"}
 		}

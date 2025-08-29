@@ -79,7 +79,10 @@ func NewEngine(logger *slog.Logger) *Engine {
 }
 
 // Route executes src against the message and returns the routing result.
-func (e *Engine) Route(ctx context.Context, src, from string, to []string, data []byte) (Result, error) {
+// envTo is the ORIGINAL envelope recipient (pre alias-expansion, pre
+// +tag-stripping): RFC 5228 §5.4 requires envelope tests to evaluate against
+// it, so subaddress routing (envelope :detail) and alias matching work.
+func (e *Engine) Route(ctx context.Context, src, from, envTo string, data []byte) (Result, error) {
 	script, err := e.compile(src)
 	if err != nil {
 		return Result{}, fmt.Errorf("sieve: compile: %w", err)
@@ -87,10 +90,6 @@ func (e *Engine) Route(ctx context.Context, src, from string, to []string, data 
 	header, err := textproto.ReadHeader(bufio.NewReader(bytes.NewReader(data)))
 	if err != nil && !errors.Is(err, io.EOF) {
 		return Result{}, fmt.Errorf("sieve: parse header: %w", err)
-	}
-	envTo := ""
-	if len(to) > 0 {
-		envTo = to[0]
 	}
 	runtime := gosieve.NewRuntimeData(script, allowRedirect{}, interp.EnvelopeStatic{
 		From: from,
@@ -156,7 +155,7 @@ func actionsToResult(actions []interp.AppliedAction) Result {
 			res.Vacation = &Vacation{Days: act.Days, From: act.From, Subject: act.Subject, Body: act.Body}
 		}
 	}
-	res.Mailboxes = dedupe(res.Mailboxes)
+	res.Mailboxes = dedupeFold(res.Mailboxes)
 	res.Flags = dedupe(res.Flags)
 	res.Redirects = dedupe(res.Redirects)
 	return res
@@ -193,6 +192,27 @@ func dedupe(in []string) []string {
 			continue
 		}
 		seen[s] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+// dedupeFold removes duplicates case-insensitively. Mailbox names differ only
+// by spelling ("Inbox" vs "INBOX") yet denote the same mailbox; a
+// case-sensitive pass would let fileinto :copy "Inbox" plus the implicit
+// keep store two copies of the message.
+func dedupeFold(in []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		key := strings.ToLower(s)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		out = append(out, s)
 	}
 	return out

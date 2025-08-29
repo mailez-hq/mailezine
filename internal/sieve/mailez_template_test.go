@@ -45,7 +45,7 @@ if not address :localpart :contains ["From","Reply-To"] ["noreply","no-reply"]{
 func routeTemplate(t *testing.T, src, msg string) Result {
 	t.Helper()
 	e := NewEngine(nil)
-	res, err := e.Route(context.Background(), src, "sender@remote.test", []string{"alice@example.com"}, []byte(msg))
+	res, err := e.Route(context.Background(), src, "sender@remote.test", "alice@example.com", []byte(msg))
 	if err != nil {
 		t.Fatalf("route: %v", err)
 	}

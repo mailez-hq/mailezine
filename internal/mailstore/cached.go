@@ -9,7 +9,9 @@ package mailstore
 
 import (
 	"context"
+	"errors"
 	"io"
+	"time"
 
 	"mailezine/internal/mailcache"
 	"mailezine/internal/store"
@@ -289,6 +291,28 @@ func mailboxListWeight(boxes []Mailbox) int64 {
 	return w
 }
 
+// VacationLastSent forwards vacation throttle state to the inner store. The
+// decorator must not silently mask the persistence capability: delivery
+// probes this interface, and without forwarding a cached store would fall
+// back to an in-memory throttle map that resets on every restart.
+func (c *Cached) VacationLastSent(ctx context.Context, account, sender string) (time.Time, error) {
+	vs, ok := c.inner.(VacationStateStore)
+	if !ok {
+		return time.Time{}, errors.New("mailstore: inner store does not persist vacation state")
+	}
+	return vs.VacationLastSent(ctx, account, sender)
+}
+
+// SetVacationLastSent forwards vacation throttle state to the inner store.
+func (c *Cached) SetVacationLastSent(ctx context.Context, account, sender string, t time.Time) error {
+	vs, ok := c.inner.(VacationStateStore)
+	if !ok {
+		return errors.New("mailstore: inner store does not persist vacation state")
+	}
+	return vs.SetVacationLastSent(ctx, account, sender, t)
+}
+
 var _ MailboxStore = (*Cached)(nil)
 var _ SieveStore = (*Cached)(nil)
 var _ ACLStore = (*Cached)(nil)
+var _ VacationStateStore = (*Cached)(nil)
