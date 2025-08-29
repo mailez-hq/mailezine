@@ -1,6 +1,7 @@
 package mailstore
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,6 +15,58 @@ func newTestKV(t *testing.T) (*KV, *store.Store) {
 	t.Helper()
 	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
 	return NewKV(s), s
+}
+
+// TestKVDeleteAccount proves the purge primitive drops every trace of the
+// account: registry rows, mailboxes, messages and quota, and that a same
+// address re-created afterwards starts empty (no inheritance).
+func TestKVDeleteAccount(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+	body := "From: s@remote.test\r\nTo: alice@example.com\r\nSubject: hi\r\n\r\nhello\r\n"
+
+	if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.EnsureDefaultMailboxes(ctx, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Deliver(ctx, "bob@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ms.DeleteAccount(ctx, "alice@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.AccountByEmail(ctx, "alice@example.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("email registry row survived purge: %v", err)
+	}
+	if err := ms.DeleteAccount(ctx, "alice@example.com"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("re-purge of absent account should be ErrNotFound, got %v", err)
+	}
+
+	// The other account is untouched.
+	if boxes, err := ms.ListMailboxes(ctx, "bob@example.com"); err != nil || len(boxes) == 0 {
+		t.Fatalf("bob affected by alice purge: %v %+v", err, boxes)
+	}
+
+	// A same-address re-creation starts with a clean slate: UID 1 proves the
+	// UID counter was purged rather than inherited (the pre-purge INBOX
+	// already had a message at UID 1).
+	uid, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid != 1 {
+		t.Fatalf("re-created account inherited UID counter: first uid = %d", uid)
+	}
+	msgs, err := ms.ListMessages(ctx, "alice@example.com", "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("re-created account inherited data: %d messages", len(msgs))
+	}
 }
 
 func TestKVDeliverAndRead(t *testing.T) {
@@ -115,5 +168,42 @@ func TestConcurrentFirstDeliverSingleMailbox(t *testing.T) {
 		if m.UID != uint32(i+1) {
 			t.Fatalf("uid[%d] = %d, want %d", i, m.UID, i+1)
 		}
+	}
+}
+
+// TestKVExpungeReclaimsBlob proves the blob GC path is live: once the last
+// reference disappears the blob itself must be gone (stageBlobUnlink used
+// to delete the link row outright, making the refs==0 reclaim branch in
+// deleteEmail unreachable — every message blob leaked forever).
+func TestKVExpungeReclaimsBlob(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+	body := "From: s@remote.test\r\nTo: alice@example.com\r\nSubject: hi\r\n\r\nhello\r\n"
+
+	if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+	e, err := ms.EmailByUID(ctx, "alice@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	blobID := e.BlobID
+	if blobID == "" {
+		t.Fatal("delivered email has no blob reference")
+	}
+	if _, err := ms.Expunge(ctx, "alice@example.com", "INBOX", []uint32{1}); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := s.GetBlob(ctx, blobID, &buf); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("blob survived expunge: err=%v", err)
+	}
+	// The zero-count tombstone must be dropped as well.
+	aid, err := s.AccountByEmail(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if refs, err := s.BlobRefCount(ctx, aid, blobID); err == nil {
+		t.Fatalf("blob link tombstone survived reclaim: refs=%d", refs)
 	}
 }

@@ -18,6 +18,7 @@ import (
 	"mailezine/internal/license"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/queue"
+	"mailezine/internal/store"
 )
 
 // Info is the read-only state the management API reports.
@@ -176,6 +177,38 @@ func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accou
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
+	})
+	// DELETE /v1/accounts/{email} purges an account with all of its engine
+	// data. The control plane calls this on user deletion: without it the
+	// engine keeps orphaned mailboxes, and a re-created same-address account
+	// would silently inherit the previous owner's mail.
+	mux.HandleFunc("/v1/accounts/", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		email := strings.TrimPrefix(r.URL.Path, "/v1/accounts/")
+		if email == "" || strings.Contains(email, "/") {
+			http.Error(w, "account email required", http.StatusBadRequest)
+			return
+		}
+		purger, ok := mstore.(mailstore.AccountPurger)
+		if !ok {
+			http.Error(w, "account purge unsupported by storage backend", http.StatusNotImplemented)
+			return
+		}
+		if err := purger.DeleteAccount(r.Context(), email); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				http.Error(w, "account not found", http.StatusNotFound)
+				return
+			}
+			logger.Error("management: purge account", "account", email, "err", err)
+			http.Error(w, "account purge failed", http.StatusInternalServerError)
+			return
+		}
+		logger.Info("audit: management account purge", "account", email, "client", r.RemoteAddr)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "account": email})
 	})
 	mux.HandleFunc("/v1/queue/", func(w http.ResponseWriter, r *http.Request) {
 		if qm == nil {

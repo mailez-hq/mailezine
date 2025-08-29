@@ -69,6 +69,16 @@ type MailboxStore interface {
 	OpenMessage(ctx context.Context, account, mailbox string, uid uint32) (io.ReadCloser, error)
 }
 
+// AccountPurger is the optional account-level purge surface used by the
+// management API: it removes an account with all of its data so a
+// control-plane user deletion does not leave orphans behind.
+type AccountPurger interface {
+	// DeleteAccount removes the account and every mailbox, message, blob
+	// reference and counter it owns. Purging an absent account returns
+	// store.ErrNotFound.
+	DeleteAccount(ctx context.Context, account string) error
+}
+
 // DefaultMailboxes maps the mailez stack default mailboxes to their
 // special-use attribute.
 var DefaultMailboxes = map[string]string{

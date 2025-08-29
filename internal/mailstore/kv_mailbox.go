@@ -194,8 +194,85 @@ func (k *KV) CreateMailbox(ctx context.Context, account, mailbox string) (uint32
 
 // DeleteMailbox removes the mailbox document and every message in it
 // (blobs are garbage-collected once their link count reaches zero).
-func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
+// DeleteAccount removes the account with every mailbox, message, index,
+// counter, change-log, quota and blob-link entry it owns, reclaiming message
+// blobs best-effort. It backs the management purge endpoint so a
+// control-plane user deletion does not leave orphaned engine data that a
+// re-created same-address account would silently inherit. FTS entries for
+// the purged account are unreachable garbage and age out on reindex.
+func (k *KV) DeleteAccount(ctx context.Context, account string) error {
 	acctID, err := k.s.AccountByEmail(ctx, account)
+	if err != nil {
+		return err
+	}
+	aid := uint32(acctID)
+
+	// Best-effort blob reclaim: the account's blob-link space names every
+	// blob the account references.
+	linkPrefix := store.BlobLinkKey(aid, "")
+	var blobs []string
+	if err := k.s.ScanRaw(ctx, linkPrefix, func(key, _ []byte) error {
+		blobs = append(blobs, string(key[len(linkPrefix):]))
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	// Every account-scoped key: documents across all collections, both
+	// index subtrees, counters, change log, quota and blob links.
+	var keys [][]byte
+	collect := func(prefix []byte) error {
+		return k.s.ScanRaw(ctx, prefix, func(key, _ []byte) error {
+			keys = append(keys, append([]byte(nil), key...))
+			return nil
+		})
+	}
+	collections := []byte{
+		store.CollectionMailbox, store.CollectionEmail, store.CollectionThread,
+		store.CollectionIdentity, store.CollectionEmailSubmission,
+		store.CollectionSieveScript, store.CollectionPrincipal,
+	}
+	for _, col := range collections {
+		if err := collect(store.CollectionKey(aid, col)); err != nil {
+			return err
+		}
+		if err := collect(store.ChangeLogPrefix(aid, col)); err != nil {
+			return err
+		}
+	}
+	// IndexMailboxNameKey(aid, "")[:5] is the raw "index space + account"
+	// prefix covering both the name and email subtrees.
+	indexPrefix := store.IndexMailboxNameKey(aid, "")[:5]
+	if err := collect(indexPrefix); err != nil {
+		return err
+	}
+	if err := collect(store.CounterKey(aid, 0, nil)); err != nil {
+		return err
+	}
+	if err := collect(store.QuotaKey(aid)); err != nil {
+		return err
+	}
+	if err := collect(linkPrefix); err != nil {
+		return err
+	}
+
+	for _, key := range keys {
+		if err := k.s.DeleteRaw(ctx, key); err != nil {
+			return err
+		}
+	}
+	for _, b := range blobs {
+		_ = k.s.DeleteBlob(ctx, b)
+	}
+	// Drop the registry rows last so a crash mid-purge leaves an account
+	// that still resolves and can be purged again.
+	if err := k.s.DeleteRaw(ctx, store.MetaEmailKey(account)); err != nil {
+		return err
+	}
+	return k.s.DeleteRaw(ctx, store.AccountKey(aid))
+}
+
+func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
 		return err
 	}
@@ -397,6 +474,13 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 			continue
 		}
 		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID); err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				// Another session won the race and removed it first: the
+				// uid is gone, which is exactly what this command promises
+				// — report it instead of failing the whole expunge midway.
+				deleted = append(deleted, e.UID)
+				continue
+			}
 			return deleted, err
 		}
 		deleted = append(deleted, e.UID)
@@ -546,10 +630,13 @@ func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbI
 	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID, idx...); err != nil {
 		return err
 	}
-	// Garbage-collect the blob when the link count reaches zero.
+	// Garbage-collect the blob when the link count reaches zero, then drop
+	// the zero-count tombstone so link rows do not accumulate.
 	if blobID != "" {
 		if refs, err := k.s.BlobRefCount(ctx, acctID, blobID); err == nil && refs == 0 {
-			_ = k.s.DeleteBlob(ctx, blobID)
+			if derr := k.s.DeleteBlob(ctx, blobID); derr == nil {
+				_ = k.s.DeleteRaw(ctx, store.BlobLinkKey(uint32(acctID), blobID))
+			}
 		}
 	}
 	return nil

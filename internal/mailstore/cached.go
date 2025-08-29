@@ -58,6 +58,19 @@ func (c *Cached) invalidateMailboxes(account string) {
 	c.cache.Remove(mboxesKey(account))
 }
 
+// DeleteAccount purges the whole account underneath and flushes the cache:
+// per-mailbox invalidation cannot reach every key of a vanishing account,
+// and a same-address re-creation must never observe pre-purge metadata.
+func (c *Cached) DeleteAccount(ctx context.Context, account string) error {
+	purger, ok := c.inner.(AccountPurger)
+	if !ok {
+		return errors.New("mailstore: storage backend does not support account purge")
+	}
+	err := purger.DeleteAccount(ctx, account)
+	c.cache.Clear()
+	return err
+}
+
 // Deliver appends one message and invalidates the target mailbox.
 func (c *Cached) Deliver(ctx context.Context, account, mailbox string, msg *Message) (uint32, error) {
 	uid, err := c.inner.Deliver(ctx, account, mailbox, msg)
