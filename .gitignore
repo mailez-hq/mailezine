@@ -7,3 +7,6 @@ deploy/scripts/ci-env/go.tar.gz
 *.env
 *.pem
 *.key
+
+# Local CE mirror exports (scripts/export-ce.sh output)
+build/
