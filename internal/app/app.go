@@ -66,15 +66,16 @@ type App struct {
 	logger *slog.Logger
 	m      *metrics.Metrics
 
-	dir        directory.Service
-	auth       auth.Service
-	st         *Storage
-	fts        *fts.Indexer
-	pipeline   *delivery.Pipeline
-	classifier *spam.Client
-	qm         *queue.Manager
-	qmDone     chan struct{}
-	arch       *archive.Spool
+	dir         directory.Service
+	auth        auth.Service
+	st          *Storage
+	fts         *fts.Indexer
+	pipeline    *delivery.Pipeline
+	classifier  *spam.Client
+	sieveEngine *sieve.Engine
+	qm          *queue.Manager
+	qmDone      chan struct{}
+	arch        *archive.Spool
 
 	tlsConf   *tls.Config
 	startedAt time.Time
@@ -257,11 +258,12 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		classifier = spam.New(a.cfg.Rspamd.URL, a.cfg.Rspamd.LearnURL, a.cfg.Rspamd.Password, a.cfg.Hostname, a.logger)
 	}
 	a.classifier = classifier
+	a.sieveEngine = sieve.NewEngine(a.logger)
 	a.pipeline = &delivery.Pipeline{
 		Directory:          a.dir,
 		Store:              a.st.mailbox,
 		Verifier:           verifier,
-		Sieve:              sieve.NewEngine(a.logger),
+		Sieve:              a.sieveEngine,
 		ScriptSource:       sieve.DefaultScriptSource{Store: a.st.mailbox, Directory: a.dir},
 		Hostname:           a.cfg.Hostname,
 		RecipientDelimiter: a.cfg.RecipientDelimiter,
@@ -368,6 +370,7 @@ func (a *App) wireServers() error {
 		Scripts:   a.st.mailbox,
 		Port:      listenerPort(a.cfg.Listeners.ManageSieve),
 		TLSConfig: tlsConf,
+		Engine:    a.sieveEngine,
 		Logger:    a.logger,
 	}
 	a.pop3Srv = &pop3.Server{
@@ -799,7 +802,7 @@ func (a *App) closeTermBackendsLocked() {
 	}
 	a.smtpInbound, a.smtpSubmission = nil, nil
 	a.imapSrv, a.sieveSrv, a.pop3Srv = nil, nil, nil
-	a.mgmtSrv, a.qm, a.qmDone, a.pipeline, a.classifier = nil, nil, nil, nil, nil
+	a.mgmtSrv, a.qm, a.qmDone, a.pipeline, a.classifier, a.sieveEngine = nil, nil, nil, nil, nil, nil
 	a.tlsConf = nil
 	a.assembled = false
 }

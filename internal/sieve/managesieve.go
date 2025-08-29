@@ -30,7 +30,11 @@ type Server struct {
 	Scripts   mailstore.SieveStore
 	Port      string      // listening port, passed to auth so the control plane recognizes webmail ports
 	TLSConfig *tls.Config // optional; enables STARTTLS for direct deploys
-	Logger    *slog.Logger
+	// Engine validates scripts on PUTSCRIPT/CHECKSCRIPT (RFC 5804 §2.5/2.6:
+	// a script that does not compile must not be stored). Nil disables
+	// validation.
+	Engine *Engine
+	Logger *slog.Logger
 }
 
 // ManageSieveSession handles one connection (used as the server.Listener
@@ -112,6 +116,8 @@ func (s *mSession) handle(ctx context.Context, cmd string) (bool, error) {
 		return false, s.handleGetScript(ctx, fields)
 	case "PUTSCRIPT":
 		return false, s.handlePutScript(ctx, fields)
+	case "CHECKSCRIPT":
+		return false, s.handleCheckScript(fields)
 	case "SETACTIVE":
 		return false, s.handleSetActive(ctx, fields)
 	case "DELETESCRIPT":
@@ -257,8 +263,45 @@ func (s *mSession) handlePutScript(ctx context.Context, fields []string) error {
 	if _, err := s.r.ReadString('\n'); err != nil {
 		return err
 	}
+	// RFC 5804 §2.6: reject scripts that do not compile instead of
+	// storing a script that silently falls back to INBOX at delivery.
+	if s.srv.Engine != nil {
+		if err := s.srv.Engine.Check(string(content)); err != nil {
+			return s.status("NO", "script does not compile: "+err.Error())
+		}
+	}
 	if err := s.srv.Scripts.PutSieveScript(ctx, s.user, name, string(content), false); err != nil {
 		return s.status("NO", "script storage error")
+	}
+	return s.status("OK", "")
+}
+
+// handleCheckScript validates a literal script without storing it
+// (RFC 5804 §2.5).
+func (s *mSession) handleCheckScript(fields []string) error {
+	if !s.authed {
+		return s.status("NO", "authenticate first")
+	}
+	if s.srv.Engine == nil {
+		return s.status("NO", "script validation not available")
+	}
+	if len(fields) != 2 {
+		return s.status("NO", "CHECKSCRIPT requires a literal size")
+	}
+	sizeSpec := strings.TrimSuffix(strings.Trim(fields[1], "{}"), "+")
+	n, err := strconv.Atoi(sizeSpec)
+	if err != nil || n < 0 {
+		return s.status("NO", "invalid literal size")
+	}
+	content := make([]byte, n)
+	if _, err := io.ReadFull(s.r, content); err != nil {
+		return err
+	}
+	if _, err := s.r.ReadString('\n'); err != nil {
+		return err
+	}
+	if err := s.srv.Engine.Check(string(content)); err != nil {
+		return s.status("NO", "script does not compile: "+err.Error())
 	}
 	return s.status("OK", "")
 }
@@ -303,10 +346,18 @@ func (s *mSession) handleDeleteScript(ctx context.Context, fields []string) erro
 	return s.status("OK", "")
 }
 
+// sieveCapabilities is the exact extension set the interpreter accepts
+// (internal/gosieve/interp load registry); the advertised SIEVE capability
+// must match it, or clients gate features the server actually supports.
+const sieveCapabilities = "fileinto reject ereject encoded-character envelope subaddress " +
+	"environment body variables relational imap4flags copy " +
+	"comparator-i;octet comparator-i;ascii-casemap comparator-i;ascii-numeric comparator-i;unicode-casemap " +
+	"index editheader vacation spamtest spamtestplus regex date mailbox"
+
 func (s *mSession) writeCapabilities() error {
 	for _, line := range []string{
 		`"IMPLEMENTATION" "mailezine"`,
-		`"SIEVE" "fileinto reject encoded-character envelope subaddress imap4flags copy variables relational environment body"`,
+		`"SIEVE" "` + sieveCapabilities + `"`,
 		`"VERSION" "1.0"`,
 	} {
 		if err := s.line(line); err != nil {

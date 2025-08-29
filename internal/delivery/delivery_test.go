@@ -498,6 +498,74 @@ if header :index 2 :matches "Received" "from * by * for <*>; *"
 	}
 }
 
+// TestApplyHeaderEditsFolding pins RFC 5293 edge cases: a deleted field
+// carries its folding continuation lines away, and :index deletes only the
+// named occurrence.
+func TestApplyHeaderEditsFolding(t *testing.T) {
+	data := []byte("Subject: hello\r\n" +
+		" world\r\n" +
+		"X-Keep: yes\r\n" +
+		"X-Drop: one\r\n" +
+		"X-Drop: two\r\n" +
+		" folded-tail\r\n" +
+		"X-Drop: three\r\n" +
+		"\r\nbody\r\n")
+
+	// deleteheader "X-Drop" with :index 2 removes only the second
+	// instance, continuation line included.
+	got := string(applyHeaderEdits(data, sieve.Result{DeleteHeaders: []sieve.HeaderEdit{
+		{Name: "X-Drop", Values: nil, Index: 2, Delete: true},
+	}}))
+	for _, want := range []string{"X-Drop: one\r\n", "X-Drop: three\r\n", "X-Keep: yes"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf(":index 2: %q missing from result:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "X-Drop: two") || strings.Contains(got, "folded-tail") {
+		t.Fatalf(":index 2: second instance or its fold not removed:\n%s", got)
+	}
+	if !strings.Contains(got, "Subject: hello\r\n world\r\n") {
+		t.Fatalf("unrelated folding must be preserved:\n%s", got)
+	}
+
+	// Value-restricted delete matches only listed values.
+	got = string(applyHeaderEdits(data, sieve.Result{DeleteHeaders: []sieve.HeaderEdit{
+		{Name: "X-Drop", Values: []string{"three"}, Delete: true},
+	}}))
+	if !strings.Contains(got, "X-Drop: one") || strings.Contains(got, "X-Drop: three") {
+		t.Fatalf("value-restricted delete wrong:\n%s", got)
+	}
+
+	// Unindexed delete removes every instance, folds included.
+	got = string(applyHeaderEdits(data, sieve.Result{DeleteHeaders: []sieve.HeaderEdit{
+		{Name: "X-Drop", Delete: true},
+	}}))
+	if strings.Contains(got, "X-Drop") || strings.Contains(got, "folded-tail") {
+		t.Fatalf("full delete left residue:\n%s", got)
+	}
+}
+
+// TestDeliverStripsInboundSpamLevel: without a classifier the stored copy
+// must not carry a sender-forged X-Spam-Level (spamtest trust issue).
+func TestDeliverStripsInboundSpamLevel(t *testing.T) {
+	p, ms, _ := newTestPipeline(t, 1<<20)
+	body := "X-Spam-Level: ****************\r\nSubject: buy pills\r\n\r\nbody\r\n"
+	if err := p.Deliver(context.Background(), nil, "spam@remote.test", []string{"alice@example.com"}, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	email, err := ms.EmailByUID(context.Background(), "alice@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blob bytes.Buffer
+	if err := ms.GetBlob(context.Background(), email.BlobID, &blob); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(blob.String(), "X-Spam-Level") {
+		t.Fatalf("forged X-Spam-Level survived:\n%s", blob.String())
+	}
+}
+
 // TestDeliverVacation verifies the auto-reply is submitted with a null
 // envelope sender and that an auto-replied inbound message never triggers a
 // second reply.

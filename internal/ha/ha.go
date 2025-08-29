@@ -44,13 +44,20 @@ var ErrLeaseStolen = fmt.Errorf("%w: lease stolen", ErrNotLeader)
 const (
 	fsClaimSuffix = ".claim"
 	// fsClaimTTL bounds how long a crashed process can block acquirers on
-	// its leftover claim file before it is stale-broken.
-	fsClaimTTL = 3 * time.Second
+	// its leftover claim file before it is stale-broken. It must exceed any
+	// legitimate holder's critical section (claim → read → write lease) by
+	// a wide margin: a starved-but-alive holder whose stall outlives the
+	// TTL gets its claim broken and a second winner may take the lease.
+	// Leader renewal runs far more often than this, so a crashed holder
+	// still delays failover by at most one TTL window.
+	fsClaimTTL = 10 * time.Second
 	// fsClaimPoll is the retry interval while waiting for a live claim.
 	fsClaimPoll = 20 * time.Millisecond
-	// fsLockWait bounds one acquisition attempt's wait for the claim; the
-	// supervisor retries with backoff instead of blocking forever here.
-	fsLockWait = 5 * time.Second
+	// fsLockWait bounds one acquisition attempt's wait for the claim and
+	// stays above fsClaimTTL so a waiter lives long enough to break a
+	// leftover claim itself; the supervisor retries with backoff instead
+	// of blocking forever here.
+	fsLockWait = 15 * time.Second
 
 	s3NotFound      = "NoSuchKey"
 	s3PrecondFailed = "PreconditionFailed"

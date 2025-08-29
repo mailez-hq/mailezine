@@ -120,7 +120,7 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 	}
 
 	for _, domain := range domains {
-		host, err := d.mxFor(ctx, domain)
+		hosts, err := d.mxCandidates(ctx, domain)
 		if err != nil {
 			for _, addr := range groups[domain] {
 				results = append(results, Result{To: addr, Permanent: true, Err: err})
@@ -128,18 +128,32 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 			continue
 		}
 		addrs := groups[domain]
-		tlsMode, daneRecords, policyErr := outboundTLSPolicy(ctx, d.PolicyResolver, d.MTSTS, d.Logger, domain, host)
-		if policyErr != nil {
-			for _, addr := range addrs {
-				results = append(results, Result{To: addr, Permanent: true, Err: policyErr})
+		// RFC 5321 §5.1: try each MX host in preference order; a transient
+		// failure (unreachable primary) advances to the next secondary
+		// within the same attempt instead of burning a retry round.
+		var resps []mailsmtp.Response
+		var lastErr error
+		delivered := false
+		for _, host := range hosts {
+			tlsMode, daneRecords, policyErr := outboundTLSPolicy(ctx, d.PolicyResolver, d.MTSTS, d.Logger, domain, host)
+			if policyErr != nil {
+				lastErr = policyErr
+				continue
 			}
-			continue
+			resps, lastErr = d.deliverGroup(ctx, from, host, addrs, body, port, tlsMode, daneRecords)
+			if lastErr == nil || len(resps) > 0 {
+				delivered = true
+				break
+			}
+			if permanentError(lastErr) {
+				break
+			}
+			d.Logger.Info("queue: MX host failed, trying next", "domain", domain, "host", host, "err", lastErr)
 		}
-		resps, err := d.deliverGroup(ctx, from, host, addrs, body, port, tlsMode, daneRecords)
-		if err != nil && len(resps) == 0 {
-			permanent := permanentError(err)
+		if !delivered {
+			permanent := lastErr != nil && permanentError(lastErr)
 			for _, addr := range addrs {
-				results = append(results, Result{To: addr, Permanent: permanent, Err: err})
+				results = append(results, Result{To: addr, Permanent: permanent, Err: lastErr})
 			}
 			continue
 		}
@@ -255,25 +269,52 @@ func (d *SMTPDeliverer) PortOrDefault() int {
 	return d.Port
 }
 
-// mxFor resolves the delivery host: the lowest-preference MX, or the domain
-// itself when it has A/AAAA records and no MX exists (RFC 5321 fallback).
-func (d *SMTPDeliverer) mxFor(ctx context.Context, domain string) (string, error) {
-	mxs, err := d.Resolver.LookupMX(ctx, domain)
-	if err == nil {
-		for _, mx := range mxs {
-			if host := strings.TrimSuffix(mx.Host, "."); host != "" {
-				return host, nil
-			}
+// mxCandidates returns delivery hosts in preference order: every MX host
+// (preference ascending, duplicates collapsed), or — when the domain has no
+// usable MX records — its A/AAAA addresses as the implicit MX (RFC 5321
+// §5.1). A null MX (".", RFC 7505) is terminal: the domain accepts no mail
+// and the address fallback must not kick in.
+func (d *SMTPDeliverer) mxCandidates(ctx context.Context, domain string) ([]string, error) {
+	var candidates []string
+	seen := map[string]bool{}
+	mxs, mxErr := d.Resolver.LookupMX(ctx, domain)
+	nullMX := false
+	for _, mx := range mxs {
+		if mx.Host == "." {
+			nullMX = true
+			continue
 		}
+		host := strings.TrimSuffix(mx.Host, ".")
+		if host == "" || seen[host] {
+			continue
+		}
+		seen[host] = true
+		candidates = append(candidates, host)
+	}
+	if nullMX && len(candidates) == 0 {
+		return nil, fmt.Errorf("queue: domain %s does not accept mail (null MX, RFC 7505)", domain)
+	}
+	if len(candidates) > 0 {
+		return candidates, nil
 	}
 	ips, ipErr := d.Resolver.LookupIPAddr(ctx, domain)
-	if ipErr == nil && len(ips) > 0 {
-		return ips[0].IP.String(), nil
+	for _, ip := range ips {
+		s := ip.IP.String()
+		if !seen[s] {
+			seen[s] = true
+			candidates = append(candidates, s)
+		}
 	}
-	if err != nil {
-		return "", fmt.Errorf("queue: no MX or address for %s: %w", domain, err)
+	if len(candidates) > 0 {
+		return candidates, nil
 	}
-	return "", fmt.Errorf("queue: no MX or address for %s", domain)
+	if ipErr == nil && mxErr == nil {
+		return nil, fmt.Errorf("queue: no MX or address for %s", domain)
+	}
+	if mxErr != nil {
+		return nil, fmt.Errorf("queue: no MX or address for %s: %w", domain, mxErr)
+	}
+	return nil, fmt.Errorf("queue: no MX or address for %s: %w", domain, ipErr)
 }
 
 func domainOf(addr string) (string, bool) {

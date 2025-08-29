@@ -332,11 +332,17 @@ func (m *Manager) List(ctx context.Context) ([]Message, error) {
 	return out, nil
 }
 
-// Retry reschedules a terminal or deferred message immediately.
+// Retry reschedules a terminal or deferred message immediately. A message
+// being delivered right now (StateActive) is owned by its worker: retrying
+// under it resets state the worker immediately overwrites with its own
+// outcome.
 func (m *Manager) Retry(ctx context.Context, id uint64) error {
 	msg, err := m.load(ctx, id)
 	if err != nil {
 		return err
+	}
+	if msg.State == StateActive {
+		return fmt.Errorf("queue: message %d is being delivered; retry after it completes", id)
 	}
 	oldNext := msg.NextAttempt
 	now := m.opts.Now()
@@ -347,10 +353,17 @@ func (m *Manager) Retry(ctx context.Context, id uint64) error {
 }
 
 // Cancel withdraws a message from the queue and removes its body blob.
+// A message being delivered (StateActive) cannot be canceled: the in-flight
+// worker would re-save its own copy after the cancel and resurrect the
+// record. Terminal messages only have their meta removed — the worker
+// already reclaimed the blob.
 func (m *Manager) Cancel(ctx context.Context, id uint64) error {
 	msg, err := m.load(ctx, id)
 	if err != nil {
 		return err
+	}
+	if msg.State == StateActive {
+		return fmt.Errorf("queue: message %d is being delivered; cancel after it completes", id)
 	}
 	ops := []store.Op{
 		{Key: store.QueueKey(queueName, id), Delete: true},
@@ -359,7 +372,13 @@ func (m *Manager) Cancel(ctx context.Context, id uint64) error {
 	if err := m.kv.Batch(ops); err != nil {
 		return err
 	}
-	return m.blob.Delete(ctx, msg.BlobID)
+	if isTerminal(msg.State) {
+		return nil
+	}
+	if err := m.blob.Delete(ctx, msg.BlobID); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 func (m *Manager) nextID() (uint64, error) {

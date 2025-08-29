@@ -126,8 +126,15 @@ func (p *Pipeline) Deliver(ctx context.Context, peer net.IP, from string, to []s
 			}
 		}
 	}
+	// An inbound X-Spam-Level is sender-controlled: the Sieve spamtest
+	// extension must never trust it. Strip it unconditionally and rely on
+	// the locally prepended verdict (rspamd's header, or the synthesized
+	// fallback above; nothing at all when no classifier is configured).
+	base := stripHeaderFields(data, "X-Spam-Level")
 	if len(headers) > 0 {
-		stored = prependHeaders(headers, data)
+		stored = prependHeaders(headers, base)
+	} else {
+		stored = base
 	}
 	for _, rcpt := range to {
 		if err := p.deliverTo(ctx, rcpt, from, stored, data); err != nil {
@@ -204,8 +211,77 @@ func headersContain(headers []string, key string) bool {
 	return false
 }
 
+// headerField is one logical header field: its first line, folding
+// continuation lines, and the unfolded value.
+type headerField struct {
+	name  string // as written, case preserved
+	value string // unfolded and trimmed
+	start int    // first line index
+	end   int    // last (continuation) line index
+}
+
+// splitHeaderFields groups header lines into logical fields, attaching
+// folding continuation lines (leading SP/HTAB) to the field they continue.
+func splitHeaderFields(lines []string) []headerField {
+	var out []headerField
+	cur := -1
+	for i, line := range lines {
+		if line == "" {
+			continue
+		}
+		if line[0] == ' ' || line[0] == '\t' {
+			if cur >= 0 {
+				out[cur].value += " " + strings.TrimSpace(line)
+				out[cur].end = i
+			}
+			continue
+		}
+		if c := strings.IndexByte(line, ':'); c >= 0 {
+			out = append(out, headerField{name: line[:c], value: strings.TrimSpace(line[c+1:]), start: i, end: i})
+			cur = len(out) - 1
+		} else {
+			cur = -1
+		}
+	}
+	return out
+}
+
+// stripHeaderFields removes every instance of the named header fields
+// (folding continuation lines included) from the header block of data.
+func stripHeaderFields(data []byte, names ...string) []byte {
+	block := string(data)
+	body := ""
+	if i := strings.Index(block, "\r\n\r\n"); i >= 0 {
+		body = block[i:]
+		block = block[:i]
+	}
+	lines := strings.Split(block, "\r\n")
+	lower := make(map[string]bool, len(names))
+	for _, n := range names {
+		lower[strings.ToLower(n)] = true
+	}
+	remove := make([]bool, len(lines))
+	for _, f := range splitHeaderFields(lines) {
+		if lower[strings.ToLower(f.name)] {
+			for i := f.start; i <= f.end; i++ {
+				remove[i] = true
+			}
+		}
+	}
+	var kept []string
+	for i, l := range lines {
+		if !remove[i] {
+			kept = append(kept, l)
+		}
+	}
+	return []byte(strings.Join(kept, "\r\n") + body)
+}
+
 // applyHeaderEdits applies RFC 5293 editheader actions to the message being
-// stored: deletes first, then adds (a delete+add pair is a "replace").
+// stored. Deletes run in script order — each action counts :index
+// occurrences against the message as mutated by its predecessors — and a
+// deleted field takes its folding continuation lines with it; adds append
+// after the deletes (a delete+add pair is a "replace").
 func applyHeaderEdits(data []byte, res sieve.Result) []byte {
 	if len(res.DeleteHeaders) == 0 && len(res.AddHeaders) == 0 {
 		return data
@@ -217,46 +293,65 @@ func applyHeaderEdits(data []byte, res sieve.Result) []byte {
 		block = block[:i]
 	}
 	lines := strings.Split(block, "\r\n")
-	del := map[string][]string{} // lower name -> values to match (nil = all)
+
 	for _, e := range res.DeleteHeaders {
-		if e.Delete {
-			var vals []string
-			if e.Value != "" {
-				vals = strings.Split(e.Value, ",")
-			}
-			del[strings.ToLower(e.Name)] = vals
+		lines = deleteHeaderFields(lines, e)
+	}
+	for _, e := range res.AddHeaders {
+		lines = append(lines, e.Name+": "+e.Value)
+	}
+	return []byte(strings.Join(lines, "\r\n") + body)
+}
+
+// deleteHeaderFields applies one deleteheader action to the header lines.
+func deleteHeaderFields(lines []string, e sieve.HeaderEdit) []string {
+	name := strings.ToLower(e.Name)
+	values := e.Values
+	if len(values) == 0 && e.Value != "" {
+		values = strings.Split(e.Value, ",")
+	}
+	// An empty match list (not merely nil) deletes every instance: the
+	// interpreter routes a valueless deleteheader through the same list
+	// machinery, producing an empty non-nil slice.
+	if len(values) == 0 {
+		values = nil
+	}
+	fields := splitHeaderFields(lines)
+	remove := make([]bool, len(lines))
+	occurrence := 0
+	for _, f := range fields {
+		if strings.ToLower(f.name) != name {
+			continue
+		}
+		occurrence++
+		// RFC 5293 §2.5: :index restricts the delete to the Nth occurrence
+		// of the field (1-based); without it every matching instance goes.
+		if e.Index > 0 && occurrence != e.Index {
+			continue
+		}
+		if values != nil && !matchesAnyValue(values, f.value) {
+			continue
+		}
+		for i := f.start; i <= f.end; i++ {
+			remove[i] = true
 		}
 	}
 	var kept []string
-	for _, line := range lines {
-		name := line
-		if i := strings.IndexByte(line, ':'); i >= 0 {
-			name = line[:i]
-		}
-		vals, ok := del[strings.ToLower(name)]
-		if !ok {
-			kept = append(kept, line)
-			continue
-		}
-		if vals == nil {
-			continue // delete every instance
-		}
-		value := strings.TrimSpace(line[len(name)+1:])
-		matched := false
-		for _, v := range vals {
-			if strings.TrimSpace(v) == value {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			kept = append(kept, line)
+	for i, l := range lines {
+		if !remove[i] {
+			kept = append(kept, l)
 		}
 	}
-	for _, e := range res.AddHeaders {
-		kept = append(kept, e.Name+": "+e.Value)
+	return kept
+}
+
+func matchesAnyValue(patterns []string, value string) bool {
+	for _, p := range patterns {
+		if strings.TrimSpace(p) == value {
+			return true
+		}
 	}
-	return []byte(strings.Join(kept, "\r\n") + body)
+	return false
 }
 
 // sendVacation generates an RFC 5230 auto-reply and hands it to the outbound

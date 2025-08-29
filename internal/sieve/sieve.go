@@ -43,8 +43,9 @@ type Result struct {
 // HeaderEdit is one editheader operation.
 type HeaderEdit struct {
 	Name   string
-	Value  string
-	Index  int // deleteheader :index (0 = all); unused for add
+	Value  string   // addheader value; for deletes, the joined match list
+	Index  int      // deleteheader :index (0 = all); unused for add
+	Values []string // deleteheader :value list (nil = delete every instance)
 	Delete bool
 }
 
@@ -105,6 +106,14 @@ func (e *Engine) Route(ctx context.Context, src, from, envTo string, data []byte
 	return actionsToResult(runtime.AppliedActions), nil
 }
 
+// Check reports whether src compiles (used by ManageSieve CHECKSCRIPT and
+// PUTSCRIPT validation; RFC 5804 §2.6: a script that does not compile must
+// not be stored).
+func (e *Engine) Check(src string) error {
+	_, err := e.compile(src)
+	return err
+}
+
 func (e *Engine) compile(src string) (*gosieve.Script, error) {
 	key := sha256.Sum256([]byte(src))
 	e.mu.Lock()
@@ -150,7 +159,7 @@ func actionsToResult(actions []interp.AppliedAction) Result {
 		case interp.ActionAddHeader:
 			res.AddHeaders = append(res.AddHeaders, HeaderEdit{Name: act.Name, Value: act.Value})
 		case interp.ActionDeleteHeader:
-			res.DeleteHeaders = append(res.DeleteHeaders, HeaderEdit{Name: act.Name, Value: strings.Join(act.Values, ", "), Index: act.Index, Delete: true})
+			res.DeleteHeaders = append(res.DeleteHeaders, HeaderEdit{Name: act.Name, Value: strings.Join(act.Values, ", "), Values: act.Values, Index: act.Index, Delete: true})
 		case interp.ActionVacation:
 			res.Vacation = &Vacation{Days: act.Days, From: act.From, Subject: act.Subject, Body: act.Body}
 		}

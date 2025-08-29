@@ -221,7 +221,10 @@ func beUint64Value(b []byte) uint64 {
 	return binary.BigEndian.Uint64(b)
 }
 
-// QuotaUsedBytes sums the sizes of every Email document of the account.
+// QuotaUsedBytes reports the account's used-bytes counter. Appends and
+// expunges maintain it transactionally (AppendEmailAtomically /
+// DeleteEmailAtomically adjust it in the same commit as the document), so
+// this is an O(1) counter read instead of a full document scan.
 func (k *KV) QuotaUsedBytes(ctx context.Context, account string) (int64, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if errors.Is(err, store.ErrNotFound) {
@@ -230,21 +233,7 @@ func (k *KV) QuotaUsedBytes(ctx context.Context, account string) (int64, error) 
 	if err != nil {
 		return 0, err
 	}
-	ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionEmail)
-	if err != nil {
-		return 0, err
-	}
-	var total int64
-	for _, id := range ids {
-		fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, id)
-		if err != nil {
-			return 0, err
-		}
-		if v, ok := fields[fieldSize]; ok && len(v) == 8 {
-			total += int64(binary.BigEndian.Uint64(v))
-		}
-	}
-	return total, nil
+	return k.s.QuotaUsed(ctx, acctID)
 }
 
 // GetBlob streams a stored message body (used by IMAP and tests).

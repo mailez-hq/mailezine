@@ -396,30 +396,44 @@ func (s *session) handleTop(ctx context.Context, fields []string) error {
 		return s.reply("-ERR cannot retrieve")
 	}
 	defer rc.Close()
-	data, err := io.ReadAll(rc)
-	if err != nil {
-		return s.reply("-ERR cannot retrieve")
-	}
 	if err := s.reply(fmt.Sprintf("+OK top of message %d", s.messageIndex(m.uid))); err != nil {
 		return err
 	}
-	// Headers plus up to n body lines.
-	parts := strings.SplitN(string(data), "\r\n\r\n", 2)
-	if err := s.line(dotStuff(parts[0])); err != nil {
-		return err
-	}
-	if err := s.line(""); err != nil {
-		return err
-	}
-	if len(parts) == 2 {
-		bodyLines := strings.Split(parts[1], "\r\n")
-		if n > len(bodyLines) {
-			n = len(bodyLines)
+	// Stream headers plus up to n body lines: the whole message is never
+	// buffered, so TOP on a huge mailbox entry costs only the bytes sent.
+	sc := bufio.NewReader(rc)
+	headerDone := false
+	bodySent := 0
+	for {
+		raw, rerr := sc.ReadString('\n')
+		eof := errors.Is(rerr, io.EOF)
+		if rerr != nil && !eof {
+			return rerr
 		}
-		for _, l := range bodyLines[:n] {
-			if err := s.line(dotStuff(l)); err != nil {
+		line := strings.TrimRight(raw, "\r\n")
+		hadContent := raw != ""
+		if !headerDone {
+			if line == "" {
+				if hadContent {
+					headerDone = true
+					if err := s.line(""); err != nil {
+						return err
+					}
+				}
+			} else if err := s.line(dotStuff(line)); err != nil {
 				return err
 			}
+		} else if hadContent {
+			if bodySent >= n {
+				break
+			}
+			bodySent++
+			if err := s.line(dotStuff(line)); err != nil {
+				return err
+			}
+		}
+		if eof {
+			break
 		}
 	}
 	return s.term()
