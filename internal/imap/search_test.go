@@ -30,7 +30,7 @@ func TestMatchSearchHeader(t *testing.T) {
 	msg := testMessage(1, "Subject: second\r\n\r\nbody")
 	ok, err := matchSearch(msg, 1, &imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "second"}},
-	}, func() ([]byte, error) {
+	}, 1, 1, func() ([]byte, error) {
 		return []byte("Subject: second\r\n\r\nbody"), nil
 	})
 	if err != nil {

@@ -278,8 +278,8 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleMove(dec, numKind)
 	case "SEARCH", "UID SEARCH":
 		err = c.handleSearch(tag, dec, numKind)
-	case "SORT":
-		err = c.handleSort(tag, dec)
+	case "SORT", "UID SORT":
+		err = c.handleSort(tag, dec, numKind)
 	default:
 		// Extension commands (e.g. RFC 4314 ACL) are handled by the
 		// session's extension hook; unknown commands still get the
@@ -313,6 +313,15 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		imapErr *imap.Error
 		decErr  *imapwire.DecoderExpectError
 	)
+	if okCode, isOK := asOKCode(err); isOK {
+		if !sendOK {
+			return nil
+		}
+		if err := c.poll(name); err != nil {
+			return err
+		}
+		return c.writeOKCodeResp(tag, okCode, name)
+	}
 	if errors.As(err, &imapErr) {
 		resp = (*imap.StatusResponse)(imapErr)
 	} else if errors.As(err, &decErr) {

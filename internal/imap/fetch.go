@@ -37,14 +37,21 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			break
 		}
 	}
+	maxSeq := uint32(len(msgs))
+	maxUID := maxSeq
+	if maxSeq > 0 {
+		maxUID = msgs[maxSeq-1].UID
+	}
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
-		if !numContains(numSet, seq, msg.UID) {
+		if !numMatches(numSet, seq, msg.UID, maxSeq, maxUID) {
 			continue
 		}
 		// Envelope and body structure are memoised per (account, mailbox,
-		// UID); only body sections and cache misses need the blob.
-		envKey := s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
+		// uidvalidity, UID); only body sections and cache misses need the
+		// blob. The uidvalidity dimension prevents a delete+recreate of the
+		// mailbox from serving stale cached envelopes under reused UIDs.
+		envKey := s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(s.uidvalidity), 10) + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
 		var env *imap.Envelope
 		if options.Envelope {
 			if e, ok := s.srv.cache.Get(envKey); ok {
@@ -158,6 +165,41 @@ func numContains(numSet imap.NumSet, seq uint32, uid uint32) bool {
 		return ns.Contains(imap.UID(uid))
 	}
 	return false
+}
+
+// numMatches reports set membership with RFC 3501 §6.4.8 "n:*" semantics: an
+// open-ended range always includes the final message of the mailbox, even
+// when n exceeds the mailbox size ("5:*" with three messages is {3}).
+// maxSeq/maxUID are the current message count / highest existing UID.
+func numMatches(numSet imap.NumSet, seq, uid, maxSeq, maxUID uint32) bool {
+	if numContains(numSet, seq, uid) {
+		return true
+	}
+	if !numSet.Dynamic() {
+		return false
+	}
+	switch numSet.(type) {
+	case imap.UIDSet:
+		return uid == maxUID
+	default:
+		return seq == maxSeq
+	}
+}
+
+// seqSetMatches is the SeqSet form of numMatches.
+func seqSetMatches(set imap.SeqSet, seq, maxSeq uint32) bool {
+	if set.Contains(seq) {
+		return true
+	}
+	return set.Dynamic() && seq == maxSeq
+}
+
+// uidSetMatches is the UIDSet form of numMatches.
+func uidSetMatches(set imap.UIDSet, uid, maxUID uint32) bool {
+	if set.Contains(imap.UID(uid)) {
+		return true
+	}
+	return set.Dynamic() && uid == maxUID
 }
 
 func imapFlags(flags []string) []imap.Flag {

@@ -35,7 +35,13 @@ type SessionSort interface {
 	Sort(criteria []SortCriterion, search *imap.SearchCriteria) ([]uint32, error)
 }
 
-func (c *Conn) handleSort(tag string, dec *imapwire.Decoder) error {
+// SessionSortUID is implemented by sessions that support UID SORT
+// (RFC 5256 §3): identical ordering, UIDs in the response.
+type SessionSortUID interface {
+	SortUID(criteria []SortCriterion, search *imap.SearchCriteria) ([]uint32, error)
+}
+
+func (c *Conn) handleSort(tag string, dec *imapwire.Decoder, numKind NumKind) error {
 	if !dec.ExpectSP() {
 		return dec.Err()
 	}
@@ -69,18 +75,32 @@ func (c *Conn) handleSort(tag string, dec *imapwire.Decoder) error {
 	if err := c.checkState(imap.ConnStateSelected); err != nil {
 		return err
 	}
-	sess, ok := c.session.(SessionSort)
-	if !ok {
-		return &imap.Error{Type: imap.StatusResponseTypeBad, Text: "SORT not supported"}
-	}
-	seqs, err := sess.Sort(criteria, &search)
-	if err != nil {
-		return err
+	var nums []uint32
+	if numKind == NumKindUID {
+		sess, ok := c.session.(SessionSortUID)
+		if !ok {
+			return &imap.Error{Type: imap.StatusResponseTypeBad, Text: "UID SORT not supported"}
+		}
+		uids, err := sess.SortUID(criteria, &search)
+		if err != nil {
+			return err
+		}
+		nums = uids
+	} else {
+		sess, ok := c.session.(SessionSort)
+		if !ok {
+			return &imap.Error{Type: imap.StatusResponseTypeBad, Text: "SORT not supported"}
+		}
+		seqs, err := sess.Sort(criteria, &search)
+		if err != nil {
+			return err
+		}
+		nums = seqs
 	}
 
 	enc := newResponseEncoder(c)
 	enc.Atom("*").SP().Atom("SORT")
-	for _, n := range seqs {
+	for _, n := range nums {
 		enc.SP().Number(n)
 	}
 	if err := enc.CRLF(); err != nil {

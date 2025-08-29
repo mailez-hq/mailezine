@@ -28,6 +28,6 @@ func FuzzMatchSearch(f *testing.F) {
 			Header: []imap.SearchCriteriaHeaderField{{Key: headerKey, Value: headerVal}},
 			Text:   []string{text},
 		}
-		_, _ = matchSearch(msg, 1, criteria, func() ([]byte, error) { return raw, nil })
+		_, _ = matchSearch(msg, 1, criteria, 1, 1, func() ([]byte, error) { return raw, nil })
 	})
 }

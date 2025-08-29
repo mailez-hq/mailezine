@@ -4,7 +4,6 @@ package imap
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sort"
 	"time"
@@ -23,7 +22,11 @@ type session struct {
 	srv  *Server
 	user string
 	mbox string
-	snap []*mailstore.Message // selected mailbox snapshot for IDLE/POLL diffs
+	// uidvalidity of the selected mailbox: fetched-envelope cache keys are
+	// namespaced by it, so a delete+recreate (new uidvalidity, same name)
+	// cannot serve stale cached envelopes for reused UIDs.
+	uidvalidity uint32
+	snap        []*mailstore.Message // selected mailbox snapshot for IDLE/POLL diffs
 }
 
 var _ imapserver.Session = (*session)(nil)
@@ -32,6 +35,7 @@ var _ imapserver.SessionNamespace = (*session)(nil)
 var _ imapserver.SessionAppendLimit = (*session)(nil)
 var _ imapserver.SessionExtension = (*session)(nil)
 var _ imapserver.SessionSort = (*session)(nil)
+var _ imapserver.SessionSortUID = (*session)(nil)
 
 func (s *session) Close() error {
 	// Only authenticated sessions were counted on login.
@@ -85,6 +89,7 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	}
 	s.mbox = mailbox
 	s.snap = msgs
+	s.uidvalidity = st.UIDValidity
 	flags := []imap.Flag{
 		imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted,
 		imap.FlagSeen, imap.FlagDraft,
@@ -297,6 +302,18 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 				return err
 			}
 		}
+		s.snap = current
+		return nil
+	}
+	// Expunges are not allowed in this round: keep the OLD snapshot. Adopting
+	// the new state here would silently swallow the pending expunge and
+	// desynchronize the client's sequence numbers — the stale snapshot makes
+	// the next diff (and the next allowExpunge round) replay it. Repeated
+	// FLAGS/EXISTS re-sends against the stale snapshot are idempotent.
+	for uid := range old {
+		if _, ok := cur[uid]; !ok {
+			return nil
+		}
 	}
 	s.snap = current
 	return nil
@@ -508,22 +525,14 @@ func (s *session) resolveUIDs(ctx context.Context, numSet imap.NumSet) ([]uint32
 	if err != nil {
 		return nil, err
 	}
+	if len(msgs) == 0 {
+		return nil, nil
+	}
 	var uids []uint32
-	switch ns := numSet.(type) {
-	case imap.SeqSet:
-		for i, msg := range msgs {
-			if ns.Contains(uint32(i) + 1) {
-				uids = append(uids, msg.UID)
-			}
+	for i, msg := range msgs {
+		if numMatches(numSet, uint32(i)+1, msg.UID, uint32(len(msgs)), msgs[len(msgs)-1].UID) {
+			uids = append(uids, msg.UID)
 		}
-	case imap.UIDSet:
-		for _, msg := range msgs {
-			if ns.Contains(imap.UID(msg.UID)) {
-				uids = append(uids, msg.UID)
-			}
-		}
-	default:
-		return nil, fmt.Errorf("imap: unsupported num set %T", numSet)
 	}
 	return uids, nil
 }

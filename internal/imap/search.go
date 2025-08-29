@@ -37,6 +37,11 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	data := &imap.SearchData{}
 	var allSeq imap.SeqSet
 	var allUID imap.UIDSet
+	maxSeq := uint32(len(msgs))
+	maxUID := maxSeq
+	if maxSeq > 0 {
+		maxUID = msgs[maxSeq-1].UID
+	}
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
 		if ftsCandidates != nil {
@@ -61,7 +66,7 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 			bodyCache = b
 			return b, nil
 		}
-		ok, err := matchSearch(msg, seq, criteria, body)
+		ok, err := matchSearch(msg, seq, criteria, maxSeq, maxUID, body)
 		if err != nil {
 			return nil, err
 		}
@@ -94,14 +99,17 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	return data, nil
 }
 
-func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, body func() ([]byte, error)) (bool, error) {
+// matchSearch evaluates c against one message. maxSeq/maxUID carry the
+// mailbox size for RFC 3501 §6.4.8 "n:*" semantics (an open-ended range
+// always includes the final message).
+func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, maxSeq, maxUID uint32, body func() ([]byte, error)) (bool, error) {
 	for _, seqSet := range c.SeqNum {
-		if seq == 0 || !seqSet.Contains(seq) {
+		if seq == 0 || !seqSetMatches(seqSet, seq, maxSeq) {
 			return false, nil
 		}
 	}
 	for _, uidSet := range c.UID {
-		if !uidSet.Contains(imap.UID(msg.UID)) {
+		if !uidSetMatches(uidSet, msg.UID, maxUID) {
 			return false, nil
 		}
 	}
@@ -158,17 +166,17 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, bod
 		}
 	}
 	for _, not := range c.Not {
-		ok, err := matchSearch(msg, seq, &not, body)
+		ok, err := matchSearch(msg, seq, &not, maxSeq, maxUID, body)
 		if err != nil || ok {
 			return false, err
 		}
 	}
 	for _, or := range c.Or {
-		a, err := matchSearch(msg, seq, &or[0], body)
+		a, err := matchSearch(msg, seq, &or[0], maxSeq, maxUID, body)
 		if err != nil {
 			return false, err
 		}
-		b, err := matchSearch(msg, seq, &or[1], body)
+		b, err := matchSearch(msg, seq, &or[1], maxSeq, maxUID, body)
 		if err != nil {
 			return false, err
 		}

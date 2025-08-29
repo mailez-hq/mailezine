@@ -18,14 +18,34 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	if err != nil {
 		return err
 	}
+	// RFC 7162 §3.3: messages skipped due to UNCHANGEDSINCE must be reported
+	// in the tagged OK via [MODIFIED <set>] so the client can re-fetch and
+	// retry; silently dropping them leaves the client believing its STORE
+	// applied. The set uses UIDs for UID STORE, sequence numbers otherwise.
+	_, uidStore := numSet.(*imap.UIDSet)
+	var modifiedUIDs imap.UIDSet
+	var modifiedSeqs imap.SeqSet
+	skipped := 0
+	maxSeq := uint32(len(msgs))
+	maxUID := maxSeq
+	if maxSeq > 0 {
+		maxUID = msgs[maxSeq-1].UID
+	}
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
-		if !numContains(numSet, seq, msg.UID) {
+		if !numMatches(numSet, seq, msg.UID, maxSeq, maxUID) {
 			continue
 		}
 		// RFC 7162: UNCHANGEDSINCE — skip messages modified after the
-		// given modseq (the client re-fetches and retries).
+		// given modseq (the client re-fetches and retries). The special
+		// value 0 always succeeds.
 		if options.UnchangedSince != 0 && msg.ModSeq > options.UnchangedSince {
+			if uidStore {
+				modifiedUIDs.AddNum(imap.UID(msg.UID))
+			} else {
+				modifiedSeqs.AddNum(seq)
+			}
+			skipped++
 			continue
 		}
 		next := applyStoreOp(msg.Flags, flags)
@@ -41,7 +61,16 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 			}
 		}
 	}
-	return s.refreshSnapshot(ctx)
+	if err := s.refreshSnapshot(ctx); err != nil {
+		return err
+	}
+	if skipped > 0 {
+		if uidStore {
+			return &imapserver.StatusOKCode{Code: imapserver.ResponseCodeModified, Set: &modifiedUIDs}
+		}
+		return &imapserver.StatusOKCode{Code: imapserver.ResponseCodeModified, Set: &modifiedSeqs}
+	}
+	return nil
 }
 
 func applyStoreOp(current []string, store *imap.StoreFlags) []string {
