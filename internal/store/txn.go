@@ -1,6 +1,10 @@
 package store
 
-import "context"
+import (
+	"bytes"
+	"context"
+	"sort"
+)
 
 // AsTxn upgrades a plain KV to the transactional TxnKV contract.
 //
@@ -71,6 +75,39 @@ func (w *writeBuf) Append(ops ...Op) {
 	for _, op := range ops {
 		w.stage(op)
 	}
+}
+
+// Scan merges the base prefix range with the staged writes and visits the
+// union in ascending key order (read-your-writes semantics).
+func (w *writeBuf) Scan(prefix []byte, fn func(k, v []byte) error) error {
+	type entry struct{ k, v []byte }
+	var merged []entry
+	staged := make(map[string]bool)
+	for _, op := range w.ops {
+		if !bytes.HasPrefix(op.Key, prefix) {
+			continue
+		}
+		staged[string(op.Key)] = true
+		if !op.Delete {
+			merged = append(merged, entry{k: append([]byte(nil), op.Key...), v: append([]byte(nil), op.Value...)})
+		}
+	}
+	if err := w.base.Scan(prefix, func(k, v []byte) error {
+		if staged[string(k)] {
+			return nil
+		}
+		merged = append(merged, entry{k: append([]byte(nil), k...), v: append([]byte(nil), v...)})
+		return nil
+	}); err != nil {
+		return err
+	}
+	sort.Slice(merged, func(i, j int) bool { return bytes.Compare(merged[i].k, merged[j].k) < 0 })
+	for _, e := range merged {
+		if err := fn(e.k, e.v); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (w *writeBuf) stage(op Op) {

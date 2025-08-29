@@ -202,6 +202,45 @@ func runTxnContract(t *testing.T, newKV func(*testing.T) KV) {
 		}
 	})
 
+	run("scan merges staged writes with base range", func(t *testing.T, txn TxnKV) {
+		for _, f := range [][2]string{{"p/a", "1"}, {"p/b", "2"}, {"p/c", "3"}, {"q/x", "9"}} {
+			if err := txn.Put([]byte(f[0]), []byte(f[1])); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var seen []string
+		err := txn.WithTxn(ctx, func(h TxnOps) error {
+			h.Put([]byte("p/a"), []byte("1m")) // overwrite base
+			h.Delete([]byte("p/b"))            // hide base
+			h.Put([]byte("p/d"), []byte("4"))  // extend inside prefix
+			h.Put([]byte("q/y"), []byte("yy")) // outside prefix: ignored
+			return h.Scan([]byte("p/"), func(k, v []byte) error {
+				seen = append(seen, fmt.Sprintf("%s=%s", k, v))
+				return nil
+			})
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"p/a=1m", "p/c=3", "p/d=4"}
+		if len(seen) != len(want) {
+			t.Fatalf("txn scan saw %v, want %v", seen, want)
+		}
+		for i := range want {
+			if seen[i] != want[i] {
+				t.Fatalf("txn scan row %d = %q, want %q (all: %v)", i, seen[i], want[i], seen)
+			}
+		}
+		// Visitor errors abort the scan and propagate.
+		sentinel := errors.New("stop")
+		err = txn.WithTxn(ctx, func(h TxnOps) error {
+			return h.Scan([]byte("p/"), func(k, v []byte) error { return sentinel })
+		})
+		if !errors.Is(err, sentinel) {
+			t.Fatalf("scan error propagation: got %v", err)
+		}
+	})
+
 	run("closure error rolls back", func(t *testing.T, txn TxnKV) {
 		if err := txn.Put([]byte("keep"), []byte("orig")); err != nil {
 			t.Fatal(err)

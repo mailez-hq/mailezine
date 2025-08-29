@@ -46,6 +46,13 @@ type TxnOps interface {
 	Delete(key []byte)
 	// Append stages pre-built Batch ops inside the transaction.
 	Append(ops ...Op)
+	// Scan visits every key with the given prefix in ascending key order,
+	// merged with the staged writes (read-your-writes): staged deletes hide
+	// base keys, staged puts surface their buffered values. Returning an
+	// error from fn aborts the scan and is propagated. Scans are part of
+	// the transaction read set: on backends with conflict detection they
+	// participate in commit-time validation.
+	Scan(prefix []byte, fn func(k, v []byte) error) error
 }
 
 // TxnKV extends KV with optimistic transactions. WithTxn runs fn against a

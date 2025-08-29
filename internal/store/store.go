@@ -253,21 +253,17 @@ func (s *Store) AppendEmailAtomically(
 	unlock := s.lockAccount(accountID)
 	defer unlock()
 
-	linkKey := BlobLinkKey(uint32(accountID), blobID)
 	quotaKey := QuotaKey(uint32(accountID))
 	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
 
 	return s.txn.WithTxn(ctx, func(t TxnOps) error {
 		t.Append(orderedFieldOps(accountID, collection, docID, fields)...)
 
-		// Blob link (reference count +1).
-		refs, err := blobRefValue(t.Get, linkKey)
-		if errors.Is(err, ErrNotFound) {
-			refs = 0
-		} else if err != nil {
+		// Blob link (reference count +1), staged so a replayed optimistic
+		// transaction cannot double-increment.
+		if err := stageBlobLink(t, accountID, blobID); err != nil {
 			return err
 		}
-		t.Append(Op{Key: linkKey, Value: beUint64(uint64(refs + 1))})
 
 		// Quota (used bytes + size).
 		cur, err := quotaValue(t.Get, quotaKey)
@@ -325,7 +321,12 @@ func (s *Store) DeleteEmailAtomically(
 		var blobID string
 		var size int64
 		var ops []Op
-		err := s.kv.Scan(prefix, func(k, v []byte) error {
+		// Scan INSIDE the transaction (read-your-writes): the read set joins
+		// the commit, so a concurrent writer racing the delete either
+		// conflicts (optimistic backends replay the closure) or waits
+		// behind the account lock — a plain outside scan could read fields
+		// a racing append had not yet committed.
+		err := t.Scan(prefix, func(k, v []byte) error {
 			key := append([]byte(nil), k...)
 			ops = append(ops, Op{Key: key, Delete: true})
 			switch field := k[len(k)-1]; field {
@@ -346,17 +347,15 @@ func (s *Store) DeleteEmailAtomically(
 		}
 		t.Append(ops...)
 
-		// Blob link (reference count -1).
+		// Blob link (reference count -1). A missing link (refs already
+		// zeroed by a crash between commit and cleanup) still deletes the
+		// document: the link invariant is restored by the delete itself.
 		if blobID != "" {
-			linkKey := BlobLinkKey(uint32(accountID), blobID)
-			refs, err := blobRefValue(t.Get, linkKey)
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				return err
-			}
-			if refs > 1 {
-				t.Append(Op{Key: linkKey, Value: beUint64(uint64(refs - 1))})
-			} else {
-				t.Append(Op{Key: linkKey, Delete: true})
+			if err := stageBlobUnlink(t, accountID, blobID); err != nil {
+				if !errors.Is(err, ErrNotFound) {
+					return err
+				}
+				t.Delete(BlobLinkKey(uint32(accountID), blobID))
 			}
 		}
 

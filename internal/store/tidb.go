@@ -76,6 +76,13 @@ func OpenTiDB(dsn, table string) (*TiDBKV, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Bound the pool: an unbounded default lets a traffic burst open
+	// hundreds of concurrent TiDB sessions (each a txn memory footprint
+	// server-side). Sensible fixed limits; callers requiring more can
+	// raise them via the returned *sql.DB accessors if ever exposed.
+	db.SetMaxOpenConns(64)
+	db.SetMaxIdleConns(8)
+	db.SetConnMaxLifetime(30 * time.Minute)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return nil, err
@@ -229,7 +236,7 @@ func (k *TiDBKV) WithTxn(ctx context.Context, fn func(t TxnOps) error) error {
 		if err != nil {
 			return err
 		}
-		t := &tidbTxn{ctx: ctx, tx: tx, getQ: getQ, putQ: putQ, delQ: delQ}
+		t := &tidbTxn{ctx: ctx, tx: tx, table: k.table, getQ: getQ, putQ: putQ, delQ: delQ}
 		if err := fn(t); err != nil {
 			tx.Rollback()
 			return err
@@ -256,6 +263,7 @@ func (k *TiDBKV) WithTxn(ctx context.Context, fn func(t TxnOps) error) error {
 type tidbTxn struct {
 	ctx              context.Context
 	tx               *sql.Tx
+	table            string
 	getQ, putQ, delQ string
 	// err holds the first statement failure; the commit phase consumes it.
 	err error
@@ -289,6 +297,49 @@ func (t *tidbTxn) Append(ops ...Op) {
 			t.exec(t.putQ, o.Key, o.Value)
 		}
 	}
+}
+
+// Scan reads the prefix range inside the SQL transaction: the engine serves
+// read-your-writes natively, and the reads join the transaction read set
+// that commit-time conflict validation checks. Transaction-scope prefixes
+// are bounded (document key ranges), so a single ordered query suffices.
+func (t *tidbTxn) Scan(prefix []byte, fn func(k, v []byte) error) error {
+	if t.err != nil {
+		return t.err
+	}
+	q := fmt.Sprintf("SELECT k, v FROM `%s` WHERE k >= ?", t.table)
+	args := []any{prefix}
+	if len(prefix) > 0 {
+		q += " AND k < ?"
+		args = append(args, prefixEnd(prefix))
+	}
+	q += " ORDER BY k ASC"
+	rows, err := t.tx.QueryContext(t.ctx, q, args...)
+	if err != nil {
+		t.err = err
+		return err
+	}
+	defer rows.Close()
+	type pair struct{ kb, vb []byte }
+	var buf []pair
+	for rows.Next() {
+		var kb, vb []byte
+		if err := rows.Scan(&kb, &vb); err != nil {
+			t.err = err
+			return err
+		}
+		buf = append(buf, pair{kb, vb})
+	}
+	if err := rows.Err(); err != nil {
+		t.err = err
+		return err
+	}
+	for _, p := range buf {
+		if err := fn(p.kb, p.vb); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (t *tidbTxn) exec(q string, args ...any) {
