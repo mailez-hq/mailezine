@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -48,10 +49,22 @@ func Open(path, tikaURL string, logger *slog.Logger) (*Indexer, error) {
 		logger = slog.Default()
 	}
 	idx, err := bleve.Open(path)
-	if err != nil {
-		// Recreate a corrupt index rather than fail startup.
-		m := buildMapping()
-		idx, err = bleve.New(path, m)
+	if err == nil && staleMapping(idx) {
+		// An index built with an older analyzer (standard, no CJK bigrams)
+		// cannot answer the new queries; recreate it from scratch. Delivery
+		// re-indexes incrementally, and `mailezine reindex` backfills the
+		// history in one pass.
+		logger.Info("fts: analyzer changed; recreating index")
+		_ = idx.Close()
+		if rmErr := os.RemoveAll(path); rmErr != nil {
+			return nil, rmErr
+		}
+		idx = nil
+	}
+	if idx == nil || err != nil {
+		// Recreate a corrupt (or analyzer-stale) index rather than fail
+		// startup.
+		idx, err = bleve.New(path, buildMapping())
 		if err != nil {
 			return nil, err
 		}
@@ -62,6 +75,16 @@ func Open(path, tikaURL string, logger *slog.Logger) (*Indexer, error) {
 		tikaURL: tikaURL,
 		hc:      &http.Client{Timeout: 5 * time.Second},
 	}, nil
+}
+
+// staleMapping reports whether the opened index was built with a different
+// default analyzer than the current code expects.
+func staleMapping(idx bleve.Index) bool {
+	im, ok := idx.Mapping().(*mapping.IndexMappingImpl)
+	if !ok {
+		return false
+	}
+	return im.DefaultAnalyzer != CJKAnalyzerName
 }
 
 // Close closes the index.
@@ -80,8 +103,9 @@ func buildMapping() mapping.IndexMapping {
 	dm.AddFieldMappingsAt("account", mb)
 	dm.AddFieldMappingsAt("mailbox", mb)
 	tf := bleve.NewTextFieldMapping()
+	tf.Analyzer = CJKAnalyzerName
 	dm.AddFieldMappingsAt("text", tf)
-	m.DefaultAnalyzer = "standard"
+	m.DefaultAnalyzer = CJKAnalyzerName
 	return m
 }
 
@@ -257,6 +281,20 @@ func (ix *Indexer) SearchText(ctx context.Context, account, mailbox string, term
 			continue
 		}
 		filtered = append(filtered, t)
+		if containsCJK(t) && !singleCJKRune(t) {
+			// CJK input: segment with the query-side twin of the index
+			// analyzer (bigrams only) and require every token, mirroring
+			// IMAP SEARCH AND semantics. Single characters take the prefix
+			// branch below.
+			for _, tok := range analyzeCJKQuery(t) {
+				tq := bleve.NewTermQuery(tok)
+				tq.SetField("text")
+				qs = append(qs, tq)
+			}
+			continue
+		}
+		// Latin words keep word/prefix semantics; a single CJK character
+		// prefixes its bigrams (发* matches 发票).
 		pq := bleve.NewPrefixQuery(t)
 		pq.SetField("text")
 		qs = append(qs, pq)
