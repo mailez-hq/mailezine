@@ -335,7 +335,12 @@ func Load() (Config, error) {
 			Compression: envBool("MAILEZINE_BLOB_COMPRESSION", false),
 		},
 		FTS: FTSConfig{
-			Enabled: envBool("MAILEZINE_FTS_ENABLED", false),
+			// Full-text search defaults ON: indexed search is the expected
+			// baseline (mainstream providers parity) and the pipeline degrades to
+			// a scan whenever the index is unavailable, so the only cost is
+			// index memory/disk. Operators with tight memory budgets can
+			// opt out with MAILEZINE_FTS_ENABLED=false.
+			Enabled: envBool("MAILEZINE_FTS_ENABLED", true),
 			Path:    getenv("MAILEZINE_FTS_PATH", ""),
 			TikaURL: getenv("MAILEZINE_FTS_TIKA_URL", ""),
 		},
