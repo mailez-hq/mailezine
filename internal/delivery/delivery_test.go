@@ -9,12 +9,14 @@ import (
 	"net"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"mailezine/internal/directory"
 	"mailezine/internal/fts"
 	"mailezine/internal/mailstore"
+	"mailezine/internal/notify"
 	"mailezine/internal/sieve"
 	"mailezine/internal/spam"
 	"mailezine/internal/store"
@@ -679,6 +681,72 @@ func TestDeliverFTSIndex(t *testing.T) {
 	}
 }
 
+// recordingNotifier captures delivery receipts for assertions.
+type recordingNotifier struct {
+	mu    sync.Mutex
+	calls []string
+	refs  [][]notify.Delivered
+}
+
+func (r *recordingNotifier) DeliveredAsync(account string, refs []notify.Delivered) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, account)
+	r.refs = append(r.refs, refs)
+}
+
+func (r *recordingNotifier) snapshot() ([]string, [][]notify.Delivered) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...), append([][]notify.Delivered(nil), r.refs...)
+}
+
+// TestDeliverNotifierReceivesReceipts: every stored copy fans out to the
+// notifier with its wire mailbox and UID, so the control plane can raise
+// push/SSE immediately. A sieve fileinto plus the kept INBOX copy yields
+// both refs in one receipt.
+func TestDeliverNotifierReceivesReceipts(t *testing.T) {
+	p, _, _ := newTestPipeline(t, 1<<20)
+	rn := &recordingNotifier{}
+	p.Notifier = rn
+	p.Sieve = sieve.NewEngine(nil)
+	p.ScriptSource = sieve.StaticSource(`require "fileinto";
+if true { fileinto "Junk"; }
+keep;`)
+
+	body := "From: sender@remote.test\r\nTo: alice@example.com\r\nSubject: notify me\r\n\r\nbody\r\n"
+	if err := p.Deliver(context.Background(), nil, "sender@remote.test", []string{"alice@example.com"}, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	calls, refs := rn.snapshot()
+	if len(calls) != 1 || calls[0] != "alice@example.com" {
+		t.Fatalf("receipt calls = %v, want one for alice", calls)
+	}
+	if len(refs) != 1 || len(refs[0]) != 2 {
+		t.Fatalf("refs = %v, want Junk+INBOX in one receipt", refs)
+	}
+	seen := map[string]bool{}
+	for _, ref := range refs[0] {
+		seen[ref.Mailbox] = true
+		if ref.UID == 0 {
+			t.Fatalf("uid missing on %s", ref.Mailbox)
+		}
+	}
+	if !seen["INBOX"] || !seen["Junk"] {
+		t.Fatalf("mailboxes = %v, want INBOX and Junk", seen)
+	}
+}
+
+// TestDeliverNoNotifierNoop: a nil notifier (disabled receipt path) must not
+// affect delivery.
+func TestDeliverNoNotifierNoop(t *testing.T) {
+	p, _, _ := newTestPipeline(t, 1<<20)
+	body := "From: sender@remote.test\r\nTo: alice@example.com\r\nSubject: plain\r\n\r\nbody\r\n"
+	if err := p.Deliver(context.Background(), nil, "sender@remote.test", []string{"alice@example.com"}, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestDeliverVacationPersistentThrottle: the :days throttle survives a
 // fresh pipeline (a restart) because it is stored in the mailstore.
 func TestDeliverVacationPersistentThrottle(t *testing.T) {
@@ -719,3 +787,4 @@ func TestDeliverVacationPersistentThrottle(t *testing.T) {
 		t.Fatalf("vacation replies = %d, want 1 (throttle must survive restart)", replies)
 	}
 }
+

@@ -43,6 +43,7 @@ import (
 	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
 	"mailezine/internal/metrics"
+	"mailezine/internal/notify"
 	"mailezine/internal/pop3"
 	"mailezine/internal/queue"
 	"mailezine/internal/server"
@@ -269,6 +270,12 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		RecipientDelimiter: a.cfg.RecipientDelimiter,
 		Logger:             a.logger,
 		FTS:                a.fts,
+	}
+	if a.cfg.Notify.Enabled {
+		// Delivery receipts: the control plane raises push/webhooks/SSE the
+		// moment mail lands instead of at its poller's next tick.
+		a.pipeline.Notifier = notify.New(a.cfg.Notify.URL, a.logger, a.cfg.StackSecret)
+		a.logger.Info("delivery notify", "url", a.cfg.Notify.URL)
 	}
 	if classifier != nil {
 		// Never assign a typed nil to the interface: an unconfigured

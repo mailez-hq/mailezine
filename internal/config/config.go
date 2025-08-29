@@ -52,6 +52,7 @@ type Config struct {
 	Queue              QueueConfig
 	Limits             limits.Config
 	Features           FeaturesConfig
+	Notify             NotifyConfig
 	// IMAPCacheSizeBytes is the weight budget (bytes) of the IMAP
 	// envelope/body-structure memo.
 	IMAPCacheSizeBytes int64
@@ -233,6 +234,16 @@ type DLPConfig struct {
 	Enabled bool
 	// URL is the control-plane check endpoint; empty derives
 	// http://<BackendAddress>/stack/dlp/check.
+	URL string
+}
+
+// NotifyConfig controls the delivery-receipt client: after a message lands
+// in a local mailbox the engine tells the control plane immediately, so web
+// push/webhooks/SSE fire without waiting for the poller.
+type NotifyConfig struct {
+	Enabled bool
+	// URL is the control-plane receipt endpoint; empty derives
+	// http://<BackendAddress>/stack/notify/delivered.
 	URL string
 }
 
@@ -427,6 +438,13 @@ func Load() (Config, error) {
 	}
 	if cfg.DLP.Enabled && cfg.DLP.URL == "" {
 		cfg.DLP.URL = "http://" + cfg.BackendAddress + "/stack/dlp/check"
+	}
+	cfg.Notify = NotifyConfig{
+		Enabled: envBool("MAILEZINE_DELIVERY_NOTIFY", true),
+		URL:     getenv("MAILEZINE_NOTIFY_URL", ""),
+	}
+	if cfg.Notify.Enabled && cfg.Notify.URL == "" {
+		cfg.Notify.URL = "http://" + cfg.BackendAddress + "/stack/notify/delivered"
 	}
 	cfg.LicenseFile = getenv("MAILEZINE_LICENSE_FILE", "")
 	cfg.LicenseInline = getenv("MAILEZINE_LICENSE", "")

@@ -20,6 +20,7 @@ import (
 	"mailezine/internal/directory"
 	"mailezine/internal/fts"
 	"mailezine/internal/mailstore"
+	"mailezine/internal/notify"
 	"mailezine/internal/sieve"
 	"mailezine/internal/spam"
 )
@@ -63,6 +64,9 @@ type Pipeline struct {
 	// resolves to "user@d" when the full address is unknown ("" disables).
 	RecipientDelimiter string
 	FTS                *fts.Indexer // optional full-text index
+	// Notifier receives per-account delivery receipts so the control plane
+	// can raise push/webhook/SSE immediately (nil disables).
+	Notifier Notifier
 	// Redirect forwards a copy to an external address (sieve redirect);
 	// implementations spool into the outbound queue. When nil, redirects
 	// are logged and skipped (the local copy still applies).
@@ -71,6 +75,11 @@ type Pipeline struct {
 
 	vacationMu   sync.Mutex
 	vacationLast map[string]time.Time // "account\x00sender" -> last auto-reply
+}
+
+// Notifier receives delivery receipts after mail lands in local mailboxes.
+type Notifier interface {
+	DeliveredAsync(account string, refs []notify.Delivered)
 }
 
 // Deliver stores one copy per resolved local target. Aliases expand through
@@ -541,6 +550,7 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 		if err := p.checkQuota(ctx, target, int64(len(finalData))*int64(len(mailboxes))); err != nil {
 			return err
 		}
+		var delivered []notify.Delivered
 		for _, mailbox := range mailboxes {
 			// Sieve scripts are authored with the display spelling ("Inbox/Sub").
 			// Only the exact "INBOX" name is the special mailbox on the wire,
@@ -565,6 +575,12 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 					p.Logger.Warn("delivery: fts index", "account", target, "mailbox", mailbox, "err", err)
 				}
 			}
+			delivered = append(delivered, notify.Delivered{Mailbox: mailbox, UID: uid})
+		}
+		if p.Notifier != nil && len(delivered) > 0 {
+			// Immediate receipt: web push/webhooks/SSE fire now instead of
+			// at the poller's next tick. Fire-and-forget by contract.
+			p.Notifier.DeliveredAsync(target, delivered)
 		}
 		p.reportQuota(ctx, target)
 		p.Logger.Debug("delivered", "to", target, "mailboxes", mailboxes, "bytes", size)
