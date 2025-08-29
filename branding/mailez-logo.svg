@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 160" role="img" aria-label="mailez — mail easy">
+  <defs>
+    <linearGradient id="mzlg-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F8E6C"/>
+      <stop offset="1" stop-color="#2E6E8E"/>
+    </linearGradient>
+    <linearGradient id="mzlg-m" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#E8F5EE"/>
+    </linearGradient>
+    <linearGradient id="mzlg-text" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#2F8E6C"/>
+      <stop offset="1" stop-color="#2E6E8E"/>
+    </linearGradient>
+  </defs>
+  <!-- Icon: envelope-outline EZ tile (same mark as mailez-icon.svg), 512->144. -->
+  <rect x="8" y="8" width="144" height="144" rx="30" fill="url(#mzlg-bg)"/>
+  <!-- Envelope outline: four edges + flap V (solid white strokes). -->
+  <g fill="none" stroke="#FFFFFF" stroke-width="10" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M42 48 H102"/>
+    <path d="M42 48 V96"/>
+    <path d="M102 48 V96"/>
+    <path d="M42 96 H102"/>
+    <path d="M42 48 L72 76 L102 48"/>
+  </g>
+  <!-- E + Z letterforms inside the envelope (brand green). -->
+  <g fill="none" stroke="#2F8E6C" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M52 56 V88"/>
+    <path d="M52 56 H66"/>
+    <path d="M52 72 H62"/>
+    <path d="M52 88 H66"/>
+    <path d="M92 56 H78"/>
+    <path d="M92 56 L78 88"/>
+    <path d="M78 88 H92"/>
+  </g>
+  <!-- postmark dot -->
+  <circle cx="112" cy="62" r="4.5" fill="#FFD98A"/>
+  <!-- paper plane swoosh -->
+  <path d="M121 28 L136 20 L132 34 Z" fill="#FFD98A"/>
+  <path d="M136 20 L132 34 L128 31 Z" fill="#FFC96B"/>
+  <!-- Wordmark: "mail" + "ez" (ez accented with the brand green). -->
+  <text x="178" y="106" font-family="'Inter','SF Pro Display','Segoe UI',system-ui,sans-serif" font-size="96" font-weight="800" letter-spacing="-1.5" fill="#1E293B">mail</text>
+  <text x="346" y="106" font-family="'Inter','SF Pro Display','Segoe UI',system-ui,sans-serif" font-size="96" font-weight="800" letter-spacing="-1.5" fill="url(#mzlg-text)">ez</text>
+  <text x="182" y="136" font-family="'Inter','SF Pro Display','Segoe UI',system-ui,sans-serif" font-size="22" font-weight="600" letter-spacing="10" fill="#8A8578">MAIL EASY</text>
+</svg>

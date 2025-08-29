@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Mailez EZ">
+  <defs>
+    <linearGradient id="mz-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F8E6C"/>
+      <stop offset="1" stop-color="#2E6E8E"/>
+    </linearGradient>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="100" fill="url(#mz-bg)"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M116 170 V350"/>
+    <path d="M116 170 H264"/>
+    <path d="M116 260 H242"/>
+    <path d="M116 350 H264"/>
+    <path d="M396 170 H264"/>
+    <path d="M396 170 L264 350"/>
+    <path d="M264 350 H396"/>
+  </g>
+  <!-- crease at Z's start (top) -->
+  <path d="M264 170 L278 232" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.75"/>
+  <!-- crease at Z's end (bottom-right) -->
+  <path d="M396 350 L382 288" stroke="#FFFFFF" stroke-width="14" stroke-linecap="round" fill="none" opacity="0.75"/>
+</svg>
