@@ -15,8 +15,8 @@ import (
 	"strings"
 	"time"
 
-	"mailezine/internal/mailstore"
 	"mailezine/internal/license"
+	"mailezine/internal/mailstore"
 	"mailezine/internal/queue"
 )
 
