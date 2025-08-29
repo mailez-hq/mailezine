@@ -217,7 +217,7 @@ type FeaturesConfig struct {
 	JMAPEnabled bool
 }
 
-// ArchiveConfig controls the compliance copy capture (enterprise-style 归档).
+// ArchiveConfig controls the compliance copy capture (归档).
 type ArchiveConfig struct {
 	Enabled bool
 	// URL is the control-plane ingest endpoint; empty derives

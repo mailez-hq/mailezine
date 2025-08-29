@@ -114,7 +114,7 @@ func handleFetchAtt(dec *imapwire.Decoder, attName string, options *imap.FetchOp
 		bs := &imap.FetchItemBodySection{}
 		writerOptions.obsolete[bs] = attName
 		options.BodySection = append(options.BodySection, bs)
-	case "RFC822.PEEK": // obsolete, equivalent to BODY.PEEK[], used by mainstream clients
+	case "RFC822.PEEK": // obsolete, equivalent to BODY.PEEK[], still issued by some clients
 		bs := &imap.FetchItemBodySection{Peek: true}
 		writerOptions.obsolete[bs] = attName
 		options.BodySection = append(options.BodySection, bs)
@@ -629,7 +629,7 @@ func writeBodyType1part(enc *imapwire.Encoder, bs *imap.BodyStructureSinglePart,
 	if bs.Encoding == "" {
 		enc.String("7bit")
 	} else {
-		// certain third-party iOS clients chokes on upper-case encodings
+		// some mobile clients reject upper-case encodings
 		enc.String(strings.ToLower(bs.Encoding))
 	}
 	enc.SP().Number(bs.Size)
@@ -665,7 +665,7 @@ func writeBodyTypeMpart(enc *imapwire.Encoder, bs *imap.BodyStructureMultiPart, 
 	}
 	for _, child := range bs.Children {
 		// ABNF for body-type-mpart doesn't have SP between body entries, and
-		// certain third-party iOS clients chokes on SP
+		// some mobile clients reject SP
 		writeBodyStructure(enc, child, extended)
 	}
 

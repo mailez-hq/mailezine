@@ -1,5 +1,5 @@
 // Package archive captures compliance copies of mail passing the SMTP layer
-// (enterprise-style 归档). Captures are written durably into the engine's
+// (归档). Captures are written durably into the engine's
 // KV/blob store first, then a worker forwards them to the control plane;
 // a failed forward is retried with backoff instead of being lost.
 package archive
