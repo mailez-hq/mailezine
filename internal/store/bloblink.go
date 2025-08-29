@@ -18,8 +18,10 @@ func (s *Store) LinkBlob(ctx context.Context, accountID AccountID, blobID string
 	})
 }
 
-// UnlinkBlob decrements the reference counter; at zero the link is removed.
-// Unlinking an absent link is a bug in the caller and returns ErrNotFound.
+// UnlinkBlob decrements the reference counter; at zero the counter is
+// tombstoned for the GC path (mailstore reclaims the blob, then drops the
+// tombstone). Unlinking an absent or already-reclaimed link is a bug in the
+// caller and returns ErrNotFound.
 func (s *Store) UnlinkBlob(ctx context.Context, accountID AccountID, blobID string) error {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
@@ -52,8 +54,18 @@ func stageBlobUnlink(t TxnOps, accountID AccountID, blobID string) error {
 	if err != nil {
 		return err
 	}
+	if refs == 0 {
+		// Zero is the reclaimed tombstone (see below): unlinking it is a
+		// caller bug and stays loud, exactly like an absent link.
+		return ErrNotFound
+	}
 	if refs == 1 {
-		t.Delete(key)
+		// Tombstone the counter at zero instead of deleting the row: the
+		// GC path (deleteEmail) reclaims the blob when BlobRefCount reads
+		// zero, and a deleted row reads ErrNotFound — with t.Delete here
+		// the zero branch was unreachable and every message blob leaked
+		// forever. deleteEmail drops the tombstone after reclaiming.
+		t.Put(key, beUint64(0))
 		return nil
 	}
 	t.Put(key, beUint64(uint64(refs-1)))

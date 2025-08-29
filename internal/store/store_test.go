@@ -200,12 +200,24 @@ func runBlobLinks(t *testing.T, s *Store) {
 	if err := s.UnlinkBlob(ctx, acct, "blob1"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.BlobRefCount(ctx, acct, "blob1"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("expected ErrNotFound at zero refs, got %v", err)
+	// At zero the counter is tombstoned (reads 0), not removed: the GC path
+	// in mailstore reclaims the blob on refs==0 and then drops the tombstone.
+	if n, err := s.BlobRefCount(ctx, acct, "blob1"); err != nil || n != 0 {
+		t.Fatalf("refcount at zero: n=%d err=%v (want tombstoned 0)", n, err)
 	}
-	// Unlinking an absent link is a caller bug and must be loud.
+	// Unlinking an absent link is a caller bug and must be loud; a tombstone
+	// is equally absent (re-link after zero recreates a live counter).
 	if err := s.UnlinkBlob(ctx, acct, "ghost"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("expected ErrNotFound for absent link, got %v", err)
+	}
+	if err := s.UnlinkBlob(ctx, acct, "blob1"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected ErrNotFound for tombstoned link, got %v", err)
+	}
+	if err := s.LinkBlob(ctx, acct, "blob1"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.BlobRefCount(ctx, acct, "blob1"); err != nil || n != 1 {
+		t.Fatalf("re-link after zero: n=%d err=%v", n, err)
 	}
 }
 
