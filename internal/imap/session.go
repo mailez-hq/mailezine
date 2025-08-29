@@ -334,6 +334,20 @@ func (s *session) Idle(w *imapserver.UpdateWriter, stop <-chan struct{}) error {
 	}
 }
 
+// snapshotMsgs returns the message view that sequence numbers must be
+// resolved against: the session snapshot the client has been told about
+// (EXISTS/EXPUNGE notifications), falling back to a fresh listing only
+// before the first snapshot exists. Resolving seqs against the live list
+// while FETCH resolves them against the snapshot let concurrent expunges
+// make STORE/MOVE/EXPUNGE act on the WRONG message: the client's "2" is the
+// snapshot's 2, not the current list's 2.
+func (s *session) snapshotMsgs(ctx context.Context) ([]*mailstore.Message, error) {
+	if s.snap != nil {
+		return s.snap, nil
+	}
+	return s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+}
+
 // refreshSnapshot re-reads the selected mailbox after commands that changed
 // it (STORE/EXPUNGE/MOVE/FETCH-with-\Seen), so Poll does not echo the
 // session's own changes back at it.
@@ -377,16 +391,9 @@ func (s *session) Namespace() (*imap.NamespaceData, error) {
 
 func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error {
 	ctx := context.Background()
-	var uidList []uint32
-	if uids != nil {
-		for _, r := range *uids {
-			for u := r.Start; u <= r.Stop; u++ {
-				uidList = append(uidList, uint32(u))
-			}
-		}
-	}
-	// Sequence numbers must be relative to the selected snapshot.
-	before, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	// Sequence numbers must be relative to the selected snapshot (the
+	// client's view), not the live list.
+	before, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return err
 	}
@@ -394,19 +401,16 @@ func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 	for i, msg := range before {
 		seqOf[msg.UID] = uint32(i) + 1
 	}
+	var uidList []uint32
 	if uids != nil {
 		// RFC 4315 §2.1: UID EXPUNGE removes messages that BOTH carry the
 		// \Deleted flag AND appear in the given set — the set narrows the
-		// candidates, it never bypasses the flag precondition. Filter to
-		// \Deleted here so the store primitive keeps its exact-set contract
-		// (POP3 QUIT depends on it).
-		want := make(map[uint32]bool, len(uidList))
-		for _, u := range uidList {
-			want[u] = true
-		}
-		uidList = uidList[:0]
+		// candidates, it never bypasses the flag precondition. Test set
+		// membership against the UIDs that actually exist instead of
+		// expanding the sequence-set: a client may send arbitrary 32-bit
+		// ranges ("1:4294967295") and expanding those allocates gigabytes.
 		for _, msg := range before {
-			if want[msg.UID] && mailstore.HasFlag(msg.Flags, "\\Deleted") {
+			if uids.Contains(imap.UID(msg.UID)) && mailstore.HasFlag(msg.Flags, "\\Deleted") {
 				uidList = append(uidList, msg.UID)
 			}
 		}
@@ -471,7 +475,8 @@ func (s *session) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string
 	if err != nil {
 		return err
 	}
-	before, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	// Snapshot-based sequence numbers for the EXPUNGE notifications.
+	before, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return err
 	}
@@ -519,9 +524,9 @@ func (s *session) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string
 }
 
 // resolveUIDs converts a seq/UID set into the concrete UIDs of the selected
-// mailbox.
+// mailbox. Sequence numbers resolve against the session snapshot.
 func (s *session) resolveUIDs(ctx context.Context, numSet imap.NumSet) ([]uint32, error) {
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	msgs, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -155,7 +155,10 @@ func newDirectory(cfg config.Config, logger *slog.Logger) (directory.Service, er
 	case "mailez":
 		base := "http://" + cfg.BackendAddress + "/stack/directory"
 		logger.Info("directory", "mode", "mailez", "base", base, "cacheTTL", cfg.Directory.CacheTTL)
-		return directory.NewMailez(base, cfg.Directory.CacheTTL, cfg.MetaCacheSizeBytes), nil
+		// The backend's /stack API requires X-Stack-Secret when
+		// MAILEZ_STACK_SECRET is set; pass ours through like the auth and
+		// archive clients do, or every login fails with 403 once hardened.
+		return directory.NewMailez(base, cfg.Directory.CacheTTL, cfg.MetaCacheSizeBytes, cfg.StackSecret), nil
 	default:
 		return nil, errors.New("config: unknown directory mode " + cfg.Directory.Mode)
 	}

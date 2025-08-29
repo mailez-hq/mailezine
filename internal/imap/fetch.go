@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strconv"
 
@@ -73,6 +74,13 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if needBuf {
 			rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, msg.UID)
 			if err != nil {
+				// The message vanished between the snapshot and this fetch
+				// (concurrent expunge, or a dangling index entry): RFC 3501
+				// §6.4.8 — omit it from the response instead of failing the
+				// whole command and locking the client out of the mailbox.
+				if errors.Is(err, mailstore.ErrNotFound) {
+					continue
+				}
 				return err
 			}
 			buf, err = io.ReadAll(rc)
@@ -85,6 +93,9 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			flags := append([]string(nil), msg.Flags...)
 			flags = append(flags, "\\Seen")
 			if err := s.srv.Store.SetFlags(ctx, s.user, s.mbox, msg.UID, flags); err != nil {
+				if errors.Is(err, mailstore.ErrNotFound) {
+					continue
+				}
 				return err
 			}
 			msg.Flags = flags

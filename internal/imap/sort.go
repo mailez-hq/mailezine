@@ -59,7 +59,8 @@ func (s *session) SortUID(criteria []imapserver.SortCriterion, search *imap.Sear
 
 func (s *session) sortMessages(criteria []imapserver.SortCriterion, search *imap.SearchCriteria, uidMode bool) ([]uint32, error) {
 	ctx := context.Background()
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	// Sequence numbers resolve against the session snapshot (snapshotMsgs).
+	msgs, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return nil, err
 	}

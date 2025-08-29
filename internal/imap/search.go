@@ -17,9 +17,16 @@ import (
 	"mailezine/internal/mailstore"
 )
 
+// errVanished marks a message whose body is no longer readable (deleted
+// under us / dangling index entry): the message is skipped from results
+// instead of failing the whole SEARCH.
+var errVanished = errors.New("imap: message vanished")
+
 func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
 	ctx := context.Background()
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	// Sequence numbers resolve against the session snapshot (snapshotMsgs)
+	// so reported seqs match the client's view.
+	msgs, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -56,6 +63,9 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 			}
 			rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, msg.UID)
 			if err != nil {
+				if errors.Is(err, mailstore.ErrNotFound) {
+					return nil, errVanished
+				}
 				return nil, err
 			}
 			defer rc.Close()
@@ -68,6 +78,9 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 		}
 		ok, err := matchSearch(msg, seq, criteria, maxSeq, maxUID, body)
 		if err != nil {
+			if errors.Is(err, errVanished) {
+				continue
+			}
 			return nil, err
 		}
 		if !ok {

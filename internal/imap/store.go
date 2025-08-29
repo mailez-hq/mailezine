@@ -14,7 +14,10 @@ import (
 
 func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	ctx := context.Background()
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	// Sequence numbers resolve against the session snapshot (see
+	// snapshotMsgs): a concurrent expunge must not redirect this STORE onto
+	// a different message.
+	msgs, err := s.snapshotMsgs(ctx)
 	if err != nil {
 		return err
 	}

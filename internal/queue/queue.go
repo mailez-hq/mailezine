@@ -563,10 +563,18 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		m.event("deferred")
 		m.maybeDelayWarning(ctx, &msg, body.Bytes())
 	}
+	// Commit the terminal state BEFORE reclaiming the blob: a crash between
+	// the two must leave the KV row terminal (a leaked blob is GC-able),
+	// never an active row pointing at a deleted blob — that would spin the
+	// retry loop on a missing body and, once attempts run out, bounce mail
+	// that may already have been delivered.
+	if err := m.save(msg, oldNext); err != nil {
+		return err
+	}
 	if isTerminal(msg.State) {
 		_ = m.blob.Delete(ctx, msg.BlobID)
 	}
-	return m.save(msg, oldNext)
+	return nil
 }
 
 func (m *Manager) deferAll(ctx context.Context, msg *Message, oldNext time.Time, err error, body []byte) error {
@@ -591,10 +599,15 @@ func (m *Manager) deferAll(ctx context.Context, msg *Message, oldNext time.Time,
 		m.event("deferred")
 		m.maybeDelayWarning(ctx, msg, body)
 	}
+	// Same ordering as processMessage: terminal state first, blob reclaim
+	// only after the state is durably committed.
+	if err := m.save(*msg, oldNext); err != nil {
+		return err
+	}
 	if isTerminal(msg.State) {
 		_ = m.blob.Delete(ctx, msg.BlobID)
 	}
-	return m.save(*msg, oldNext)
+	return nil
 }
 
 // maybeBounce invokes the bounce handler once for terminal bounce states.
