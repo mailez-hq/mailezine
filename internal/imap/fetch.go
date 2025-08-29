@@ -225,7 +225,10 @@ func envelopeOf(buf []byte) *imap.Envelope {
 	br := bufio.NewReader(bytes.NewReader(buf))
 	header, err := textproto.ReadHeader(br)
 	if err != nil {
-		return nil
+		// Unparseable headers (e.g. a BOM or garbage in front of the first
+		// key) must degrade to an empty envelope, never a nil one: the
+		// weight/cache/write path below dereferences it unconditionally.
+		return &imap.Envelope{}
 	}
 	return imapserver.ExtractEnvelope(header)
 }

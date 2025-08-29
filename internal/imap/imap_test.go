@@ -382,6 +382,38 @@ func TestIMAPHeaderFieldsFetch(t *testing.T) {
 	}
 }
 
+// TestIMAPEnvelopeUnparseableHeaders: a message whose headers cannot be
+// parsed (e.g. a UTF-8 BOM in front of the first key) must yield an empty
+// envelope instead of panicking the connection. Regression: envelopeOf
+// returned nil on ReadHeader error and envelopeWeight dereferenced it,
+// killing every FETCH ENVELOPE over the mailbox (webmail list + pollers).
+func TestIMAPEnvelopeUnparseableHeaders(t *testing.T) {
+	c, _ := startTestServer(t)
+	// \ufeff before "From" makes textproto reject the key.
+	body := "\xef\xbb\xbfFrom: sender@remote.test\r\nSubject: bom\r\n\r\nhello\r\n"
+	u1 := appendMessage(t, c, "INBOX", body, nil)
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := c.Fetch(imap.UIDSetNum(u1), &imap.FetchOptions{
+		Envelope: true,
+		Flags:    true,
+	}).Collect()
+	if err != nil {
+		t.Fatalf("fetch over unparseable headers: %v", err)
+	}
+	if len(fetched) != 1 {
+		t.Fatalf("fetch: %+v", fetched)
+	}
+	env := fetched[0].Envelope
+	if env == nil {
+		t.Fatal("envelope must be empty, not nil")
+	}
+	if env.Subject != "" || len(env.From) != 0 {
+		t.Fatalf("degraded envelope should be empty: %+v", env)
+	}
+}
+
 // TestIMAPBodyStructureFetch verifies ENVELOPE + extended BODYSTRUCTURE on a
 // cache-miss path. Regression: short-variable shadowing left the outer
 // envelope/structure nil and WriteBodyStructure panicked, dropping the
