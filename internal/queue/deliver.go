@@ -91,12 +91,23 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 		return d.deliverToHost(ctx, from, to, body, d.FixedHost, port, tlsMode, daneRecords)
 	}
 
+	var results []Result
 	groups := map[string][]string{}
 	var domains []string
 	for _, addr := range to {
 		domain, ok := domainOf(addr)
 		if !ok {
-			continue // malformed; reported as missing result by caller
+			// Malformed recipient: resolve permanently right away so it
+			// cannot linger pending in the queue (and eventually vanish
+			// without even a DSN — the address is unparseable for bounces
+			// too, but the sender at least gets the rejection at RCPT time
+			// semantics via the queue result).
+			results = append(results, Result{
+				To:        addr,
+				Permanent: true,
+				Err:       fmt.Errorf("queue: invalid recipient address %q", addr),
+			})
+			continue
 		}
 		if _, seen := groups[domain]; !seen {
 			domains = append(domains, domain)
@@ -104,7 +115,6 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 		groups[domain] = append(groups[domain], addr)
 	}
 
-	var results []Result
 	for _, domain := range domains {
 		host, err := d.mxFor(ctx, domain)
 		if err != nil {

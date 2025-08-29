@@ -459,6 +459,9 @@ func metaNext(get func([]byte) ([]byte, error)) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if len(v) != 8 {
+		return 0, errors.New("store: corrupt account allocator")
+	}
 	return binary.BigEndian.Uint64(v), nil
 }
 

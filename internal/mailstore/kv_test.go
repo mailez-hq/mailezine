@@ -3,6 +3,8 @@ package mailstore
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
 	"testing"
 
 	"mailezine/internal/store"
@@ -60,5 +62,58 @@ func TestKVQuotaEmptyAccount(t *testing.T) {
 	q, err := ms.QuotaUsedBytes(context.Background(), "nobody@example.com")
 	if err != nil || q != 0 {
 		t.Fatalf("quota = %d err=%v, want 0", q, err)
+	}
+}
+
+// Concurrent first deliveries to the same fresh mailbox must resolve to
+// exactly one mailbox document (INV-DELIVERY): the check-create sequence
+// used to span four separate transactions, so racers could fork duplicate
+// mailboxes whose messages then hide from clients.
+func TestConcurrentFirstDeliverSingleMailbox(t *testing.T) {
+	ms, _ := newTestKV(t)
+	ctx := context.Background()
+	const n = 16
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			body := []byte(fmt.Sprintf("From: s@remote.test\r\nSubject: c%d\r\n\r\n%d\r\n", i, i))
+			if _, err := ms.Deliver(ctx, "alice@example.com", "Junk", &Message{From: "s@remote.test", Data: body}); err != nil {
+				errs <- err
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	boxes, err := ms.ListMailboxes(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dupes := 0
+	for _, b := range boxes {
+		if b.Name == "Junk" {
+			dupes++
+		}
+	}
+	if dupes != 1 {
+		t.Fatalf("Junk appears %d times in mailbox list, want exactly 1: %v", dupes, boxes)
+	}
+	msgs, err := ms.ListMessages(ctx, "alice@example.com", "Junk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != n {
+		t.Fatalf("messages in Junk = %d, want %d", len(msgs), n)
+	}
+	// UIDs stay dense and ordered (INV-UID).
+	for i, m := range msgs {
+		if m.UID != uint32(i+1) {
+			t.Fatalf("uid[%d] = %d, want %d", i, m.UID, i+1)
+		}
 	}
 }

@@ -437,3 +437,123 @@ func TestComposeBounceDSN(t *testing.T) {
 }
 
 var clockNow = time.Date(2026, 8, 25, 0, 0, 0, 0, time.UTC)
+
+// A cross-round partial success must reach the delivered terminal state:
+// round 1 resolves some recipients, round 2 the rest. The old "all
+// delivered in one round" counter could never fire again in round 2 and the
+// message idled in deferred forever.
+func TestCrossRoundPartialSuccessTerminates(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	d := &fakeDeliverer{results: map[string]Result{
+		"a@example.com": {To: "a@example.com", OK: true},
+		"b@example.com": {To: "b@example.com", Err: errors.New("451 temp")},
+	}}
+	opts := DefaultOptions()
+	opts.BaseRetry = time.Minute
+	m, _, blob := newTestManager(d, opts, clock)
+	ctx := context.Background()
+
+	if _, err := m.Submit(ctx, "s@example.com", []string{"a@example.com", "b@example.com"}, "hi", strings.NewReader("Subject: hi\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := m.List(ctx)
+	if msgs[0].State != StateDeferred {
+		t.Fatalf("after round 1: %+v", msgs[0])
+	}
+
+	// Round 2: the deferred recipient now succeeds.
+	clock.Advance(2 * time.Hour)
+	d.results["b@example.com"] = Result{To: "b@example.com", OK: true}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = m.List(ctx)
+	if msgs[0].State != StateDelivered {
+		t.Fatalf("cross-round partial success must reach delivered, got %+v", msgs[0])
+	}
+	for _, r := range msgs[0].Recipients {
+		if r.Status != RecipientDelivered {
+			t.Fatalf("recipient not delivered: %+v", r)
+		}
+	}
+	if err := blob.Get(ctx, msgs[0].BlobID, io.Discard); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("body blob not cleaned up: %v", err)
+	}
+}
+
+// A recipient that fails PERMANENTLY in a later round (after others were
+// delivered in round 1) must still produce a bounce DSN instead of leaving
+// the message deferred forever.
+func TestLatePermanentFailureBounces(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	d := &fakeDeliverer{results: map[string]Result{
+		"a@example.com": {To: "a@example.com", OK: true},
+		"b@example.com": {To: "b@example.com", Err: errors.New("451 temp")},
+	}}
+	opts := DefaultOptions()
+	opts.BaseRetry = time.Minute
+	m, _, _ := newTestManager(d, opts, clock)
+	var bounced []BounceFailure
+	m.SetBounceHandler(func(_ context.Context, _ string, _ *Message, _ []byte, failures []BounceFailure) {
+		bounced = append(bounced, failures...)
+	})
+	ctx := context.Background()
+
+	if _, err := m.Submit(ctx, "s@example.com", []string{"a@example.com", "b@example.com"}, "hi", strings.NewReader("Subject: hi\r\n\r\nbody")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	clock.Advance(2 * time.Hour)
+	d.results["b@example.com"] = Result{To: "b@example.com", Permanent: true, Err: errors.New("550 no such user")}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := m.List(ctx)
+	if msgs[0].State != StateBounced {
+		t.Fatalf("late permanent failure must bounce, got %+v", msgs[0])
+	}
+	if len(bounced) != 1 || bounced[0].To != "b@example.com" {
+		t.Fatalf("bounce failures: %+v", bounced)
+	}
+}
+
+// A transient blob read failure defers with backoff; only retry exhaustion
+// terminates the message.
+func TestBlobReadFailureDefers(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	d := &fakeDeliverer{}
+	opts := DefaultOptions()
+	opts.BaseRetry = time.Minute
+	m, kv, blob := newTestManager(d, opts, clock)
+	ctx := context.Background()
+
+	id, err := m.Submit(ctx, "s@example.com", []string{"a@example.com"}, "hi", strings.NewReader("Subject: hi\r\n\r\nbody"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Corrupt the blob reference to make every read fail.
+	msgs, _ := m.List(ctx)
+	if err := blob.Delete(ctx, msgs[0].BlobID); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ = m.List(ctx)
+	if msgs[0].State != StateDeferred || msgs[0].Attempts != 1 {
+		t.Fatalf("blob read failure must defer, got %+v", msgs[0])
+	}
+	if msgs[0].LastError == "" {
+		t.Fatal("last error not recorded")
+	}
+	if d.callsCount() != 0 {
+		t.Fatalf("deliver must not be called without a body: %d", d.callsCount())
+	}
+	_ = kv
+	_ = id
+}

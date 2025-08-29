@@ -100,7 +100,11 @@ func (a *Account) withSidecar(fn func(*sidecarData) error) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	syncDir(dir)
+	return nil
 }
 
 func (m *Mailbox) sidecarUIDNext() (uint32, error) {

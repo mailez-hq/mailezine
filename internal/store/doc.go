@@ -2,9 +2,56 @@ package store
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"sort"
 )
+
+// EnsureMailboxDoc atomically resolves the mailbox document registered under
+// name, creating it (doc counter + meta sentinel + fields + name index) when
+// absent. The whole check-create sequence runs inside one transaction under
+// the account shard lock, so concurrent first deliveries to the same new
+// mailbox cannot fork duplicate documents: in-process callers serialize on
+// the shard lock, and on optimistic backends a conflicting create replays
+// the closure and adopts the winner's index entry (INV-DELIVERY / INV-UID).
+func (s *Store) EnsureMailboxDoc(ctx context.Context, accountID AccountID, name string, fields func(docID uint64) map[byte][]byte) (uint64, error) {
+	unlock := s.lockAccount(accountID)
+	defer unlock()
+
+	idxKey := IndexMailboxNameKey(uint32(accountID), name)
+	counterKey := CounterKey(uint32(accountID), CounterKindNextDoc, []byte{CollectionMailbox})
+	var docID uint64
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		if v, err := t.Get(idxKey); err == nil {
+			if len(v) != 8 {
+				return errors.New("store: corrupt mailbox name index")
+			}
+			docID = binary.BigEndian.Uint64(v)
+			return nil
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		next, err := readCounter(t.Get, counterKey)
+		if err != nil {
+			return err
+		}
+		docID = next + 1
+		ops := []Op{
+			{Key: counterKey, Value: beUint64(docID)},
+			{Key: FieldKey(uint32(accountID), CollectionMailbox, docID, FieldMeta), Value: []byte{1}},
+			{Key: idxKey, Value: beUint64(docID)},
+		}
+		for f, v := range fields(docID) {
+			ops = append(ops, Op{Key: FieldKey(uint32(accountID), CollectionMailbox, docID, f), Value: v})
+		}
+		t.Append(ops...)
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return docID, nil
+}
 
 // CreateDocument allocates the next document ID in a collection and marks the
 // document as existing. IDs are monotonic and never reused (INV-UID).

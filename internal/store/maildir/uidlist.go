@@ -67,7 +67,23 @@ func saveUIDList(dir string, ul *uidList) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmp.Name(), path)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return err
+	}
+	syncDir(dir)
+	return nil
+}
+
+// syncDir flushes a directory entry to disk after rename so a power cut
+// cannot silently undo the rename (crash durability). Best-effort:
+// platforms that cannot fsync directories (Windows) ignore failures.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 // parseUIDList parses the legacy IMAP version-3 format. The first line carries

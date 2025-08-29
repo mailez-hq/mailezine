@@ -85,14 +85,29 @@ func (b *FSBlob) Put(_ context.Context, id string, size int64, r io.Reader) (int
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		_ = os.Remove(tmp.Name())
 		if errors.Is(err, os.ErrExist) {
-			// Lost a race with an identical content-addressed write.
-			if fi, err2 := os.Stat(path); err2 == nil {
-				return fi.Size(), nil
+			// Lost a race with an identical content-addressed write. Report
+			// the declared logical size: quota counts pre-compression bytes
+			// (same as the pre-check above), not the on-disk file size.
+			if _, err2 := os.Stat(path); err2 == nil {
+				return size, nil
 			}
 		}
 		return 0, err
 	}
+	syncDir(b.root)
 	return size, nil
+}
+
+// syncDir flushes a directory entry to disk after rename so a power cut
+// cannot silently undo the rename (crash durability). Best-effort:
+// platforms that cannot fsync directories (Windows) ignore failures.
+func syncDir(dir string) {
+	d, err := os.Open(dir)
+	if err != nil {
+		return
+	}
+	_ = d.Sync()
+	_ = d.Close()
 }
 
 func (b *FSBlob) Get(_ context.Context, id string, w io.Writer) error {

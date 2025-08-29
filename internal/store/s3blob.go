@@ -111,6 +111,12 @@ func (b *S3Blob) Get(ctx context.Context, id string, w io.Writer) error {
 }
 
 func (b *S3Blob) Delete(ctx context.Context, id string) error {
+	// S3 removes are idempotent (missing keys report success), but the Blob
+	// contract returns ErrNotFound for absent ids so callers can distinguish
+	// "deleted" from "already gone" (quota/GC bookkeeping relies on it).
+	if _, err := b.Stat(ctx, id); err != nil {
+		return err
+	}
 	return b.mc.RemoveObject(ctx, b.bucket, id, minio.RemoveObjectOptions{})
 }
 

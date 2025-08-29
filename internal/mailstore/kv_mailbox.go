@@ -386,6 +386,9 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 	}
 	var deleted []uint32
 	for _, e := range emails {
+		// An explicit UID set deletes exactly those messages (the caller —
+		// POP3 QUIT — owns the precondition); the flagless form deletes
+		// everything carrying \Deleted (IMAP EXPUNGE).
 		if len(uidFilter) > 0 {
 			if _, ok := uidFilter[e.UID]; !ok {
 				continue

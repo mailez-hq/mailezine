@@ -393,6 +393,7 @@ func (m *Manager) load(_ context.Context, id uint64) (Message, error) {
 // save persists metadata and keeps the due index consistent with
 // NextAttempt. oldNext is the value before the update (for index moves).
 func (m *Manager) save(msg Message, oldNext time.Time) error {
+	msg.UpdatedAt = m.opts.Now()
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
@@ -424,10 +425,37 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 	}
 	var body bytes.Buffer
 	if err := m.blob.Get(ctx, msg.BlobID, &body); err != nil {
-		msg.State = StateFailed
+		// Blob read failures are storage-transient, not a verdict on the
+		// message: defer with backoff instead of terminating it. Only retry
+		// exhaustion (or a permanently missing blob) bounces — with the DSN
+		// noting the storage failure rather than a delivery verdict.
+		oldNext := msg.NextAttempt
+		err = fmt.Errorf("blob read: %w", err)
+		msg.Attempts++
 		msg.LastError = err.Error()
-		_ = m.save(msg, msg.NextAttempt)
-		return err
+		for i := range msg.Recipients {
+			if msg.Recipients[i].Status == RecipientPending {
+				msg.Recipients[i].LastError = msg.LastError
+			}
+		}
+		if msg.Attempts >= msg.MaxAttempts {
+			for i := range msg.Recipients {
+				if msg.Recipients[i].Status == RecipientPending {
+					msg.Recipients[i].Status = RecipientBounced
+				}
+			}
+			msg.State = StateBounced
+			m.event("bounced")
+			m.maybeBounce(ctx, &msg, nil)
+		} else {
+			msg.State = StateDeferred
+			msg.NextAttempt = m.opts.Now().Add(backoff(m.opts, msg.Attempts))
+			m.event("deferred")
+		}
+		if isTerminal(msg.State) {
+			_ = m.blob.Delete(ctx, msg.BlobID)
+		}
+		return m.save(msg, oldNext)
 	}
 
 	var pending []string
@@ -459,7 +487,7 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		byAddr[res.To] = res
 	}
 
-	delivered, bounced := 0, 0
+	bounced := 0
 	for i := range msg.Recipients {
 		r := &msg.Recipients[i]
 		if r.Status != RecipientPending {
@@ -471,7 +499,6 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		}
 		if res.OK {
 			r.Status = RecipientDelivered
-			delivered++
 			continue
 		}
 		r.LastError = resultError(res)
@@ -481,12 +508,23 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		}
 	}
 
+	// Terminal state is decided by "no recipient remains pending", not by
+	// this round's counts: a cross-round partial success (round 1 resolved
+	// some recipients, round 2 the rest) must still terminate — and a
+	// recipient that fails PERMANENTLY in a later round must still get its
+	// bounce DSN instead of the message idling in deferred forever.
+	pendingLeft := 0
+	for i := range msg.Recipients {
+		if msg.Recipients[i].Status == RecipientPending {
+			pendingLeft++
+		}
+	}
 	switch {
-	case len(msg.Recipients) == delivered:
+	case pendingLeft == 0 && bounced == 0:
 		msg.State = StateDelivered
 		msg.LastError = ""
 		m.event("delivered")
-	case delivered+bounced == len(msg.Recipients):
+	case pendingLeft == 0:
 		msg.State = StateBounced
 		m.event("bounced")
 		m.maybeBounce(ctx, &msg, body.Bytes())

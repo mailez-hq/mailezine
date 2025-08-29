@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -315,15 +316,19 @@ func (m *Mailbox) Move(uid uint32, dst *Mailbox) error {
 		return err
 	}
 
+	// Remove the source file BEFORE dropping its uidlist entry: a crash in
+	// between leaves a stale entry (reconcile marks it stale and cleans up)
+	// rather than an entry-less file that would be re-assigned a fresh UID
+	// and resurrect as a duplicate copy in the source mailbox.
+	if err := os.Remove(filepath.Join(m.dir, msg.Subdir, msg.Filename)); err != nil {
+		return err
+	}
 	ul, err := loadUIDList(m.dir)
 	if err != nil {
 		return err
 	}
 	delete(ul.entries, uid)
-	if err := saveUIDList(m.dir, ul); err != nil {
-		return err
-	}
-	return os.Remove(filepath.Join(m.dir, msg.Subdir, msg.Filename))
+	return saveUIDList(m.dir, ul)
 }
 
 // UnseenCount returns the number of messages without \Seen.
@@ -489,7 +494,17 @@ func (m *Mailbox) scanLocked() ([]Message, error) {
 		// Unreadable/corrupt uidlist: rebuild from files with fresh validity.
 		ul = &uidList{validity: uint32(time.Now().Unix()), entries: map[uint32]string{}}
 	}
+	// Reconcile allocation starts from the same three-source floor as
+	// nextUIDLocked (max uid, persisted N field, sidecar uidnext): reusing a
+	// deleted UID here would break IMAP caches exactly like it would on the
+	// append path (INV-UID).
 	next := maxUID(ul) + 1
+	if ul.next > next {
+		next = ul.next
+	}
+	if saved, err := m.sidecarUIDNext(); err == nil && saved > next {
+		next = saved
+	}
 	dirty := false
 
 	var msgs []Message
@@ -501,15 +516,48 @@ func (m *Mailbox) scanLocked() ([]Message, error) {
 		}
 		msgs = append(msgs, messageFromFile(uid, info))
 	}
+	// Base-name index of surviving entries: a crash between a flag rename
+	// and the uidlist rewrite leaves the file under a new name while the
+	// entry still points at the old one — match by base name to keep the UID
+	// instead of assigning a fresh one.
+	baseOf := func(name string) string {
+		if i := strings.LastIndexByte(name, '/'); i >= 0 {
+			name = name[i+1:]
+		}
+		base, _ := SplitInfo(name)
+		return base
+	}
+	byBase := map[string]uint32{}
+	for uid, rel := range ul.entries {
+		if _, ok := files[rel]; ok {
+			byBase[baseOf(rel)] = uid
+		}
+	}
+	var fresh []string
 	for rel, info := range files {
 		if hasEntry(ul, rel) {
 			continue
 		}
+		if uid, ok := byBase[baseOf(rel)]; ok {
+			// Renamed twin of a known entry (SetFlags crash window): adopt
+			// the file under the original UID.
+			ul.entries[uid] = rel
+			dirty = true
+			msgs = append(msgs, messageFromFile(uid, info))
+			continue
+		}
+		fresh = append(fresh, rel)
+	}
+	// Assign UIDs in filename order (maildir names are timestamp-prefixed,
+	// so this approximates arrival order — RFC 3501 requires ascending UIDs
+	// by arrival; Go map iteration would make it random).
+	sort.Strings(fresh)
+	for _, rel := range fresh {
 		uid := next
 		next++
 		ul.entries[uid] = rel
 		dirty = true
-		msgs = append(msgs, messageFromFile(uid, info))
+		msgs = append(msgs, messageFromFile(uid, files[rel]))
 	}
 	if dirty {
 		if err := saveUIDList(m.dir, ul); err != nil {

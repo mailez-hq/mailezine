@@ -119,37 +119,39 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 
 func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
-	if errors.Is(err, store.ErrNotFound) {
-		return k.s.CreateAccount(ctx, account)
+	if err == nil {
+		return acctID, nil
+	}
+	if !errors.Is(err, store.ErrNotFound) {
+		return 0, err
+	}
+	acctID, err = k.s.CreateAccount(ctx, account)
+	if errors.Is(err, store.ErrExists) {
+		// Lost a concurrent create: adopt the winner's registration instead
+		// of surfacing a spurious temporary failure.
+		return k.s.AccountByEmail(ctx, account)
 	}
 	return acctID, err
 }
 
 // ensureMailbox returns the mailbox document ID, creating the mailbox (and
 // its UID counter) on first use. INBOX is created eagerly so delivery and
-// IMAP always see it.
+// IMAP always see it. Creation is a single atomic check-create transaction:
+// concurrent first deliveries to the same new mailbox resolve to exactly one
+// document (the loser adopts the winner via conflict replay).
 func (k *KV) ensureMailbox(ctx context.Context, acctID store.AccountID, mailbox string) (uint64, error) {
 	if id, err := k.mailboxDocID(ctx, acctID, mailbox); err == nil {
 		return id, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return 0, err
 	}
-	docID, err := k.s.CreateDocument(ctx, acctID, store.CollectionMailbox)
-	if err != nil {
-		return 0, err
-	}
-	fields := map[byte][]byte{
-		mbFieldName:        []byte(mailbox),
-		mbFieldUIDValidity: beUint32(uint32(docID)),
-		mbFieldSubscribed:  []byte{0},
-	}
-	if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionMailbox, docID, fields); err != nil {
-		return 0, err
-	}
-	if err := k.s.PutRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox), beUint64(docID)); err != nil {
-		return 0, err
-	}
-	return docID, nil
+	return k.s.EnsureMailboxDoc(ctx, acctID, mailbox, func(docID uint64) map[byte][]byte {
+		return map[byte][]byte{
+			mbFieldName:        []byte(mailbox),
+			mbFieldUIDValidity: beUint32(uint32(docID)),
+			mbFieldSubscribed:  []byte{0},
+		}
+	})
 }
 
 // mailboxDocID resolves a mailbox name to its document ID. The primary path

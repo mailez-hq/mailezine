@@ -114,7 +114,10 @@ type Client struct {
 
 const (
 	maxReplyLine = 8192
-	maxEHLOArgs  = 64
+	// maxReplyLines caps folded multiline replies against unbounded
+	// continuation from hostile servers.
+	maxReplyLines = 128
+	maxEHLOArgs   = 64
 )
 
 // Dial connects to addr and returns a Client before any SMTP commands are
@@ -405,9 +408,14 @@ func (c *Client) writef(format string, args ...any) error {
 }
 
 // readReply reads one SMTP reply, folding multiline responses into lines.
+// Continuation lines are capped so a hostile server cannot exhaust memory
+// with an endless "-" reply.
 func (c *Client) readReply() ([]string, int, error) {
 	var lines []string
 	for {
+		if len(lines) >= maxReplyLines {
+			return nil, 0, fmt.Errorf("mailsmtp: reply exceeds %d continuation lines", maxReplyLines)
+		}
 		line, err := readLine(c.br)
 		if err != nil {
 			return nil, 0, err
