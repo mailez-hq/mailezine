@@ -22,10 +22,18 @@ import (
 // signature; the compliance seam wraps it per edition.
 type submitHandler = func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error
 
+// submitSigner signs locally delivered submissions (best effort). A nil
+// implementation means "no DKIM vault configured; deliver unsigned".
+type submitSigner interface {
+	Sign(ctx context.Context, from string, msg []byte) ([]byte, error)
+}
+
 // newSubmit routes envelope recipients: local addresses go through the
 // delivery pipeline; external addresses are spooled for relay when the
-// outbound queue is enabled.
-func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Manager, logger *slog.Logger) submitHandler {
+// outbound queue is enabled. Locally delivered submissions are DKIM-signed
+// too — the message originates from our domain, so the stored copy carries
+// the same signature an external relay would get.
+func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Manager, signer submitSigner, logger *slog.Logger) submitHandler {
 	return func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error {
 		// Outbound mail never carries internal Received chains or client
 		// fingerprints collected on the way in. The filter streams so large
@@ -50,6 +58,15 @@ func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Man
 			raw, err := clean.ReadAll()
 			if err != nil {
 				return err
+			}
+			if signer != nil {
+				if signed, serr := signer.Sign(ctx, from, raw); serr == nil {
+					raw = signed
+				} else {
+					// Signing is best effort (opportunisticSigner already
+					// degrades vault outages); never block local delivery.
+					logger.Warn("smtp: local sign skipped", "from", from, "err", serr)
+				}
 			}
 			if err := pipeline.Deliver(ctx, peer, from, local, raw); err != nil {
 				return err

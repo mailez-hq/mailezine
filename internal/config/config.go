@@ -608,11 +608,19 @@ func (c Config) Summary() string {
 	if c.License.IsEnterprise() {
 		lic = fmt.Sprintf("enterprise(max=%d)", c.License.MaxMailboxes)
 	}
+	// Anti-spam tier actually in effect: rspamd (enterprise high tier),
+	// basic (built-in Authentication-Results + DNSBL classifier) or off.
+	junk := "off"
+	if c.Rspamd.URL != "" {
+		junk = "rspamd"
+	} else if c.Junk.Enabled {
+		junk = "basic"
+	}
 	return fmt.Sprintf(
-		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v rspamd=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%v jmap=%v maxMsg=%d",
-		c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Rspamd.URL != "", c.Outbound.Enabled,
+		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%s jmap=%v maxMsg=%d",
+		c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Outbound.Enabled,
 		lic, c.HealthAddr, c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
-		c.Features.POP3Enabled, c.Features.JunkEnabled, c.Features.JMAPEnabled,
+		c.Features.POP3Enabled, junk, c.Features.JMAPEnabled,
 		c.Limits.MaxMessageSize,
 	)
 }

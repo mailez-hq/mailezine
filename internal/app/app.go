@@ -32,6 +32,7 @@ import (
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
+	"mailezine/internal/dkim"
 	"mailezine/internal/fts"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
@@ -358,7 +359,13 @@ func (a *App) wireServers() error {
 		return err
 	}
 	a.tlsConf = tlsConf
-	submit := newSubmit(a.dir, a.pipeline, a.qm, a.logger)
+	// Locally delivered submissions get DKIM-signed as well when a vault is
+	// configured; without one (plain dev tier) they deliver unsigned.
+	var submitSign submitSigner
+	if a.cfg.DKIMVaultURL != "" {
+		submitSign = opportunisticSigner{dkim.NewSigner(a.cfg.DKIMVaultURL, a.logger, a.cfg.StackSecret), a.logger}
+	}
+	submit := newSubmit(a.dir, a.pipeline, a.qm, submitSign, a.logger)
 	submitInbound := submit
 	submitOutbound := submit
 	if a.arch != nil {
