@@ -35,6 +35,7 @@ import (
 	"mailezine/internal/fts"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
+	"mailezine/internal/junk"
 	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
@@ -288,7 +289,21 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 	}
 	var classifier spamClassifier
 	if a.cfg.Rspamd.URL != "" {
+		// Enterprise tier: the rspamd client re-scans the whole message and
+		// takes precedence over the community baseline.
 		classifier = newSpamClassifier(a.cfg, a.logger)
+	} else if a.cfg.Junk.Enabled {
+		// Community baseline: score the verifier's authentication results
+		// plus DNSBL hits and sender lists. Lenient by design — flag more,
+		// reject only on hard signals.
+		classifier = junk.New(newSystemResolver(), junk.Config{
+			HeaderScore: a.cfg.Junk.HeaderScore,
+			RejectScore: a.cfg.Junk.RejectScore,
+			RBLs:        a.cfg.Junk.RBLs,
+			Whitelist:   a.cfg.Junk.Whitelist,
+			Blacklist:   a.cfg.Junk.Blacklist,
+			Greylist:    a.cfg.Junk.Greylist,
+		}, a.logger)
 	}
 	a.classifier = classifier
 	a.sieveEngine = sieve.NewEngine(a.logger)

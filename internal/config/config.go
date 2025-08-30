@@ -45,6 +45,7 @@ type Config struct {
 	RecipientDelimiter string
 	TrustedNets        []string // CIDRs that are authenticated by the gateway
 	Rspamd             RspamdConfig
+	Junk               JunkConfig
 	DKIMVaultURL       string
 	Outbound           OutboundConfig
 	TLS                TLSConfig
@@ -177,6 +178,28 @@ type RspamdConfig struct {
 	Password string
 }
 
+// JunkConfig configures the community baseline spam classifier (optional;
+// the enterprise rspamd client takes precedence when configured).
+type JunkConfig struct {
+	// Enabled turns the baseline classifier on. Default true in community
+	// builds without rspamd; harmless in enterprise builds that configure
+	// rspamd (the rspamd client wins).
+	Enabled bool
+	// RejectScore / HeaderScore: scores at or above which messages are
+	// rejected / flagged. Defaults 12 / 4.5 — deliberately lenient.
+	RejectScore float64
+	HeaderScore float64
+	// RBLs lists DNSBL zones queried with the reversed peer IP. Empty
+	// disables DNSBL checks.
+	RBLs []string
+	// Whitelist / Blacklist hold full addresses or bare domains.
+	Whitelist []string
+	Blacklist []string
+	// Greylist greylists first-seen senders scoring in the ambiguous
+	// band. Default false.
+	Greylist bool
+}
+
 // OutboundConfig controls relay submission to the queue.
 type OutboundConfig struct {
 	Enabled bool
@@ -298,6 +321,17 @@ func Load() (Config, error) {
 		}
 		return n
 	}
+	envFloat := func(key string, def float64) float64 {
+		v := getenv(key, "")
+		if v == "" {
+			return def
+		}
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return def
+		}
+		return f
+	}
 	envInt64 := func(key string, def int64) int64 {
 		v := getenv(key, "")
 		if v == "" {
@@ -393,6 +427,18 @@ func Load() (Config, error) {
 			URL:      getenv("MAILEZINE_RSPAMD_URL", ""),
 			LearnURL: getenv("MAILEZINE_RSPAMD_LEARN_URL", ""),
 			Password: getenv("MAILEZINE_RSPAMD_PASSWORD", ""),
+		},
+		Junk: JunkConfig{
+			// Enabled by default: the community baseline classifier is
+			// harmless where rspamd is configured (rspamd wins the wiring)
+			// and is the only anti-spam tier otherwise.
+			Enabled:     envBool("MAILEZINE_JUNK_ENABLED", true),
+			HeaderScore: envFloat("MAILEZINE_JUNK_HEADER_SCORE", 0),
+			RejectScore: envFloat("MAILEZINE_JUNK_REJECT_SCORE", 0),
+			RBLs:        splitCSV(getenv("MAILEZINE_JUNK_RBLS", "bl.spamcop.net")),
+			Whitelist:   splitCSV(getenv("MAILEZINE_JUNK_WHITELIST", "")),
+			Blacklist:   splitCSV(getenv("MAILEZINE_JUNK_BLACKLIST", "")),
+			Greylist:    envBool("MAILEZINE_JUNK_GREYLIST", false),
 		},
 		DKIMVaultURL: getenv("MAILEZINE_DKIM_VAULT_URL", ""),
 		Outbound: OutboundConfig{

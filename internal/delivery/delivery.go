@@ -61,6 +61,15 @@ type Classifier interface {
 	Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (Result, error)
 }
 
+// authResultsClassifier is implemented by classifiers that can reuse the
+// verifier's Authentication-Results header instead of re-running
+// SPF/DKIM/DMARC themselves (the junk baseline classifier does; the rspamd
+// client re-scans the whole message and does not).
+type authResultsClassifier interface {
+	Classifier
+	ClassifyAuthResults(ctx context.Context, authResults string, peer net.IP, from string, to []string, data []byte) (Result, error)
+}
+
 // Pipeline resolves and stores inbound messages.
 type Pipeline struct {
 	Directory    directory.Service
@@ -110,15 +119,23 @@ func (p *Pipeline) Deliver(ctx context.Context, peer net.IP, from string, to []s
 		headers = append(headers, fmt.Sprintf("Message-ID: <%s.%s@%s>",
 			time.Now().Format("20060102150405"), newMessageID(), host))
 	}
+	var authResults string
 	if p.Verifier != nil {
 		if header, err := p.Verifier.Verify(ctx, peer, from, data); err != nil {
 			p.Logger.Warn("delivery: verify", "from", from, "err", err)
 		} else if header != "" {
 			headers = append(headers, header)
+			authResults = header
 		}
 	}
 	if !classifierNil(p.Classifier) {
-		res, err := p.Classifier.Classify(ctx, peer, from, to, data)
+		var res Result
+		var err error
+		if ac, ok := p.Classifier.(authResultsClassifier); ok {
+			res, err = ac.ClassifyAuthResults(ctx, authResults, peer, from, to, data)
+		} else {
+			res, err = p.Classifier.Classify(ctx, peer, from, to, data)
+		}
 		if err != nil {
 			// Fail-open (decision D5): an unreachable classifier must not
 			// stop mail. The missing mark is visible in metrics.
