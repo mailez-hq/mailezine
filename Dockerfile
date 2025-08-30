@@ -13,8 +13,13 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
+# MAILEZ_EDITION=ee compiles the enterprise features (TiDB KV, S3 blobs,
+# rspamd client, HA, compliance archive) via the mailez_ee build tag; the
+# default community build excludes internal/ee entirely.
+ARG MAILEZ_EDITION=ce
 ARG VERSION=dev
-RUN go build -trimpath -ldflags="-s -w -X mailezine/internal/version.Version=${VERSION}" -o /out/mailezine ./cmd/mailezine
+RUN [ "$MAILEZ_EDITION" = "ee" ] && TAGS="-tags mailez_ee" || TAGS=""; \
+    go build -trimpath $TAGS -ldflags="-s -w -X mailezine/internal/version.Version=${VERSION}" -o /out/mailezine ./cmd/mailezine
 
 FROM alpine:3.21
 
