@@ -312,6 +312,7 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		Directory:          a.dir,
 		Store:              a.st.mailbox,
 		Verifier:           verifier,
+		Classifier:         classifier,
 		Sieve:              a.sieveEngine,
 		ScriptSource:       sieve.DefaultScriptSource{Store: a.st.mailbox, Directory: a.dir},
 		Hostname:           a.cfg.Hostname,
