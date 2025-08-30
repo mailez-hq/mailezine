@@ -281,12 +281,32 @@ func decodeBase64(s string) (string, error) {
 	return string(b), err
 }
 
+// maxLineLen caps a single POP3 protocol line. Legitimate lines (commands,
+// base64 AUTH payloads, APOP digests) stay well under 1KB; anything beyond
+// this is a broken client or an abuse attempt, and the unbounded
+// ReadString below would otherwise let a peer OOM the engine.
+const maxLineLen = 8192
+
 func (s *session) readLine() (string, error) {
-	line, err := s.r.ReadString('\n')
-	if err != nil {
-		return "", err
+	var sb strings.Builder
+	for {
+		chunk, err := s.r.ReadSlice('\n')
+		sb.Write(chunk)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			if sb.Len() > maxLineLen {
+				return "", errors.New("pop3: line too long")
+			}
+			continue // line spans the reader's buffer, keep reading
+		}
+		if err != nil {
+			return "", err
+		}
+		break
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	if sb.Len() > maxLineLen {
+		return "", errors.New("pop3: line too long")
+	}
+	return strings.TrimRight(sb.String(), "\r\n"), nil
 }
 
 func (s *session) stats() (count int, size int64) {

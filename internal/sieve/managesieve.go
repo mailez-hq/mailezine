@@ -68,9 +68,43 @@ type mSession struct {
 	tlsUp  bool
 }
 
+// maxLineLen caps a single ManageSieve protocol line; commands and AUTH
+// payloads stay well under 1KB. Without it ReadString('\n') accumulates
+// without bound and a peer can OOM the engine before authenticating.
+const maxLineLen = 8192
+
+// maxScriptLen caps a PUTSCRIPT/CHECKSCRIPT literal. Real sieve scripts
+// are a few KB; a multi-MB spec is abuse whose make([]byte, n) would pin
+// memory for the connection lifetime.
+const maxScriptLen = 1 << 20
+
+// readLine reads one CRLF-terminated line, rejecting lines longer than
+// maxLineLen (connection is torn down by the caller on error).
+func readLine(r *bufio.Reader) (string, error) {
+	var sb strings.Builder
+	for {
+		chunk, err := r.ReadSlice('\n')
+		sb.Write(chunk)
+		if errors.Is(err, bufio.ErrBufferFull) {
+			if sb.Len() > maxLineLen {
+				return "", errors.New("managesieve: line too long")
+			}
+			continue
+		}
+		if err != nil {
+			return "", err
+		}
+		break
+	}
+	if sb.Len() > maxLineLen {
+		return "", errors.New("managesieve: line too long")
+	}
+	return strings.TrimRight(sb.String(), "\r\n"), nil
+}
+
 func (s *mSession) loop(ctx context.Context) error {
 	for {
-		line, err := s.r.ReadString('\n')
+		line, err := readLine(s.r)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -256,11 +290,14 @@ func (s *mSession) handlePutScript(ctx context.Context, fields []string) error {
 	if err != nil || n < 0 {
 		return s.status("NO", "invalid literal size")
 	}
+	if n > maxScriptLen {
+		return s.status("NO", "literal too large")
+	}
 	content := make([]byte, n)
 	if _, err := io.ReadFull(s.r, content); err != nil {
 		return err
 	}
-	if _, err := s.r.ReadString('\n'); err != nil {
+	if _, err := readLine(s.r); err != nil {
 		return err
 	}
 	// RFC 5804 §2.6: reject scripts that do not compile instead of
@@ -293,11 +330,14 @@ func (s *mSession) handleCheckScript(fields []string) error {
 	if err != nil || n < 0 {
 		return s.status("NO", "invalid literal size")
 	}
+	if n > maxScriptLen {
+		return s.status("NO", "literal too large")
+	}
 	content := make([]byte, n)
 	if _, err := io.ReadFull(s.r, content); err != nil {
 		return err
 	}
-	if _, err := s.r.ReadString('\n'); err != nil {
+	if _, err := readLine(s.r); err != nil {
 		return err
 	}
 	if err := s.srv.Engine.Check(string(content)); err != nil {
