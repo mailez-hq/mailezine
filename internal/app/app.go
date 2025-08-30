@@ -467,7 +467,7 @@ func listenerPort(addr string) string {
 
 // serveHealth binds the health/readiness/metrics endpoint. It runs in every
 // lifecycle state: a standby answers probes too, reporting its role, so an
-// orchestrator no longer mistakes "waiting for the lease" for a dead pod.
+// orchestrator does not mistake "waiting for the lease" for a dead pod.
 func (a *App) serveHealth(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {

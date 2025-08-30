@@ -120,7 +120,7 @@ func TestKVQuotaEmptyAccount(t *testing.T) {
 
 // Concurrent first deliveries to the same fresh mailbox must resolve to
 // exactly one mailbox document (INV-DELIVERY): the check-create sequence
-// used to span four separate transactions, so racers could fork duplicate
+// must resolve in a single transaction, otherwise racers fork duplicate
 // mailboxes whose messages then hide from clients.
 func TestConcurrentFirstDeliverSingleMailbox(t *testing.T) {
 	ms, _ := newTestKV(t)

@@ -98,8 +98,7 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 
 	// EXAMINE write guard: appending into the currently examined mailbox is
 	// rejected. The literal is drained first so the wire stays in sync
-	// before the NO goes out (other mailboxes stay appendable — the
-	// selection does not lock the account out of writes elsewhere).
+	// before the NO goes out; other mailboxes stay appendable.
 	examined := c.state == imap.ConnStateSelected && c.readOnly && strings.EqualFold(mailbox, c.mbox)
 
 	var data *imap.AppendData
