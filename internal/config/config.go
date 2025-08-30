@@ -50,6 +50,10 @@ type Config struct {
 	Outbound           OutboundConfig
 	TLS                TLSConfig
 	ProxyProtocol      []string // listener ports expecting a PROXY v1 header
+	// ProxyTrusted are the CIDRs whose connections may carry the PROXY v1
+	// header; headers from other peers are rejected (client-IP forgery
+	// guard). Defaults to loopback and private ranges.
+	ProxyTrusted []string
 	Queue              QueueConfig
 	Limits             limits.Config
 	Features           FeaturesConfig
@@ -455,6 +459,7 @@ func Load() (Config, error) {
 			KeyFile:  getenv("MAILEZINE_TLS_KEY_FILE", ""),
 		},
 		ProxyProtocol: splitCSV(getenv("MAILEZINE_PROXY_PROTOCOL", "")),
+		ProxyTrusted:  splitCSV(getenv("MAILEZINE_PROXY_TRUSTED", "127.0.0.1/8,::1/128,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fe80::/10,fc00::/7")),
 		Queue: QueueConfig{
 			MaxAttempts:  envInt("MAILEZINE_QUEUE_MAX_ATTEMPTS", 10),
 			BaseRetry:    time.Duration(envInt("MAILEZINE_QUEUE_BASE_RETRY_SECONDS", 60)) * time.Second,
@@ -581,6 +586,11 @@ func (c Config) Validate() error {
 	for _, cidr := range c.TrustedNets {
 		if _, _, err := net.ParseCIDR(cidr); err != nil {
 			return fmt.Errorf("config: trusted net %q is not a valid CIDR: %v", cidr, err)
+		}
+	}
+	for _, cidr := range c.ProxyTrusted {
+		if _, _, err := net.ParseCIDR(cidr); err != nil {
+			return fmt.Errorf("config: proxy trusted net %q is not a valid CIDR: %v", cidr, err)
 		}
 	}
 	if c.Rspamd.URL != "" && !strings.HasPrefix(c.Rspamd.URL, "http://") && !strings.HasPrefix(c.Rspamd.URL, "https://") {

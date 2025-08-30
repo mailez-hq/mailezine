@@ -455,7 +455,7 @@ func TestSMTPProxyProtocolPeerIP(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = ln.Close() })
-	go func() { _ = srv.Serve(server.NewProxyListener(ln, nil)) }()
+	go func() { _ = srv.Serve(server.NewProxyListener(ln, nil, nil)) }()
 
 	conn, err := net.Dial("tcp", ln.Addr().String())
 	if err != nil {

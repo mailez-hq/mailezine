@@ -17,7 +17,8 @@ import (
 // serveSMTP binds addr and serves; the server is drained in the shutdown
 // phase via Shutdown. A non-nil tlsConf turns the listener into implicit
 // TLS (RFC 8314 submissions port), negotiated before the first SMTP byte.
-func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int, proxy bool, tlsConf *tls.Config, logger *slog.Logger) error {
+// proxyTrusted gates which peers may carry the PROXY v1 header.
+func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int, proxy bool, proxyTrusted []*net.IPNet, tlsConf *tls.Config, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -25,7 +26,7 @@ func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int
 	logger.Info("listening", "component", "smtp", "addr", ln.Addr().String())
 	var lim net.Listener = server.NewLimitListener(ln, maxConn)
 	if proxy {
-		lim = server.NewProxyListener(lim, logger)
+		lim = server.NewProxyListener(lim, logger, proxyTrusted)
 	}
 	if tlsConf != nil {
 		lim = tls.NewListener(lim, tlsConf)
@@ -47,7 +48,8 @@ type tcpServer interface {
 
 // serveTCP binds addr and serves a tcpServer (LimitListener backpressure).
 // A non-nil tlsConf turns the listener into implicit TLS (imaps port).
-func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int, proxy bool, tlsConf *tls.Config, logger *slog.Logger) error {
+// proxyTrusted gates which peers may carry the PROXY v1 header.
+func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int, proxy bool, proxyTrusted []*net.IPNet, tlsConf *tls.Config, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -55,7 +57,7 @@ func serveTCP(ctx context.Context, srv tcpServer, name, addr string, maxConn int
 	logger.Info("listening", "component", name, "addr", ln.Addr().String())
 	var lim net.Listener = server.NewLimitListener(ln, maxConn)
 	if proxy {
-		lim = server.NewProxyListener(lim, logger)
+		lim = server.NewProxyListener(lim, logger, proxyTrusted)
 	}
 	if tlsConf != nil {
 		lim = tls.NewListener(lim, tlsConf)

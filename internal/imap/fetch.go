@@ -38,6 +38,11 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			break
 		}
 	}
+	// EXAMINE semantics: reading a body section from an examined mailbox
+	// must not set \Seen (the implicit flag change would be a write).
+	if s.readOnly {
+		markSeen = false
+	}
 	maxSeq := uint32(len(msgs))
 	maxUID := maxSeq
 	if maxSeq > 0 {

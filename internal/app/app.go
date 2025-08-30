@@ -529,34 +529,38 @@ func (a *App) serveManagement(ctx context.Context) error {
 func (a *App) serveMailListeners(ctx context.Context) error {
 	cfg := a.cfg
 	lim := cfg.Limits
+	proxyTrusted, err := parseNets(cfg.ProxyTrusted)
+	if err != nil {
+		return fmt.Errorf("proxy trusted nets: %w", err)
+	}
 	if cfg.Listeners.SMTP != "" {
 		if err := serveSMTP(ctx, a.smtpInbound, cfg.Listeners.SMTP, lim.MaxConnections,
-			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTP), nil, a.logger); err != nil {
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTP), proxyTrusted, nil, a.logger); err != nil {
 			return fmt.Errorf("smtp: %w", err)
 		}
 	}
 	if cfg.Listeners.Submission != "" {
 		if err := serveSMTP(ctx, a.smtpSubmission, cfg.Listeners.Submission, lim.MaxConnections,
-			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.Submission), nil, a.logger); err != nil {
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.Submission), proxyTrusted, nil, a.logger); err != nil {
 			return fmt.Errorf("submission: %w", err)
 		}
 	}
 	if cfg.Listeners.IMAP != "" {
 		if err := serveTCP(ctx, a.imapSrv, "imap", cfg.Listeners.IMAP, lim.MaxConnections,
-			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAP), nil, a.logger); err != nil {
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAP), proxyTrusted, nil, a.logger); err != nil {
 			return fmt.Errorf("imap: %w", err)
 		}
 	}
 	tlsConf := a.tlsConf
 	if cfg.Listeners.SMTPS != "" && tlsConf != nil {
 		if err := serveSMTP(ctx, a.smtpSubmission, cfg.Listeners.SMTPS, lim.MaxConnections,
-			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTPS), tlsConf, a.logger); err != nil {
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.SMTPS), proxyTrusted, tlsConf, a.logger); err != nil {
 			return fmt.Errorf("smtps: %w", err)
 		}
 	}
 	if cfg.Listeners.IMAPS != "" && tlsConf != nil {
 		if err := serveTCP(ctx, a.imapSrv, "imaps", cfg.Listeners.IMAPS, lim.MaxConnections,
-			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAPS), tlsConf, a.logger); err != nil {
+			proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.IMAPS), proxyTrusted, tlsConf, a.logger); err != nil {
 			return fmt.Errorf("imaps: %w", err)
 		}
 	}
@@ -566,6 +570,7 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 			Addr:          cfg.Listeners.ManageSieve,
 			MaxConn:       lim.MaxConnections,
 			ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.ManageSieve),
+			ProxyTrusted:  proxyTrusted,
 			Logger:        a.logger,
 			Handler:       a.sieveSrv.ManageSieveSession,
 		}
@@ -582,6 +587,7 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 				Addr:          cfg.Listeners.POP3,
 				MaxConn:       lim.MaxConnections,
 				ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.POP3),
+				ProxyTrusted:  proxyTrusted,
 				Logger:        a.logger,
 				Handler:       a.pop3Srv.ServeConn,
 			}
@@ -597,6 +603,7 @@ func (a *App) serveMailListeners(ctx context.Context) error {
 				Addr:          cfg.Listeners.POP3S,
 				MaxConn:       lim.MaxConnections,
 				ProxyProtocol: proxyEnabled(cfg.ProxyProtocol, cfg.Listeners.POP3S),
+				ProxyTrusted:  proxyTrusted,
 				TLSConfig:     tlsConf,
 				Logger:        a.logger,
 				Handler:       a.pop3Srv.ServeConn,

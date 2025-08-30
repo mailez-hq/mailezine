@@ -73,6 +73,7 @@ type Listener struct {
 	Addr          string
 	MaxConn       int
 	ProxyProtocol bool        // expect a PROXY v1 header on every connection
+	ProxyTrusted  []*net.IPNet // peers allowed to speak the header (nil = loopback/private defaults)
 	TLSConfig     *tls.Config // optional: serve implicit TLS (RFC 8314)
 	Logger        *slog.Logger
 	Handler       Handler
@@ -137,7 +138,7 @@ func (l *Listener) ServeListener(ctx context.Context, ln net.Listener) error {
 			defer wg.Done()
 			defer func() { <-sem }()
 			if l.ProxyProtocol {
-				wrapped, err := NewProxyConn(c)
+				wrapped, err := NewProxyConnTrusted(c, l.ProxyTrusted)
 				if err != nil {
 					l.Logger.Warn("connection rejected", "component", l.Name, "reason", "proxy protocol", "err", err)
 					return

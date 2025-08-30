@@ -13,6 +13,13 @@ import (
 // defaultAppendLimit is the default maximum size of an APPEND payload.
 const defaultAppendLimit = 100 * 1024 * 1024 // 100MiB
 
+// handleAppendGuarded is wired from the command dispatch; the actual
+// EXAMINE check lives inside handleAppend where the mailbox name is known
+// and the literal can still be drained before answering.
+func (c *Conn) handleAppendGuarded(tag string, dec *imapwire.Decoder) error {
+	return c.handleAppend(tag, dec)
+}
+
 func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 	var (
 		mailbox string
@@ -89,7 +96,19 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 		return err
 	}
 
-	data, appendErr := c.session.Append(mailbox, lit, &options)
+	// EXAMINE write guard: appending into the currently examined mailbox is
+	// rejected. The literal is drained first so the wire stays in sync
+	// before the NO goes out (other mailboxes stay appendable — the
+	// selection does not lock the account out of writes elsewhere).
+	examined := c.state == imap.ConnStateSelected && c.readOnly && strings.EqualFold(mailbox, c.mbox)
+
+	var data *imap.AppendData
+	var appendErr error
+	if examined {
+		_, _ = io.Copy(io.Discard, lit)
+	} else {
+		data, appendErr = c.session.Append(mailbox, lit, &options)
+	}
 	if _, discardErr := io.Copy(io.Discard, lit); discardErr != nil {
 		return err
 	}
@@ -98,6 +117,12 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 	}
 	if !dec.ExpectCRLF() {
 		return err
+	}
+	if examined {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "mailbox is read-only (EXAMINE)",
+		}
 	}
 	if appendErr != nil {
 		return appendErr

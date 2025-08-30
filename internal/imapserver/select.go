@@ -99,7 +99,10 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 	}
 
 	c.state = imap.ConnStateSelected
-	// TODO: forbid write commands in read-only mode
+	// Remember the selection mode for the dispatch-level write guard
+	// (EXAMINE must be read-only end to end).
+	c.readOnly = readOnly
+	c.mbox = mailbox
 
 	var (
 		cmdName string
@@ -140,6 +143,8 @@ func (c *Conn) handleUnselect(dec *imapwire.Decoder, expunge bool) error {
 	}
 
 	c.state = imap.ConnStateAuthenticated
+	c.readOnly = false
+	c.mbox = ""
 	return nil
 }
 

@@ -22,6 +22,10 @@ type session struct {
 	srv  *Server
 	user string
 	mbox string
+	// readOnly records EXAMINE (vs SELECT): FETCH must not implicitly set
+	// \Seen and the server must not report permanent flags for such a
+	// selection (RFC 3501 §6.3.2/§6.4.8).
+	readOnly bool
 	// uidvalidity of the selected mailbox: fetched-envelope cache keys are
 	// namespaced by it, so a delete+recreate (new uidvalidity, same name)
 	// cannot serve stale cached envelopes for reused UIDs.
@@ -89,12 +93,18 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	}
 	s.mbox = mailbox
 	s.snap = msgs
+	s.readOnly = options != nil && options.ReadOnly
 	s.uidvalidity = st.UIDValidity
 	flags := []imap.Flag{
 		imap.FlagAnswered, imap.FlagFlagged, imap.FlagDeleted,
 		imap.FlagSeen, imap.FlagDraft,
 	}
 	permanent := append(append([]imap.Flag(nil), flags...), imap.FlagWildcard)
+	if s.readOnly {
+		// No permanent flags for an examined mailbox: nothing the client
+		// changes will persist.
+		permanent = nil
+	}
 	data := &imap.SelectData{
 		Flags:          flags,
 		PermanentFlags: permanent,

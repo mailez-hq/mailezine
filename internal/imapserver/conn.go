@@ -46,6 +46,13 @@ type Conn struct {
 
 	state   imap.ConnState
 	session Session
+	// readOnly remembers EXAMINE for the current selection: mutating
+	// commands (STORE/COPY/MOVE/EXPUNGE, CLOSE's implicit expunge, APPEND
+	// into the examined mailbox) are rejected with NO while it holds.
+	// Commands are dispatched from a single goroutine, so the plain field
+	// needs no lock.
+	readOnly bool
+	mbox     string
 }
 
 func newConn(c net.Conn, server *Server) *Conn {
@@ -193,6 +200,19 @@ func (c *Conn) serve() {
 	}
 }
 
+// rejectIfReadOnly returns a tagged NO response when the current selection
+// came from EXAMINE: RFC 3501 §6.3.2 — no mutation may be performed on an
+// examined mailbox.
+func (c *Conn) rejectIfReadOnly(tag string) error {
+	if c.state == imap.ConnStateSelected && c.readOnly {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "mailbox is read-only (EXAMINE)",
+		}
+	}
+	return nil
+}
+
 func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 	var tag, name string
 	if !dec.ExpectAtom(&tag) || !dec.ExpectSP() || !dec.ExpectAtom(&name) {
@@ -259,22 +279,44 @@ func (c *Conn) readCommand(dec *imapwire.Decoder) error {
 		err = c.handleSelect(tag, dec, name == "EXAMINE")
 		sendOK = false
 	case "CLOSE", "UNSELECT":
-		err = c.handleUnselect(dec, name == "CLOSE")
+		// CLOSE on an examined mailbox behaves like UNSELECT: the implicit
+		// expunge would be a write (RFC 3501 §6.4.2).
+		err = c.handleUnselect(dec, name == "CLOSE" && !c.readOnly)
 	case "APPEND":
-		err = c.handleAppend(tag, dec)
+		err = c.handleAppendGuarded(tag, dec)
 		sendOK = false
 	case "FETCH", "UID FETCH":
 		err = c.handleFetch(dec, numKind)
 	case "EXPUNGE":
+		if e := c.rejectIfReadOnly(tag); e != nil {
+			err = e
+			break
+		}
 		err = c.handleExpunge(dec)
 	case "UID EXPUNGE":
+		if e := c.rejectIfReadOnly(tag); e != nil {
+			err = e
+			break
+		}
 		err = c.handleUIDExpunge(dec)
 	case "STORE", "UID STORE":
+		if e := c.rejectIfReadOnly(tag); e != nil {
+			err = e
+			break
+		}
 		err = c.handleStore(dec, numKind)
 	case "COPY", "UID COPY":
+		if e := c.rejectIfReadOnly(tag); e != nil {
+			err = e
+			break
+		}
 		err = c.handleCopy(tag, dec, numKind)
 		sendOK = false
 	case "MOVE", "UID MOVE":
+		if e := c.rejectIfReadOnly(tag); e != nil {
+			err = e
+			break
+		}
 		err = c.handleMove(dec, numKind)
 	case "SEARCH", "UID SEARCH":
 		err = c.handleSearch(tag, dec, numKind)
