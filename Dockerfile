@@ -38,9 +38,9 @@ RUN set -euxo pipefail \
 COPY --from=build /out/mailezine /mailezine
 RUN echo $VERSION >/version
 
-# Health/metrics + the protocol matrix (the gateway proxies 25/465/587 and
-# IMAP/POP3/ManageSieve on its own ports; the engine listens on the internal
-# port contract configured through MAILEZINE_* envs).
+# Health/metrics port. Mail protocols (25/1587/143/993/110/995/4190) are
+# published by the engine itself on the compose host mappings — the gateway
+# is HTTP/ACME only.
 EXPOSE 11480/tcp
 HEALTHCHECK --start-period=10s --interval=15s CMD wget -qO- http://127.0.0.1:11480/health >/dev/null || exit 1
 
