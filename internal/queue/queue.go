@@ -498,7 +498,12 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 	results, derr := m.deliver.Deliver(ctx, msg.From, pending, bytes.NewReader(body.Bytes()))
 	m.observeDelivery(time.Since(start), derr == nil)
 	if derr != nil {
-		// Transport-level failure: defer every pending recipient.
+		// Transport-level failure: defer every pending recipient. This is
+		// at-least-once delivery: a connection lost AFTER the message body
+		// was sent leaves the remote's commit state unknowable, so the
+		// retry can duplicate for recipients whose copy actually landed
+		// (SMTP has no per-recipient transaction; LMTP is not an option
+		// against remote MXes). Failures before DATA cannot duplicate.
 		return m.deferAll(ctx, &msg, oldNext, derr, body.Bytes())
 	}
 	byAddr := map[string]Result{}

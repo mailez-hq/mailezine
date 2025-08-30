@@ -315,6 +315,12 @@ func (c *Client) Deliver(ctx context.Context, from string, to []string, body []b
 	}
 	lines, code, err = c.readReply()
 	if err != nil {
+		// The body was already on the wire when the connection died: the
+		// server may or may not have committed the message, and SMTP offers
+		// no way to ask. Callers must treat this as "unknown, retry" —
+		// outbound delivery is therefore at-least-once for a connection
+		// lost after DATA (RFC 5321 §4.1.1.4 ambiguity); a retry may
+		// duplicate for recipients whose copy actually landed.
 		return nil, err
 	}
 	if code/100 != 2 {
