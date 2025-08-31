@@ -21,6 +21,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus/testutil"
+
+	"mailezine/internal/metrics"
 	"mailezine/internal/store"
 )
 
@@ -128,6 +131,9 @@ func TestExpiredClaimIsStolen(t *testing.T) {
 	lease := time.Minute
 	dead := newMultiManager(kv, blob, d, "dead-node", clock, lease)
 	successor := newMultiManager(kv, blob, d, "node-2", clock, lease)
+	// Health metrics ride the successor: the steal below must be visible.
+	mm := metrics.New()
+	successor.SetMetrics(mm, context.Background())
 	ctx := context.Background()
 
 	if _, err := dead.Submit(ctx, "s@example.com", []string{"a@example.com"}, "hi", strings.NewReader("body")); err != nil {
@@ -162,6 +168,13 @@ func TestExpiredClaimIsStolen(t *testing.T) {
 	}
 	if n := d.callsCount(); n != 1 {
 		t.Fatalf("deliver calls after steal = %d, want 1", n)
+	}
+	// The steal is visible in the multi-active health metrics.
+	if got := testutil.ToFloat64(mm.QueueClaims.WithLabelValues("stolen")); got != 1 {
+		t.Fatalf("stolen counter = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(mm.QueueClaims.WithLabelValues("lost")); got != 0 {
+		t.Fatalf("lost counter = %v, want 0 (no fenced writes in this scenario)", got)
 	}
 	msgs, _ = successor.List(ctx)
 	if msgs[0].State != StateDelivered {

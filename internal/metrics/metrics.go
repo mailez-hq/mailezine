@@ -16,6 +16,7 @@ type Metrics struct {
 	HealthChecks      *prometheus.CounterVec
 	DirectoryRequests *prometheus.CounterVec
 	QueueMessages     *prometheus.CounterVec
+	QueueClaims       *prometheus.CounterVec
 
 	SMTPConnections       prometheus.Counter
 	SMTPConnectionsActive prometheus.Gauge
@@ -44,6 +45,10 @@ func New() *Metrics {
 			Name: "mailezine_queue_messages_total",
 			Help: "Outbound queue message events (submitted/delivered/bounced/deferred/failed).",
 		}, []string{"event"}),
+		QueueClaims: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "mailezine_queue_claims_total",
+			Help: "Outbound delivery claims, by outcome: claimed (this node took a due message), stolen (took over an expired claim after a crashed/stalled owner), lost (this node's outcome was discarded because the claim was stolen from under it). Multi-active health signal: a sustained steal/lost rate means claim leases are too short or nodes are dying mid-delivery.",
+		}, []string{"outcome"}),
 		SMTPConnections: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "mailezine_smtp_connections_total",
 			Help: "SMTP connections accepted (inbound and submission).",
@@ -78,7 +83,7 @@ func New() *Metrics {
 			Buckets: prometheus.DefBuckets,
 		}, []string{"result"}),
 	}
-	reg.MustRegister(m.HealthChecks, m.DirectoryRequests, m.QueueMessages,
+	reg.MustRegister(m.HealthChecks, m.DirectoryRequests, m.QueueMessages, m.QueueClaims,
 		m.SMTPConnections, m.SMTPConnectionsActive, m.SMTPMessagesIn,
 		m.SMTPAuthFailures, m.IMAPSessionsActive, m.POP3Sessions,
 		m.QueueDepth, m.DeliveryDuration)
@@ -161,4 +166,13 @@ func (m *Metrics) ObserveDelivery(d time.Duration, ok bool) {
 		result = "error"
 	}
 	m.DeliveryDuration.WithLabelValues(result).Observe(d.Seconds())
+}
+
+// QueueClaimEvent records one delivery-claim outcome
+// (claimed/stolen/lost) — the multi-active health signal.
+func (m *Metrics) QueueClaimEvent(outcome string) {
+	if m == nil {
+		return
+	}
+	m.QueueClaims.WithLabelValues(outcome).Inc()
 }

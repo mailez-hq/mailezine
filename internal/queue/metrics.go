@@ -46,6 +46,12 @@ func (m *Manager) observeDelivery(d time.Duration, ok bool) {
 	m.mtr.ObserveDelivery(d, ok)
 }
 
+// observeClaim records one claim outcome (claimed/stolen/lost) — the
+// multi-active health signal. m.mtr is nil-safe.
+func (m *Manager) observeClaim(outcome string) {
+	m.mtr.QueueClaimEvent(outcome)
+}
+
 // depthCollector recounts the queue states at scrape time.
 type depthCollector struct {
 	mgr *Manager

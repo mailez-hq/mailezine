@@ -55,6 +55,7 @@ import (
 	"mailezine/internal/verify"
 	"mailezine/internal/version"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -131,6 +132,7 @@ type App struct {
 
 	clusterNodeID     string
 	clusterNodeIDOnce sync.Once
+	kvReplayOnce      sync.Once
 }
 
 // nodeID is this instance's cluster identity: the owner recorded in queue
@@ -278,6 +280,16 @@ func (a *App) openServices() error {
 	}
 	if a.st, err = NewStorage(a.cfg, a.logger); err != nil {
 		return err
+	}
+	// Optimistic-transaction replay gauge (contention signal): registers
+	// once per process even though HA terms re-run this assembly.
+	if rc, ok := a.st.kv.(interface{ Replays() uint64 }); ok {
+		a.kvReplayOnce.Do(func() {
+			_ = a.m.Registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "mailezine_kv_txn_replays_total",
+				Help: "KV optimistic transactions replayed due to write conflicts (multi-writer contention on shared keys; the signal for per-account write pinning).",
+			}, func() float64 { return float64(rc.Replays()) }))
+		})
 	}
 	// One-shot backfill of the KV secondary indexes (name and per-mailbox
 	// email indexes). Idempotent — existing entries are only rewritten when

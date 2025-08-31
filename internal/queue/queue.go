@@ -516,6 +516,9 @@ func (m *Manager) claim(ctx context.Context, id uint64, out *Message) (bool, err
 			// Steal after expiry: the previous owner crashed or stalled
 			// mid-delivery. The outcome is unknowable — at-least-once.
 			cur.LastError = "claim expired"
+			m.observeClaim("stolen")
+		} else {
+			m.observeClaim("claimed")
 		}
 		oldDue := duePos(cur)
 		cur.State = StateActive
@@ -731,6 +734,7 @@ func (m *Manager) commitOutcome(ctx context.Context, msg *Message, body []byte) 
 		return err
 	}
 	if !committed {
+		m.observeClaim("lost")
 		m.logger.Warn("queue: claim lost; outcome discarded", "message", msg.ID, "owner", msg.Owner)
 		return nil
 	}

@@ -56,4 +56,22 @@ func TestNilReceiverSafety(t *testing.T) {
 	m.IMAPSessionClosed()
 	m.POP3SessionServed()
 	m.ObserveDelivery(time.Second, true)
+	m.QueueClaimEvent("claimed")
+}
+
+func TestQueueClaimMetrics(t *testing.T) {
+	m := New()
+	m.QueueClaimEvent("claimed")
+	m.QueueClaimEvent("stolen")
+	m.QueueClaimEvent("stolen")
+	m.QueueClaimEvent("lost")
+	if got := testutil.ToFloat64(m.QueueClaims.WithLabelValues("claimed")); got != 1 {
+		t.Fatalf("claimed = %v, want 1", got)
+	}
+	if got := testutil.ToFloat64(m.QueueClaims.WithLabelValues("stolen")); got != 2 {
+		t.Fatalf("stolen = %v, want 2", got)
+	}
+	if got := testutil.ToFloat64(m.QueueClaims.WithLabelValues("lost")); got != 1 {
+		t.Fatalf("lost = %v, want 1", got)
+	}
 }
