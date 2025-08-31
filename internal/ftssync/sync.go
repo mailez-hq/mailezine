@@ -37,19 +37,27 @@ import (
 type Worker struct {
 	Store *store.Store
 	Index *fts.Indexer
-	// StatePath persists the per-account watermarks; empty derives
-	// "<index dir>.sync.json" — callers pass the same path the Indexer
-	// opened.
+	// StatePath persists the per-account watermarks; empty falls back to
+	// "ftssync-state.json" in the working directory — production wiring
+	// always passes an explicit path next to the index.
 	StatePath string
 	// Interval between sync passes; defaults to 2s.
 	Interval time.Duration
 	Logger   *slog.Logger
 }
 
-// state is the durable tailer position: the last applied change ID per
-// account email. Account emails (not IDs) survive DeleteAccount/re-create.
+// state is the durable tailer position. Watermarks are keyed by account
+// email but carry the account ID they were taken at: change-log IDs are
+// per-account counters, so a deleted-and-recreated same-address account
+// restarts at 1 — replaying against the stale high-water mark would
+// silently skip the new account's first N changes forever.
 type state struct {
-	Accounts map[string]uint64 `json:"accounts"`
+	Accounts map[string]watermark `json:"accounts"`
+}
+
+type watermark struct {
+	AccountID uint32 `json:"accountId"`
+	Mark      uint64 `json:"mark"`
 }
 
 // Run syncs every Interval until ctx is cancelled. Errors are per-pass and
@@ -86,14 +94,14 @@ func (w *Worker) SyncOnce(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	applied := 0
-	live := make(map[string]uint64, len(accounts))
+	live := make(map[string]watermark, len(accounts))
 	for _, account := range accounts {
-		mark, n, err := w.syncAccount(ctx, st, account)
+		wm, n, err := w.syncAccount(ctx, st, account)
 		if err != nil {
 			return applied, err
 		}
 		applied += n
-		live[account] = mark
+		live[account] = wm
 	}
 	// Accounts that vanished since the last pass (DeleteAccount) drop out
 	// of the watermarks; their index entries age out on the next reindex.
@@ -104,15 +112,21 @@ func (w *Worker) SyncOnce(ctx context.Context) (int, error) {
 	return applied, nil
 }
 
-func (w *Worker) syncAccount(ctx context.Context, st *state, account string) (mark uint64, applied int, err error) {
+func (w *Worker) syncAccount(ctx context.Context, st *state, account string) (wm watermark, applied int, err error) {
 	acctID, err := w.Store.AccountByEmail(ctx, account)
 	if err != nil {
-		return 0, 0, err
+		return watermark{}, 0, err
 	}
-	mark = st.Accounts[account]
-	changes, err := w.Store.ChangesSince(ctx, acctID, store.CollectionEmail, mark)
+	wm = watermark{AccountID: uint32(acctID), Mark: 0}
+	if prev, ok := st.Accounts[account]; ok && prev.AccountID == uint32(acctID) {
+		wm.Mark = prev.Mark
+	}
+	// A changed account ID (delete + re-create of the same address) starts
+	// from zero: the fresh change log restarts at 1 and would otherwise be
+	// swallowed by the old account's high-water mark.
+	changes, err := w.Store.ChangesSince(ctx, acctID, store.CollectionEmail, wm.Mark)
 	if err != nil || len(changes) == 0 {
-		return mark, 0, err
+		return wm, 0, err
 	}
 	for _, ch := range changes {
 		if err := w.apply(ctx, acctID, account, ch); err != nil {
@@ -122,9 +136,9 @@ func (w *Worker) syncAccount(ctx context.Context, st *state, account string) (ma
 			w.Logger.Warn("ftssync: apply", "account", account, "change", ch.ChangeID, "err", err)
 		}
 		applied++
-		mark = ch.ChangeID
+		wm.Mark = ch.ChangeID
 	}
-	return mark, applied, nil
+	return wm, applied, nil
 }
 
 // apply projects one change onto the local index.
@@ -172,7 +186,7 @@ func (w *Worker) stateFile() string {
 }
 
 func (w *Worker) load() (*state, error) {
-	st := &state{Accounts: map[string]uint64{}}
+	st := &state{Accounts: map[string]watermark{}}
 	data, err := os.ReadFile(w.stateFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return st, nil
@@ -184,10 +198,10 @@ func (w *Worker) load() (*state, error) {
 		// A corrupt watermark file replays from zero: worst case is a full
 		// (idempotent) rebuild, never a permanently stuck tail.
 		w.Logger.Warn("ftssync: state unreadable; replaying from zero", "err", err)
-		return &state{Accounts: map[string]uint64{}}, nil
+		return &state{Accounts: map[string]watermark{}}, nil
 	}
 	if st.Accounts == nil {
-		st.Accounts = map[string]uint64{}
+		st.Accounts = map[string]watermark{}
 	}
 	return st, nil
 }

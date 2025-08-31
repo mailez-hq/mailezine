@@ -293,7 +293,11 @@ func (m *Manager) ProcessDue(ctx context.Context) error {
 	var ids []uint64
 	err := m.kv.Scan(store.QueueDuePrefix(), func(k, _ []byte) error {
 		if len(k) != 21 {
-			return errors.New("queue: corrupt due index key")
+			// A stray key under the due prefix (migration leftovers, a
+			// foreign encoding) must not stall the whole outbound queue:
+			// skip it loudly and keep scanning.
+			m.logger.Warn("queue: skipping malformed due index key", "key", fmt.Sprintf("%x", k))
+			return nil
 		}
 		ts := int64(binary.BigEndian.Uint64(k[5:13]))
 		if ts > now.Unix() {
@@ -307,7 +311,14 @@ func (m *Manager) ProcessDue(ctx context.Context) error {
 	}
 	var wg sync.WaitGroup
 	for _, id := range ids {
-		m.workerSem <- struct{}{}
+		select {
+		case m.workerSem <- struct{}{}:
+		case <-ctx.Done():
+			// Shutdown must not hang on the semaphore while every worker
+			// sits in a long delivery.
+			wg.Wait()
+			return nil
+		}
 		m.wg.Add(1)
 		wg.Add(1)
 		go func(id uint64) {
@@ -365,44 +376,74 @@ func (m *Manager) List(ctx context.Context) ([]Message, error) {
 	return out, nil
 }
 
-// Retry reschedules a terminal or deferred message immediately. A message
-// being delivered right now (StateActive) is owned by its worker: retrying
-// under it resets state the worker immediately overwrites with its own
-// outcome.
+// Retry reschedules a terminal or deferred message immediately. The state
+// check and the write run in one transaction: in multi-active deployments
+// another node may claim the message between a plain read and a plain
+// write, and an unfenced Retry would resurrect the meta row under the
+// in-flight worker (whose fenced outcome would then be silently dropped,
+// re-sending mail the remote already accepted).
 func (m *Manager) Retry(ctx context.Context, id uint64) error {
-	msg, err := m.load(ctx, id)
-	if err != nil {
-		return err
-	}
-	if msg.State == StateActive {
-		return fmt.Errorf("queue: message %d is being delivered; retry after it completes", id)
-	}
-	oldDue := duePos(msg)
 	now := m.opts.Now()
-	msg.State = StateQueued
-	msg.Attempts = 0
-	msg.NextAttempt = now
-	return m.save(msg, oldDue)
+	return m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+		v, err := t.Get(store.QueueKey(queueName, id))
+		if err != nil {
+			return err
+		}
+		var cur Message
+		if err := json.Unmarshal(v, &cur); err != nil {
+			return err
+		}
+		if cur.State == StateActive {
+			return fmt.Errorf("queue: message %d is being delivered; retry after it completes", id)
+		}
+		oldDue := duePos(cur)
+		cur.State = StateQueued
+		cur.Attempts = 0
+		cur.NextAttempt = now
+		cur.Owner = ""
+		cur.LeaseUntil = time.Time{}
+		cur.UpdatedAt = now
+		data, err := json.Marshal(cur)
+		if err != nil {
+			return err
+		}
+		t.Put(store.QueueKey(queueName, id), data)
+		// Deleting the old position is idempotent (terminal messages have
+		// no live entry).
+		t.Append(
+			store.Op{Key: store.QueueDueKey(oldDue.Unix(), id), Delete: true},
+			store.Op{Key: store.QueueDueKey(now.Unix(), id), Value: nil},
+		)
+		return nil
+	})
 }
 
 // Cancel withdraws a message from the queue and removes its body blob.
 // A message being delivered (StateActive) cannot be canceled: the in-flight
-// worker would re-save its own copy after the cancel and resurrect the
-// record. Terminal messages only have their meta removed — the worker
-// already reclaimed the blob.
+// worker's fenced outcome would resurrect the record (or, unfenced, the
+// cancel would drop a delivery the remote already accepted). The state
+// check and the deletes commit in one transaction.
 func (m *Manager) Cancel(ctx context.Context, id uint64) error {
-	msg, err := m.load(ctx, id)
+	var msg Message
+	err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+		v, err := t.Get(store.QueueKey(queueName, id))
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(v, &msg); err != nil {
+			return err
+		}
+		if msg.State == StateActive {
+			return fmt.Errorf("queue: message %d is being delivered; cancel after it completes", id)
+		}
+		t.Delete(store.QueueKey(queueName, id))
+		t.Append(
+			store.Op{Key: store.QueueDueKey(duePos(msg).Unix(), id), Delete: true},
+			store.Op{Key: store.QueueDueKey(msg.LeaseUntil.Unix(), id), Delete: true},
+		)
+		return nil
+	})
 	if err != nil {
-		return err
-	}
-	if msg.State == StateActive {
-		return fmt.Errorf("queue: message %d is being delivered; cancel after it completes", id)
-	}
-	ops := []store.Op{
-		{Key: store.QueueKey(queueName, id), Delete: true},
-		{Key: store.QueueDueKey(duePos(msg).Unix(), id), Delete: true},
-	}
-	if err := m.kv.Batch(ops); err != nil {
 		return err
 	}
 	if isTerminal(msg.State) {
@@ -506,7 +547,14 @@ func (m *Manager) claim(ctx context.Context, id uint64, out *Message) (bool, err
 			return err
 		}
 		if isTerminal(cur.State) {
-			t.Delete(store.QueueDueKey(duePos(cur).Unix(), id))
+			// Self-heal a stale due entry left by a crash between the
+			// terminal commit and index maintenance. The orphan can sit at
+			// either historical position; deletes are idempotent, so clear
+			// both candidates.
+			t.Append(
+				store.Op{Key: store.QueueDueKey(duePos(cur).Unix(), id), Delete: true},
+				store.Op{Key: store.QueueDueKey(cur.LeaseUntil.Unix(), id), Delete: true},
+			)
 			return nil
 		}
 		if cur.State == StateActive && cur.LeaseUntil.After(now) {
@@ -697,7 +745,10 @@ func (m *Manager) finalizeState(msg *Message) {
 // a missing body and, once attempts run out, bounce mail that may already
 // have been delivered).
 func (m *Manager) commitOutcome(ctx context.Context, msg *Message, body []byte) error {
-	oldDue := duePos(*msg) // our claim position in the due index
+	// The claim indexed this message at its LeaseUntil — duePos(msg) would
+	// now read the post-outcome state (NextAttempt), delete the wrong key
+	// and leak a ghost entry that re-triggers the scheduler forever.
+	oldDue := msg.LeaseUntil
 	committed := false
 	err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
 		committed = false

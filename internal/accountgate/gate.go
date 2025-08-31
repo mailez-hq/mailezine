@@ -68,8 +68,17 @@ type Gate struct {
 // without it leases still work but expire after one TTL and rely on
 // re-acquisition.
 func New(kv store.KV, nodeID string, opts Options, logger *slog.Logger) *Gate {
-	if opts.TTL <= 0 || opts.IdleRelease <= 0 || opts.Wait <= 0 {
-		opts = DefaultOptions()
+	// Per-field fallback: a caller tuning only the Wait budget must not
+	// silently reset TTL/IdleRelease to defaults.
+	def := DefaultOptions()
+	if opts.TTL <= 0 {
+		opts.TTL = def.TTL
+	}
+	if opts.IdleRelease <= 0 {
+		opts.IdleRelease = def.IdleRelease
+	}
+	if opts.Wait <= 0 {
+		opts.Wait = def.Wait
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -181,7 +190,12 @@ func (g *Gate) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			g.releaseAll(ctx)
+			// The loop ctx is already cancelled here; releases need a
+			// fresh budget or every lease Release would fail on
+			// context.Canceled and ownership would linger to TTL.
+			rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			g.releaseAll(rctx)
+			cancel()
 			return
 		case <-t.C:
 		}
@@ -191,45 +205,69 @@ func (g *Gate) Run(ctx context.Context) {
 
 func (g *Gate) sweep() {
 	now := time.Now()
-	type action struct {
-		account string
-		lease   *kvlease.Lease
-		release bool
-	}
 	g.mu.Lock()
-	var todo []action
+	var todo []maintenance
 	for account, h := range g.held {
-		if now.Sub(h.lastUsed) > g.opts.IdleRelease {
-			todo = append(todo, action{account, h.lease, true})
-			continue
-		}
-		todo = append(todo, action{account, h.lease, false})
+		todo = append(todo, maintenance{account, h.lease, now.Sub(h.lastUsed) > g.opts.IdleRelease})
 	}
 	g.mu.Unlock()
 
+	// Renew and release with a small worker pool: a serial sweep with a
+	// 5 s per-account budget lets a handful of slow accounts push the tail
+	// of the list past its TTL, systematically losing ownership.
+	const workers = 8
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, workers)
+	for _, a := range todo {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(a maintenance) {
+			defer func() { <-sem; wg.Done() }()
+			g.maintain(a)
+		}(a)
+	}
+	wg.Wait()
+}
+
+// maintenance is one sweep action for a held account.
+type maintenance struct {
+	account string
+	lease   *kvlease.Lease
+	release bool // true = idle, release it; false = renew it
+}
+
+// maintain renews or releases one held account.
+func (g *Gate) maintain(a maintenance) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	for _, a := range todo {
-		if a.release {
-			_ = a.lease.Release(ctx)
-			g.mu.Lock()
-			if h, ok := g.held[a.account]; ok && h.lease == a.lease {
-				delete(g.held, a.account)
-			}
-			g.mu.Unlock()
-			continue
-		}
-		if ok, err := a.lease.Acquire(ctx); err == nil && !ok {
-			// Stolen after expiry: drop local ownership; the next writer
-			// re-acquires (and the current one already proceeded under
-			// transactional correctness).
-			g.mu.Lock()
-			if h, ok := g.held[a.account]; ok && h.lease == a.lease {
-				delete(g.held, a.account)
-			}
-			g.mu.Unlock()
-		}
+	if a.release {
+		_ = a.lease.Release(ctx)
+		g.drop(a.account, a.lease)
+		return
 	}
+	ok, err := a.lease.Acquire(ctx)
+	if err != nil {
+		// Storage trouble: conservatively drop local ownership. Keeping
+		// the entry would let the fast path admit writers with no lease
+		// held (and no signal that the gate stopped gating).
+		g.logger.Warn("accountgate: renewal failed; dropping ownership", "account", a.account, "err", err)
+		g.drop(a.account, a.lease)
+		return
+	}
+	if !ok {
+		// Stolen after expiry: drop local ownership; the next writer
+		// re-acquires (and the current one already proceeded under
+		// transactional correctness).
+		g.drop(a.account, a.lease)
+	}
+}
+
+func (g *Gate) drop(account string, lease *kvlease.Lease) {
+	g.mu.Lock()
+	if h, ok := g.held[account]; ok && h.lease == lease {
+		delete(g.held, account)
+	}
+	g.mu.Unlock()
 }
 
 func (g *Gate) releaseAll(ctx context.Context) {

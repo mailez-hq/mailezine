@@ -185,9 +185,9 @@ func TestDeletedAccountSkips(t *testing.T) {
 	kv := store.NewMemoryKV()
 	blob := store.NewMemoryBlob()
 	ms, ix, state := newNode(t, kv, blob)
+	w := newWorker(t, kv, blob, ix, state)
 
 	deliver(t, ms, "gone@example.com", "INBOX", "old mail")
-	w := newWorker(t, kv, blob, ix, state)
 	if _, err := w.SyncOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -196,6 +196,41 @@ func TestDeletedAccountSkips(t *testing.T) {
 	}
 	if _, err := w.SyncOnce(context.Background()); err != nil {
 		t.Fatalf("pass after account deletion must not fail: %v", err)
+	}
+}
+
+// Regression: a deleted-and-recreated same-address account restarts its
+// change log at 1. The watermark must detect the account-ID change and
+// replay from zero — carrying the old high-water mark forward silently
+// skipped the new account's first N changes (its mail stayed unsearchable
+// until the IDs caught up).
+func TestRecreatedAccountReplaysFromZero(t *testing.T) {
+	kv := store.NewMemoryKV()
+	blob := store.NewMemoryBlob()
+	ms, ix, state := newNode(t, kv, blob)
+	w := newWorker(t, kv, blob, ix, state)
+	ctx := context.Background()
+
+	// Old account accumulates a high watermark.
+	for i := 0; i < 5; i++ {
+		deliver(t, ms, "user@example.com", "INBOX", "old mail")
+	}
+	if _, err := w.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Delete + recreate the same address; the fresh account's change IDs
+	// restart at 1 — far below the stale watermark.
+	if err := ms.DeleteAccount(ctx, "user@example.com"); err != nil {
+		t.Fatal(err)
+	}
+	deliver(t, ms, "user@example.com", "INBOX", "fresh start")
+
+	if _, err := w.SyncOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !hit(t, ix, "user@example.com", "INBOX", "fresh") {
+		t.Fatal("re-created account's mail not indexed (stale watermark swallowed the fresh change log)")
 	}
 }
 

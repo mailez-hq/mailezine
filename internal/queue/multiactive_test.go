@@ -12,6 +12,7 @@ package queue
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -75,6 +76,112 @@ func newMultiManager(kv store.KV, blob store.Blob, d Deliverer, node string, clo
 	opts.ClaimLease = lease
 	opts.Now = clock.Now
 	return New(kv, blob, d, opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
+}
+
+// dueEntries returns the (timestamp, id) pairs currently in the due index —
+// the invariant surface every claim/commit transition must keep exact: one
+// entry per non-terminal message, positioned at its duePos, none for
+// terminal ones.
+func dueEntries(t *testing.T, kv store.KV) map[uint64]int64 {
+	t.Helper()
+	out := map[uint64]int64{}
+	if err := kv.Scan(store.QueueDuePrefix(), func(k, _ []byte) error {
+		if len(k) != 21 {
+			t.Fatalf("malformed due key in index: %x", k)
+		}
+		id := binary.BigEndian.Uint64(k[13:21])
+		if _, dup := out[id]; dup {
+			t.Fatalf("duplicate due entries for message %d", id)
+		}
+		out[id] = int64(binary.BigEndian.Uint64(k[5:13]))
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// Regression (release-blocking): the claim indexes a message at its
+// LeaseUntil, so the outcome commit must move/delete THAT entry. Reading
+// duePos after the outcome mutation (NextAttempt) deleted the wrong key and
+// leaked a ghost entry per delivered message — ghosts re-triggered the
+// scheduler at lease expiry, re-claiming deferred messages early (burning
+// attempts into premature bounces) and growing the index without bound.
+func TestDueIndexStaysExact(t *testing.T) {
+	kv := store.NewMemoryKV()
+	blob := store.NewMemoryBlob()
+	clock := &fakeClock{now: time.Now()}
+	d := &fakeDeliverer{results: map[string]Result{
+		"a@example.com": {To: "a@example.com", OK: true},
+		"b@example.com": {To: "b@example.com", Err: errors.New("451 temp")},
+	}}
+	opts := DefaultOptions()
+	opts.BaseRetry = time.Minute
+	opts.Now = clock.Now
+	m := New(kv, blob, d, opts, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	ctx := context.Background()
+
+	id1, err := m.Submit(ctx, "s@example.com", []string{"a@example.com"}, "ok", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id2, err := m.Submit(ctx, "s@example.com", []string{"b@example.com"}, "defer", strings.NewReader("body"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := dueEntries(t, kv)
+	if len(entries) != 2 {
+		t.Fatalf("after submit: due entries = %v, want 2", entries)
+	}
+
+	// Round 1: one delivered (terminal), one deferred.
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	entries = dueEntries(t, kv)
+	if _, ok := entries[id1]; ok {
+		t.Fatalf("terminal message %d still has a due entry: %v", id1, entries)
+	}
+	retryAt, ok := entries[id2]
+	if !ok {
+		t.Fatalf("deferred message %d lost its due entry: %v", id2, entries)
+	}
+	msgs, _ := m.List(ctx)
+	var deferred Message
+	for _, msg := range msgs {
+		if msg.ID == id2 {
+			deferred = msg
+		}
+	}
+	if retryAt != deferred.NextAttempt.Unix() {
+		t.Fatalf("deferred due entry at %d, want NextAttempt %d", retryAt, deferred.NextAttempt.Unix())
+	}
+
+	// Round 2 after backoff: the deferred message delivers and its entry
+	// disappears; nothing resurrects the terminal one.
+	clock.Advance(2 * time.Hour)
+	d.results["b@example.com"] = Result{To: "b@example.com", OK: true}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if entries := dueEntries(t, kv); len(entries) != 0 {
+		t.Fatalf("due index after full delivery = %v, want empty", entries)
+	}
+
+	// Retry re-opens a terminal message with exactly one entry at now.
+	if err := m.Retry(ctx, id1); err != nil {
+		t.Fatal(err)
+	}
+	entries = dueEntries(t, kv)
+	if len(entries) != 1 || entries[id1] != clock.now.Unix() {
+		t.Fatalf("after retry: due entries = %v, want single entry for %d at now", entries, id1)
+	}
+	if err := m.Cancel(ctx, id1); err != nil {
+		t.Fatal(err)
+	}
+	if entries := dueEntries(t, kv); len(entries) != 0 {
+		t.Fatalf("due index after cancel = %v, want empty", entries)
+	}
 }
 
 // Two schedulers racing on the same due messages deliver each exactly once.

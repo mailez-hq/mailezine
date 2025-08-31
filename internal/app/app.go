@@ -18,6 +18,7 @@ package app
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -133,9 +134,9 @@ type App struct {
 
 	clusterNodeID     string
 	clusterNodeIDOnce sync.Once
-	kvReplayOnce      sync.Once
+	kvReplayGauge     prometheus.Collector
 	gate              *accountgate.Gate
-	gateRegOnce       sync.Once
+	gateGauge         prometheus.Collector
 }
 
 // nodeID is this instance's cluster identity: the owner recorded in queue
@@ -172,11 +173,14 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if cfg.HA.Enabled {
 		// HA (shared lease + standby/leader terms) is an enterprise
 		// capability; a copied config must never wedge community startup,
-		// so degrade to single-node with a loud warning.
+		// so degrade to single-node with a loud warning. Mutate the App's
+		// copy too — Run() branches on a.cfg.HA.Enabled and would otherwise
+		// fall into the (CE-stub) HA supervisor and exit with an error.
 		a.logger.Warn("ha: requires the enterprise edition; continuing single-node")
 		cfg.HA.Enabled = false
+		a.cfg.HA.Enabled = false
 	}
-	if err := a.openServices(); err != nil {
+	if err := a.openServices(a.ctx); err != nil {
 		a.Close()
 		return nil, err
 	}
@@ -265,8 +269,10 @@ func (a *App) Close() {
 // Service assembly (shared by non-HA eager start and per-term activation).
 // ---------------------------------------------------------------------------
 
-// openServices opens the directory, auth and storage backends plus FTS.
-func (a *App) openServices() error {
+// openServices opens the directory, auth and storage backends plus FTS
+// under runCtx (the HA term scope when HA is enabled: background helpers
+// started here must not outlive the KV they were opened against).
+func (a *App) openServices(runCtx context.Context) error {
 	var err error
 	if a.dir, err = newDirectory(a.cfg, a.logger); err != nil {
 		return err
@@ -284,27 +290,40 @@ func (a *App) openServices() error {
 	if a.st, err = NewStorage(a.cfg, a.logger); err != nil {
 		return err
 	}
-	// Optimistic-transaction replay gauge (contention signal): registers
-	// once per process even though HA terms re-run this assembly.
+	if a.cfg.Cluster.Mode == "multi" && a.cfg.Storage.S3Endpoint == "" {
+		// Without shared blob storage every replica writes bodies to its
+		// own disk: cross-node IMAP reads, FTS convergence and claimed
+		// outbound deliveries all break SILENTLY. A same-host deployment
+		// sharing one volume is legitimate — hence a loud warning, not a
+		// hard error.
+		a.logger.Warn("cluster: multi-active without MAILEZINE_S3_*: blob storage is node-local — every replica must share the same blob volume, or bodies, search and cross-node delivery break")
+	}
+	// Optimistic-transaction replay gauge (contention signal). HA terms
+	// re-run this assembly with fresh KV instances: replace the collector
+	// so it reports the live one instead of freezing on the first term.
 	if rc, ok := a.st.kv.(interface{ Replays() uint64 }); ok {
-		a.kvReplayOnce.Do(func() {
-			_ = a.m.Registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-				Name: "mailezine_kv_txn_replays_total",
-				Help: "KV optimistic transactions replayed due to write conflicts (multi-writer contention on shared keys; the signal for per-account write pinning).",
-			}, func() float64 { return float64(rc.Replays()) }))
-		})
+		if a.kvReplayGauge != nil {
+			a.m.Registry.Unregister(a.kvReplayGauge)
+		}
+		a.kvReplayGauge = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "mailezine_kv_txn_replays_total",
+			Help: "KV optimistic transactions replayed due to write conflicts (multi-writer contention on shared keys; the signal for per-account write pinning).",
+		}, func() float64 { return float64(rc.Replays()) })
+		_ = a.m.Registry.Register(a.kvReplayGauge)
 	}
 	// One-shot backfill of the KV secondary indexes (name and per-mailbox
 	// email indexes). Idempotent — existing entries are only rewritten when
 	// divergent — so it is safe to repeat per HA term. Async: never block
-	// start-up on a large store.
+	// start-up on a large store. The backfill is scoped to runCtx (the HA
+	// term): without it, a term switch would leave it running on the
+	// already-closed KV for up to 10 minutes.
 	if kvms, ok := a.st.mailbox.(*mailstore.KV); ok {
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+			ctx, cancel := context.WithTimeout(runCtx, 10*time.Minute)
 			defer cancel()
 			n, err := kvms.Reindex(ctx)
 			switch {
-			case err != nil:
+			case err != nil && !errors.Is(err, context.Canceled):
 				a.logger.Warn("storage: index backfill incomplete", "fixed", n, "err", err)
 			case n > 0:
 				a.logger.Info("storage: index backfill", "entries", n)
@@ -318,9 +337,14 @@ func (a *App) openServices() error {
 			mailcache.NewCacheWithTTL(a.cfg.MetaCacheSizeBytes, 30*time.Second))
 	}
 	// Embedded full-text index (bleve); a failure disables FTS but never
-	// startup (search falls back to the scan).
+	// startup (search falls back to the scan) — except in multi-active,
+	// where a silently missing index on one node diverges search results
+	// across the cluster: fail fast instead.
 	if a.cfg.FTS.Enabled {
 		a.fts = openFTS(a.cfg, a.logger)
+		if a.fts == nil && a.cfg.Cluster.Mode == "multi" {
+			return fmt.Errorf("fts: per-node index unavailable at %s (multi-active requires a writable index path; set MAILEZINE_FTS_PATH or MAILEZINE_ROCKS_PATH)", ftsIndexPath(a.cfg))
+		}
 	}
 	return nil
 }
@@ -402,12 +426,14 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		a.gate.SetMetrics(a.m)
 		a.pipeline.Gate = a.gate
 		go a.gate.Run(runCtx)
-		a.gateRegOnce.Do(func() {
-			_ = a.m.Registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
-				Name: "mailezine_account_gate_held",
-				Help: "Accounts whose inbound write path this node currently owns (per-account write pinning).",
-			}, func() float64 { return float64(a.gate.Held()) }))
-		})
+		if a.gateGauge != nil {
+			a.m.Registry.Unregister(a.gateGauge)
+		}
+		a.gateGauge = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "mailezine_account_gate_held",
+			Help: "Accounts whose inbound write path this node currently owns (per-account write pinning).",
+		}, func() float64 { return float64(a.gate.Held()) })
+		_ = a.m.Registry.Register(a.gateGauge)
 		a.logger.Info("account write gate", "wait", opts.Wait, "ttl", opts.TTL)
 	}
 	if a.cfg.Notify.Enabled {
@@ -432,10 +458,15 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		if a.cfg.Cluster.Mode == "multi" {
 			// Exactly one node sweeps at a time: the flag rewrite is
 			// idempotent, but the receipt fires push/SSE and must not
-			// repeat per node. The lease TTL covers several sweep
-			// intervals — a node whose sweeps stall loses the lease and a
-			// successor takes over (at-least-once, like every worker).
-			l := kvlease.New(a.st.kv, "snooze-sweeper", a.nodeID(), 90*time.Second)
+			// repeat per node. The lease must cover at least two sweep
+			// intervals (renewal runs on each tick): a fixed 90 s would
+			// expire between sweeps once operators raise the interval,
+			// causing repeated lease flapping and double receipts.
+			leaseTTL := 2 * interval
+			if leaseTTL < 90*time.Second {
+				leaseTTL = 90 * time.Second
+			}
+			l := kvlease.New(a.st.kv, "snooze-sweeper", a.nodeID(), leaseTTL)
 			go l.Run(runCtx, interval, func(ctx context.Context) { sw.SweepOnce(ctx) })
 			a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval, "leased", true)
 		} else {
@@ -575,14 +606,14 @@ func (a *App) serveHealth(ctx context.Context) error {
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		a.m.HealthChecks.WithLabelValues("/health").Inc()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"status":"ok","version":%q,"role":%q}`,
-			version.Version, a.role())
+		fmt.Fprintf(w, `{"status":"ok","version":%q,"role":%q,"cluster":%q}`,
+			version.Version, a.role(), a.cfg.Cluster.Mode)
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		a.m.HealthChecks.WithLabelValues("/ready").Inc()
-		fmt.Fprintf(w, `{"status":"ok","role":%q,"cluster":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
+		fmt.Fprintf(w, `{"status":"ok","role":%q,"cluster":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v,"fts":%v}`,
 			a.role(), a.cfg.Cluster.Mode, a.cfg.Storage.Backend, a.cfg.Directory.Mode,
-			a.classifier != nil, a.cfg.Outbound.Enabled)
+			a.classifier != nil, a.cfg.Outbound.Enabled, a.fts != nil)
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(a.m.Registry, promhttp.HandlerOpts{}))
 	a.healthSrv = &http.Server{Addr: a.cfg.HealthAddr, Handler: mux}
@@ -744,7 +775,7 @@ func (a *App) activateTerm(root context.Context) error {
 		return err
 	}
 
-	if err := a.openServices(); err != nil {
+	if err := a.openServices(tctx); err != nil {
 		return cleanupAll(err)
 	}
 	if err := a.wirePipeline(tctx); err != nil {

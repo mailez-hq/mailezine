@@ -75,15 +75,16 @@ func encodeEmailDeleteValue(collection byte, docID uint64, mailbox string, uid u
 }
 
 // ChangesSince returns changes with changeID > after, in ascending order.
+// The read seeks to the cursor key instead of scanning the whole prefix:
+// pollers (the FTS tailer) call this every few seconds, and a prefix scan
+// would make each poll O(total change history) per account.
 func (s *Store) ChangesSince(_ context.Context, accountID AccountID, collection byte, after uint64) ([]Change, error) {
+	prefix := ChangeLogPrefix(uint32(accountID), collection)
+	start := ChangeLogKey(uint32(accountID), collection, after+1)
 	var out []Change
-	err := s.kv.Scan(ChangeLogPrefix(uint32(accountID), collection), func(k, v []byte) error {
-		changeID := ChangeIDFromLogKey(k)
-		if changeID <= after || len(v) < 10 {
-			return nil
-		}
+	err := s.kv.ScanRange(start, PrefixEnd(prefix), func(k, v []byte) error {
 		out = append(out, Change{
-			ChangeID:   changeID,
+			ChangeID:   ChangeIDFromLogKey(k),
 			Collection: v[0],
 			DocID:      binary.BigEndian.Uint64(v[1:9]),
 			Op:         v[9],

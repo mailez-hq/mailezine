@@ -33,6 +33,10 @@ func (b *bufTxn) Delete(key []byte) error        { return b.base.Delete(key) }
 func (b *bufTxn) Scan(prefix []byte, fn func(k, v []byte) error) error {
 	return b.base.Scan(prefix, fn)
 }
+
+func (b *bufTxn) ScanRange(start, end []byte, fn func(k, v []byte) error) error {
+	return b.base.ScanRange(start, end, fn)
+}
 func (b *bufTxn) Batch(ops []Op) error { return b.base.Batch(ops) }
 func (b *bufTxn) Close() error         { return b.base.Close() }
 

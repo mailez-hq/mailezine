@@ -72,9 +72,9 @@ type Listener struct {
 	Name          string
 	Addr          string
 	MaxConn       int
-	ProxyProtocol bool        // expect a PROXY v1 header on every connection
+	ProxyProtocol bool         // expect a PROXY v1 header on every connection
 	ProxyTrusted  []*net.IPNet // peers allowed to speak the header (nil = loopback/private defaults)
-	TLSConfig     *tls.Config // optional: serve implicit TLS (RFC 8314)
+	TLSConfig     *tls.Config  // optional: serve implicit TLS (RFC 8314)
 	Logger        *slog.Logger
 	Handler       Handler
 }

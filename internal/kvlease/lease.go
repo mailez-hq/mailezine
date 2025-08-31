@@ -45,8 +45,13 @@ type Lease struct {
 
 // New builds a lease. owner must uniquely identify this process within the
 // deployment (RandomNodeID is the default choice); ttl is how long a
-// holder survives without re-acquiring.
+// holder survives without re-acquiring. A non-positive ttl is clamped to
+// one minute: a zero ttl would make every lease instantly stealable,
+// silently disabling the mutual exclusion the caller relies on.
 func New(kv store.KV, name, owner string, ttl time.Duration) *Lease {
+	if ttl <= 0 {
+		ttl = time.Minute
+	}
 	return &Lease{
 		txn:    store.AsTxn(kv),
 		key:    store.MetaLeaseKey(name),

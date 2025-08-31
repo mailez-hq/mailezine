@@ -64,6 +64,24 @@ func (p *PebbleKV) Scan(prefix []byte, fn func(k, v []byte) error) error {
 	return iter.Error()
 }
 
+func (p *PebbleKV) ScanRange(start, end []byte, fn func(k, v []byte) error) error {
+	opts := &pebble.IterOptions{LowerBound: start}
+	if end != nil {
+		opts.UpperBound = end
+	}
+	iter, err := p.db.NewIter(opts)
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		if err := fn(append([]byte(nil), iter.Key()...), append([]byte(nil), iter.Value()...)); err != nil {
+			return err
+		}
+	}
+	return iter.Error()
+}
+
 func (p *PebbleKV) Batch(ops []Op) error {
 	b := p.db.NewBatch()
 	defer b.Close()

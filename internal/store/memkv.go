@@ -72,6 +72,30 @@ func (k *MemoryKV) Scan(prefix []byte, fn func(k2, v []byte) error) error {
 	return nil
 }
 
+func (k *MemoryKV) ScanRange(start, end []byte, fn func(k2, v []byte) error) error {
+	k.mu.RLock()
+	keys := make([]string, 0, len(k.m))
+	for key := range k.m {
+		b := []byte(key)
+		if bytes.Compare(b, start) >= 0 && (end == nil || bytes.Compare(b, end) < 0) {
+			keys = append(keys, key)
+		}
+	}
+	sort.Strings(keys)
+	values := make([][]byte, len(keys))
+	for i, key := range keys {
+		values[i] = append([]byte(nil), k.m[key]...)
+	}
+	k.mu.RUnlock()
+
+	for i, key := range keys {
+		if err := fn([]byte(key), values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (k *MemoryKV) Batch(ops []Op) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()

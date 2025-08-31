@@ -32,6 +32,12 @@ type KV interface {
 	// Scan visits every key with the given prefix in ascending key order.
 	// Returning an error from fn aborts the scan and is propagated.
 	Scan(prefix []byte, fn func(k, v []byte) error) error
+	// ScanRange visits keys in [start, end) in ascending key order. Use it
+	// instead of Scan+filter when the tail past a cursor is wanted — a
+	// prefix scan would still read (and discard) everything before the
+	// cursor, which is O(history) per poll on large spaces like the
+	// change log. Returning an error from fn aborts and propagates.
+	ScanRange(start, end []byte, fn func(k, v []byte) error) error
 	// Batch applies ops atomically: either all take effect or none do.
 	Batch(ops []Op) error
 	Close() error

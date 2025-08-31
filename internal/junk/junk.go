@@ -150,7 +150,8 @@ func (c *Classifier) ClassifyAuthResults(ctx context.Context, authResults string
 
 // Classify implements delivery.Classifier without an auth-results header
 // (the verifier may be disabled); DNSBL and lists still apply.
-func (c *Classifier) Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (delivery.Result, error) {	if c.denyListed(from) {
+func (c *Classifier) Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (delivery.Result, error) {
+	if c.denyListed(from) {
 		return c.verdict(denyScore, []hit{{"deny-listed sender", denyScore}}), nil
 	}
 	if c.allowListed(from) {

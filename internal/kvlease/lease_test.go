@@ -2,6 +2,7 @@ package kvlease
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -98,33 +99,38 @@ func TestRunElectsSingleWorker(t *testing.T) {
 
 	tick := 10 * time.Millisecond
 	ttl := time.Minute
-	var runsA, runsB int
-	done := make(chan struct{})
+	var runsA, runsB atomic.Int32
+	doneA := make(chan struct{})
+	doneB := make(chan struct{})
 	go func() {
-		newLease(kv, "a", ttl, clock).Run(ctx, tick, func(context.Context) { runsA++ })
-		close(done)
+		newLease(kv, "a", ttl, clock).Run(ctx, tick, func(context.Context) { runsA.Add(1) })
+		close(doneA)
 	}()
-	go newLease(kv, "b", ttl, clock).Run(ctx, tick, func(context.Context) { runsB++ })
+	go func() {
+		newLease(kv, "b", ttl, clock).Run(ctx, tick, func(context.Context) { runsB.Add(1) })
+		close(doneB)
+	}()
 
 	deadline := time.After(2 * time.Second)
 	for {
-		if runsA+runsB >= 5 {
+		if runsA.Load()+runsB.Load() >= 5 {
 			break
 		}
 		select {
 		case <-deadline:
-			t.Fatalf("workers never ran: a=%d b=%d", runsA, runsB)
+			t.Fatalf("workers never ran: a=%d b=%d", runsA.Load(), runsB.Load())
 		default:
 			time.Sleep(time.Millisecond)
 		}
 	}
 	cancel()
-	<-done
+	<-doneA
+	<-doneB
 	// One node ran every tick, the other none: exactly-once per tick.
-	if runsA > 0 && runsB > 0 {
-		t.Fatalf("both nodes ran the worker: a=%d b=%d", runsA, runsB)
+	if a, b := runsA.Load(), runsB.Load(); a > 0 && b > 0 {
+		t.Fatalf("both nodes ran the worker: a=%d b=%d", a, b)
 	}
-	if runsA+runsB < 5 {
-		t.Fatalf("expected repeated ticks, got a=%d b=%d", runsA, runsB)
+	if runsA.Load()+runsB.Load() < 5 {
+		t.Fatalf("expected repeated ticks, got a=%d b=%d", runsA.Load(), runsB.Load())
 	}
 }
