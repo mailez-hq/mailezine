@@ -7,6 +7,7 @@ package imap
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"log/slog"
 
 	"github.com/emersion/go-imap/v2"
@@ -98,7 +99,11 @@ func New(s *Server) *imapserver.Server {
 type slogAdapter struct{ l *slog.Logger }
 
 func (a slogAdapter) Printf(format string, args ...any) {
-	a.l.Error("imap: "+format, args...)
+	if len(args) == 0 {
+		a.l.Error("imap: " + format)
+		return
+	}
+	a.l.Error("imap: " + fmt.Sprintf(format, args...))
 }
 
 var _ imapserver.Logger = slogAdapter{}

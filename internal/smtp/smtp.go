@@ -317,7 +317,11 @@ func remoteIP(addr net.Addr) net.IP {
 type slogAdapter struct{ l *slog.Logger }
 
 func (a slogAdapter) Printf(format string, args ...any) {
-	a.l.Error("smtp: "+format, args...)
+	if len(args) == 0 {
+		a.l.Error("smtp: " + format)
+		return
+	}
+	a.l.Error("smtp: " + fmt.Sprintf(format, args...))
 }
 
 func (a slogAdapter) Println(args ...any) {
