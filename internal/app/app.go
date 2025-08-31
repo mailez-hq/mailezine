@@ -34,6 +34,7 @@ import (
 	"mailezine/internal/directory"
 	"mailezine/internal/dkim"
 	"mailezine/internal/fts"
+	"mailezine/internal/ftssync"
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
 	"mailezine/internal/junk"
@@ -304,16 +305,7 @@ func (a *App) openServices() error {
 	// Embedded full-text index (bleve); a failure disables FTS but never
 	// startup (search falls back to the scan).
 	if a.cfg.FTS.Enabled {
-		if a.cfg.Cluster.Mode == "multi" {
-			// bleve is a node-local index: in multi-active each node would
-			// only index the mail its own pipelines delivered, and searches
-			// would silently miss the rest of the cluster's mail. Disable
-			// until the changelog-tailing indexer lands; search falls back
-			// to the (correct, slower) store scan.
-			a.logger.Warn("fts: disabled in multi-active mode (node-local index); search falls back to scan")
-		} else {
-			a.fts = openFTS(a.cfg, a.logger)
-		}
+		a.fts = openFTS(a.cfg, a.logger)
 	}
 	return nil
 }
@@ -347,6 +339,15 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 	}
 	a.classifier = classifier
 	a.sieveEngine = sieve.NewEngine(a.logger)
+	pipelineFTS := a.fts
+	if a.cfg.Cluster.Mode == "multi" && a.fts != nil {
+		// Multi-active: indexing converges via the change-log tailer below
+		// (every node, including this one), so the delivery path stays
+		// index-free — each copy is indexed exactly once per node instead
+		// of twice on the delivering node. The read path (IMAP SEARCH)
+		// keeps using a.fts.
+		pipelineFTS = nil
+	}
 	a.pipeline = &delivery.Pipeline{
 		Directory:          a.dir,
 		Store:              a.st.mailbox,
@@ -357,7 +358,21 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		Hostname:           a.cfg.Hostname,
 		RecipientDelimiter: a.cfg.RecipientDelimiter,
 		Logger:             a.logger,
-		FTS:                a.fts,
+		FTS:                pipelineFTS,
+	}
+	if a.cfg.Cluster.Mode == "multi" && a.fts != nil {
+		// bleve is node-local: tail the shared change logs so this node's
+		// index sees every node's deliveries (eventual consistency, one
+		// interval of lag; a fresh/corrupt local index replays from
+		// watermark zero and rebuilds in full).
+		sw := &ftssync.Worker{
+			Store:     a.st.Facade(),
+			Index:     a.fts,
+			StatePath: ftsIndexPath(a.cfg) + ".sync.json",
+			Logger:    a.logger,
+		}
+		go sw.Run(runCtx)
+		a.logger.Info("fts: change-log tailer", "state", ftsIndexPath(a.cfg)+".sync.json")
 	}
 	if a.cfg.Notify.Enabled {
 		// Delivery receipts: the control plane raises push/webhooks/SSE the

@@ -135,14 +135,20 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 	return kv, blob, nil
 }
 
+// ftsIndexPath resolves the bleve index directory: MAILEZINE_FTS_PATH or
+// "<rocks path>.fts". Shared by openFTS and the change-log tailer's
+// watermark file ("<fts path>.sync.json").
+func ftsIndexPath(cfg config.Config) string {
+	if p := cfg.FTS.Path; p != "" {
+		return p
+	}
+	return cfg.Storage.RocksPath + ".fts"
+}
+
 // openFTS opens the embedded bleve index; a corrupt/unusable index disables
 // FTS (search falls back to a full scan).
 func openFTS(cfg config.Config, logger *slog.Logger) *fts.Indexer {
-	path := cfg.FTS.Path
-	if path == "" {
-		base := cfg.Storage.RocksPath
-		path = base + ".fts"
-	}
+	path := ftsIndexPath(cfg)
 	idx, err := fts.Open(path, cfg.FTS.TikaURL, logger)
 	if err != nil {
 		logger.Warn("fts: disabled", "path", path, "err", err)

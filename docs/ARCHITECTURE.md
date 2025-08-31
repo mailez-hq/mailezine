@@ -269,6 +269,12 @@ accept → session(限流/语法) → verify(SPF/DKIM/DMARC) → classify(rspamd
 配套的全局单例 worker（snooze sweeper 等）用 `internal/kvlease` 的命名租约
 （owner + TTL，tick 即续约）跨节点选主，同一时刻全集群恰有一个执行者。
 
+多活下的全文检索由 `internal/ftssync` 收敛：bleve 索引是节点本地的，每个
+节点按账户水位 tail 变更日志（§2.3，INV-CHANGE），create/update 重索引、
+delete 精确删除（变更日志的删除条目扩展携带被删副本的 mailbox 与 UID，
+10 字节旧编码向前兼容）。投递路径在多活下不内联索引——每副本经追踪器恰好
+索引一次。索引是纯派生数据：水位损坏或副本重建时从 0 重放即全量重建。
+
 ### 5.2 队列管理
 
 管理 API（`management`，仅内网 + 共享密钥）暴露：队列深度、按域视图、重试/冻结/

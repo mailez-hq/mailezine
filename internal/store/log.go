@@ -19,6 +19,11 @@ type Change struct {
 	Collection byte
 	DocID      uint64
 	Op         byte
+	// Mailbox and UID are carried by extended email-delete entries so
+	// consumers that maintain derived state (the FTS tailer) can address
+	// the exact copy after the KV row is gone. Empty on legacy entries.
+	Mailbox string
+	UID     uint32
 }
 
 // AppendChange records one change and returns its monotonic change ID
@@ -55,12 +60,26 @@ func encodeChangeValue(collection byte, docID uint64, op byte) []byte {
 	return value
 }
 
+// encodeEmailDeleteValue extends a delete record with the deleted copy's
+// mailbox name and UID. Derived-state consumers (the FTS tailer) cannot
+// recover them after the fact — the KV row is gone by the time the change
+// is read. Layout: the 10-byte base record, then UID (8-byte BE, the
+// EmailFieldUID convention), then a u16 length prefix and the mailbox name.
+func encodeEmailDeleteValue(collection byte, docID uint64, mailbox string, uid uint32) []byte {
+	value := encodeChangeValue(collection, docID, OpDelete)
+	var uidBuf [8]byte
+	binary.BigEndian.PutUint64(uidBuf[:], uint64(uid))
+	value = append(value, uidBuf[:]...)
+	value = binary.BigEndian.AppendUint16(value, uint16(len(mailbox)))
+	return append(value, mailbox...)
+}
+
 // ChangesSince returns changes with changeID > after, in ascending order.
 func (s *Store) ChangesSince(_ context.Context, accountID AccountID, collection byte, after uint64) ([]Change, error) {
 	var out []Change
 	err := s.kv.Scan(ChangeLogPrefix(uint32(accountID), collection), func(k, v []byte) error {
 		changeID := ChangeIDFromLogKey(k)
-		if changeID <= after || len(v) != 10 {
+		if changeID <= after || len(v) < 10 {
 			return nil
 		}
 		out = append(out, Change{
@@ -69,6 +88,14 @@ func (s *Store) ChangesSince(_ context.Context, accountID AccountID, collection 
 			DocID:      binary.BigEndian.Uint64(v[1:9]),
 			Op:         v[9],
 		})
+		// Extended email-delete entries carry the copy's (mailbox, UID).
+		ch := &out[len(out)-1]
+		if ch.Op == OpDelete && len(v) >= 20 {
+			ch.UID = uint32(binary.BigEndian.Uint64(v[10:18]))
+			if n := int(binary.BigEndian.Uint16(v[18:20])); n > 0 && len(v) >= 20+n {
+				ch.Mailbox = string(v[20 : 20+n])
+			}
+		}
 		return nil
 	})
 	if err != nil {

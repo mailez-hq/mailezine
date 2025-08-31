@@ -320,6 +320,8 @@ func (s *Store) DeleteEmailAtomically(
 	return s.txn.WithTxn(ctx, func(t TxnOps) error {
 		var blobID string
 		var size int64
+		var mailbox string
+		var uid uint32
 		var ops []Op
 		// Scan INSIDE the transaction (read-your-writes): the read set joins
 		// the commit, so a concurrent writer racing the delete either
@@ -335,6 +337,12 @@ func (s *Store) DeleteEmailAtomically(
 			case EmailFieldSize:
 				if len(v) == 8 {
 					size = int64(binary.BigEndian.Uint64(v))
+				}
+			case EmailFieldMailbox:
+				mailbox = string(v)
+			case EmailFieldUID:
+				if len(v) == 8 {
+					uid = uint32(binary.BigEndian.Uint64(v))
 				}
 			}
 			return nil
@@ -372,14 +380,20 @@ func (s *Store) DeleteEmailAtomically(
 		}
 
 		// Change log (allocate the next change ID in the same commit).
+		// Email deletes carry the copy's (mailbox, UID): derived-state
+		// consumers cannot recover them after the row is gone.
 		nextChange, err := readCounter(t.Get, changeCounter)
 		if err != nil {
 			return err
 		}
 		nextChange++
+		changeVal := encodeChangeValue(collection, docID, OpDelete)
+		if collection == CollectionEmail && mailbox != "" && uid != 0 {
+			changeVal = encodeEmailDeleteValue(collection, docID, mailbox, uid)
+		}
 		t.Append(
 			Op{Key: changeCounter, Value: beUint64(nextChange)},
-			Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, docID, OpDelete)},
+			Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: changeVal},
 		)
 		t.Append(extra...)
 		return nil
