@@ -37,6 +37,7 @@ import (
 	"mailezine/internal/imap"
 	"mailezine/internal/imapserver"
 	"mailezine/internal/junk"
+	"mailezine/internal/kvlease"
 	"mailezine/internal/mailcache"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/management"
@@ -48,6 +49,7 @@ import (
 	"mailezine/internal/sieve"
 	"mailezine/internal/smtp"
 	"mailezine/internal/snooze"
+	"mailezine/internal/store"
 	"mailezine/internal/telemetry"
 	"mailezine/internal/verify"
 	"mailezine/internal/version"
@@ -125,6 +127,22 @@ type App struct {
 	ready      atomic.Bool // write path bound and served
 	assembled  bool        // services currently open on this process
 	teardownMu sync.Mutex  // serializes teardown paths (term loss + Close)
+
+	clusterNodeID     string
+	clusterNodeIDOnce sync.Once
+}
+
+// nodeID is this instance's cluster identity: the owner recorded in queue
+// claims and singleton leases. Explicitly configured or generated once per
+// process; stable across HA terms.
+func (a *App) nodeID() string {
+	a.clusterNodeIDOnce.Do(func() {
+		a.clusterNodeID = a.cfg.Cluster.NodeID
+		if a.clusterNodeID == "" {
+			a.clusterNodeID = kvlease.RandomNodeID()
+		}
+	})
+	return a.clusterNodeID
 }
 
 // New builds the engine.
@@ -155,6 +173,18 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	if err := a.openServices(); err != nil {
 		a.Close()
 		return nil, err
+	}
+	if a.cfg.Cluster.Mode == "multi" {
+		// Multi-active fencing (queue claims, singleton leases) is only as
+		// strong as the KV's transactional guarantees: require a native
+		// TxnKV backend. The config layer already pinned the backend to
+		// "tidb"; this re-checks what actually opened (registry,
+		// edition), so a buffer-mode fallback can never run silently.
+		if _, ok := a.st.kv.(store.TxnKV); !ok {
+			a.Close()
+			return nil, fmt.Errorf("cluster: multi-active requires a transactional KV backend (tidb); got %T", a.st.kv)
+		}
+		a.logger.Info("cluster mode", "mode", "multi-active", "node", a.nodeID())
 	}
 	if err := a.wirePipeline(a.ctx); err != nil {
 		a.Close()
@@ -274,7 +304,16 @@ func (a *App) openServices() error {
 	// Embedded full-text index (bleve); a failure disables FTS but never
 	// startup (search falls back to the scan).
 	if a.cfg.FTS.Enabled {
-		a.fts = openFTS(a.cfg, a.logger)
+		if a.cfg.Cluster.Mode == "multi" {
+			// bleve is a node-local index: in multi-active each node would
+			// only index the mail its own pipelines delivered, and searches
+			// would silently miss the rest of the cluster's mail. Disable
+			// until the changelog-tailing indexer lands; search falls back
+			// to the (correct, slower) store scan.
+			a.logger.Warn("fts: disabled in multi-active mode (node-local index); search falls back to scan")
+		} else {
+			a.fts = openFTS(a.cfg, a.logger)
+		}
 	}
 	return nil
 }
@@ -338,8 +377,20 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 			Notify:   a.notifyClient,
 			Logger:   a.logger,
 		}
-		go sw.Run(runCtx, time.Duration(a.cfg.SnoozeInterval)*time.Second)
-		a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval)
+		interval := time.Duration(a.cfg.SnoozeInterval) * time.Second
+		if a.cfg.Cluster.Mode == "multi" {
+			// Exactly one node sweeps at a time: the flag rewrite is
+			// idempotent, but the receipt fires push/SSE and must not
+			// repeat per node. The lease TTL covers several sweep
+			// intervals — a node whose sweeps stall loses the lease and a
+			// successor takes over (at-least-once, like every worker).
+			l := kvlease.New(a.st.kv, "snooze-sweeper", a.nodeID(), 90*time.Second)
+			go l.Run(runCtx, interval, func(ctx context.Context) { sw.SweepOnce(ctx) })
+			a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval, "leased", true)
+		} else {
+			go sw.Run(runCtx, interval)
+			a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval)
+		}
 	}
 	if classifier != nil {
 		// Never assign a typed nil to the interface: an unconfigured
@@ -478,8 +529,8 @@ func (a *App) serveHealth(ctx context.Context) error {
 	})
 	mux.HandleFunc("/ready", func(w http.ResponseWriter, _ *http.Request) {
 		a.m.HealthChecks.WithLabelValues("/ready").Inc()
-		fmt.Fprintf(w, `{"status":"ok","role":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
-			a.role(), a.cfg.Storage.Backend, a.cfg.Directory.Mode,
+		fmt.Fprintf(w, `{"status":"ok","role":%q,"cluster":%q,"storage":%q,"directory":%q,"rspamd":%v,"outbound":%v}`,
+			a.role(), a.cfg.Cluster.Mode, a.cfg.Storage.Backend, a.cfg.Directory.Mode,
 			a.classifier != nil, a.cfg.Outbound.Enabled)
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(a.m.Registry, promhttp.HandlerOpts{}))
@@ -488,10 +539,13 @@ func (a *App) serveHealth(ctx context.Context) error {
 }
 
 func (a *App) role() string {
-	if a.ready.Load() {
-		return "leader"
+	if !a.ready.Load() {
+		return "standby"
 	}
-	return "standby"
+	if a.cfg.Cluster.Mode == "multi" {
+		return "active"
+	}
+	return "leader"
 }
 
 // serveManagement binds the management API when configured. In HA mode it

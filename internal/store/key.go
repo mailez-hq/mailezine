@@ -185,6 +185,16 @@ func MetaNextAccountKey() []byte {
 	return append(k, "next_account"...)
 }
 
+// MetaLeaseKey addresses a named coordination lease in the meta space —
+// singleton worker election in multi-active deployments. The value is the
+// JSON record {owner, until}; fencing is the read-modify-write transaction
+// of the underlying TxnKV.
+func MetaLeaseKey(name string) []byte {
+	k := []byte{SpaceMeta}
+	k = append(k, "lease:"...)
+	return append(k, name...)
+}
+
 // MetaVacationKey returns the key of the vacation last-sent state for
 // (account, sender).
 func MetaVacationKey(account, sender string) []byte {

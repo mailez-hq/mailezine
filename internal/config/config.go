@@ -33,6 +33,7 @@ type Config struct {
 	Storage        StorageConfig
 	FTS            FTSConfig
 	HA             HAConfig
+	Cluster        ClusterConfig
 	Directory      DirectoryConfig
 	Auth           AuthConfig
 	Management     ManagementConfig
@@ -54,10 +55,10 @@ type Config struct {
 	// header; headers from other peers are rejected (client-IP forgery
 	// guard). Defaults to loopback and private ranges.
 	ProxyTrusted []string
-	Queue              QueueConfig
-	Limits             limits.Config
-	Features           FeaturesConfig
-	Notify             NotifyConfig
+	Queue        QueueConfig
+	Limits       limits.Config
+	Features     FeaturesConfig
+	Notify       NotifyConfig
 	// SnoozeInterval is the seconds between snooze wake-up sweeps; 0
 	// disables the sweeper (due messages then only resurface lazily when
 	// the snoozed view is opened).
@@ -239,6 +240,24 @@ type QueueConfig struct {
 	// DelayWarning is the interval after which a still-queued message
 	// triggers a delay warning; 0 disables.
 	DelayWarning time.Duration
+	// ClaimLease bounds one delivery attempt's claim in multi-active
+	// deployments; 0 keeps the 10m default.
+	ClaimLease time.Duration
+}
+
+// ClusterConfig selects the engine clustering mode.
+type ClusterConfig struct {
+	// Mode is "single" (default) or "multi". Multi runs every engine
+	// service on every node against shared transactional storage (TiDB):
+	// the outbound queue claims deliveries per message, singleton workers
+	// are leased across nodes and any node can serve any account. It
+	// replaces the HA leader/standby model — the two are mutually
+	// exclusive.
+	Mode string
+	// NodeID identifies this node in claim ownership and singleton leases;
+	// empty auto-generates a per-process ID. Set it when logs and queue
+	// states should name a stable node.
+	NodeID string
 }
 
 // FeaturesConfig gates optional components; switches only decide whether a
@@ -402,6 +421,10 @@ func Load() (Config, error) {
 			LeasePath:  getenv("MAILEZINE_HA_LEASE_PATH", ""),
 			TTLSeconds: envInt("MAILEZINE_HA_TTL_SECONDS", 15),
 		},
+		Cluster: ClusterConfig{
+			Mode:   getenv("MAILEZINE_CLUSTER_MODE", "single"),
+			NodeID: getenv("MAILEZINE_CLUSTER_NODE_ID", ""),
+		},
 		Directory: DirectoryConfig{
 			Mode:     getenv("MAILEZINE_DIRECTORY_MODE", "dev"),
 			File:     getenv("MAILEZINE_DIRECTORY_FILE", ""),
@@ -466,6 +489,7 @@ func Load() (Config, error) {
 			MaxRetry:     time.Duration(envInt("MAILEZINE_QUEUE_MAX_RETRY_SECONDS", 24*3600)) * time.Second,
 			PollInterval: time.Duration(envInt("MAILEZINE_QUEUE_POLL_INTERVAL_SECONDS", 5)) * time.Second,
 			DelayWarning: time.Duration(envInt("MAILEZINE_QUEUE_DELAY_WARNING_SECONDS", 300)) * time.Second,
+			ClaimLease:   time.Duration(envInt("MAILEZINE_QUEUE_CLAIM_LEASE_SECONDS", 600)) * time.Second,
 		},
 		Limits: limits.Defaults(),
 		Features: FeaturesConfig{
@@ -548,6 +572,18 @@ func (c Config) Validate() error {
 			return fmt.Errorf("config: S3 blob requires MAILEZINE_S3_ACCESS_KEY, MAILEZINE_S3_SECRET_KEY and MAILEZINE_S3_BUCKET")
 		}
 	}
+	switch c.Cluster.Mode {
+	case "", "single":
+	case "multi":
+		if c.HA.Enabled {
+			return fmt.Errorf("config: cluster.mode=multi and ha.enabled are mutually exclusive (multi-active replaces leader/standby)")
+		}
+		if c.Storage.Backend != "tidb" {
+			return fmt.Errorf("config: cluster.mode=multi requires storage backend \"tidb\" (claims and singleton leases need transactional fencing)")
+		}
+	default:
+		return fmt.Errorf("config: unsupported cluster mode %q (want single|multi)", c.Cluster.Mode)
+	}
 	switch c.Directory.Mode {
 	case "dev":
 		if c.Directory.File == "" {
@@ -627,8 +663,8 @@ func (c Config) Summary() string {
 		junk = "basic"
 	}
 	return fmt.Sprintf(
-		"storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%s jmap=%v maxMsg=%d",
-		c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Outbound.Enabled,
+		"cluster=%s storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%s jmap=%v maxMsg=%d",
+		c.Cluster.Mode, c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Outbound.Enabled,
 		lic, c.HealthAddr, c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
 		c.Features.POP3Enabled, junk, c.Features.JMAPEnabled,
 		c.Limits.MaxMessageSize,

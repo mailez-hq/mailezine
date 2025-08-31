@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mailezine/internal/kvlease"
 	"mailezine/internal/metrics"
 	"mailezine/internal/store"
 )
@@ -77,6 +78,11 @@ type Message struct {
 	CreatedAt     time.Time   `json:"createdAt"`
 	UpdatedAt     time.Time   `json:"updatedAt"`
 	LastWarningAt time.Time   `json:"lastWarningAt,omitempty"`
+	// Owner is the node that claimed the ACTIVE delivery; LeaseUntil is
+	// when that claim may be stolen (crash recovery). Multi-active only —
+	// empty in single-node deployments.
+	Owner      string    `json:"owner,omitempty"`
+	LeaseUntil time.Time `json:"leaseUntil,omitempty"`
 }
 
 // Options tunes the scheduler.
@@ -89,6 +95,15 @@ type Options struct {
 	// DelayWarning is the interval after which a still-queued message
 	// triggers a delay warning; 0 disables.
 	DelayWarning time.Duration
+	// NodeID identifies this manager in claim ownership (multi-active
+	// deployments); empty auto-generates a per-process ID.
+	NodeID string
+	// ClaimLease bounds how long one delivery attempt may run before
+	// another node may steal the claim. It must comfortably exceed the
+	// worst-case single delivery (MX fallbacks, slow recipients); a steal
+	// under a live worker turns into an at-least-once duplicate. Default
+	// 10m.
+	ClaimLease time.Duration
 	// Now overrides time.Now for deterministic tests.
 	Now func() time.Time
 }
@@ -102,12 +117,18 @@ func DefaultOptions() Options {
 		PollInterval: 5 * time.Second,
 		Workers:      16,
 		DelayWarning: 5 * time.Minute,
+		ClaimLease:   10 * time.Minute,
 	}
 }
 
-// Manager owns the queue: spooling, scheduling and outcome recording.
+// Manager owns the queue: spooling, scheduling and outcome recording. In
+// multi-active deployments several managers share one KV+blob pair; every
+// due message is claimed transactionally before delivery and outcomes are
+// fenced by claim ownership, so each message has exactly one live worker
+// at a time across the deployment.
 type Manager struct {
 	kv        store.KV
+	txn       store.TxnKV
 	blob      store.Blob
 	deliver   Deliverer
 	signer    Signer
@@ -117,6 +138,8 @@ type Manager struct {
 	mtr       *metrics.Metrics // optional Prometheus instrumentation (SetMetrics)
 	logger    *slog.Logger
 	opts      Options
+	nodeID    string
+	lease     time.Duration
 
 	mu        sync.Mutex // serializes ID allocation
 	workerSem chan struct{}
@@ -166,18 +189,28 @@ func New(kv store.KV, blob store.Blob, deliver Deliverer, opts Options, logger *
 	if opts.Workers <= 0 {
 		opts.Workers = DefaultOptions().Workers
 	}
+	if opts.ClaimLease <= 0 {
+		opts.ClaimLease = DefaultOptions().ClaimLease
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
 	if logger == nil {
 		logger = slog.Default()
 	}
+	nodeID := opts.NodeID
+	if nodeID == "" {
+		nodeID = kvlease.RandomNodeID()
+	}
 	return &Manager{
 		kv:        kv,
+		txn:       store.AsTxn(kv),
 		blob:      blob,
 		deliver:   deliver,
 		logger:    logger,
 		opts:      opts,
+		nodeID:    nodeID,
+		lease:     opts.ClaimLease,
 		workerSem: make(chan struct{}, opts.Workers),
 		wake:      make(chan struct{}, 1),
 	}
@@ -212,7 +245,7 @@ func (m *Manager) Submit(ctx context.Context, from string, to []string, subject 
 	}
 	body := bytes.NewReader(data)
 	m.mu.Lock()
-	id, err := m.nextID()
+	id, err := m.nextID(ctx)
 	m.mu.Unlock()
 	if err != nil {
 		return 0, err
@@ -344,12 +377,12 @@ func (m *Manager) Retry(ctx context.Context, id uint64) error {
 	if msg.State == StateActive {
 		return fmt.Errorf("queue: message %d is being delivered; retry after it completes", id)
 	}
-	oldNext := msg.NextAttempt
+	oldDue := duePos(msg)
 	now := m.opts.Now()
 	msg.State = StateQueued
 	msg.Attempts = 0
 	msg.NextAttempt = now
-	return m.save(msg, oldNext)
+	return m.save(msg, oldDue)
 }
 
 // Cancel withdraws a message from the queue and removes its body blob.
@@ -367,7 +400,7 @@ func (m *Manager) Cancel(ctx context.Context, id uint64) error {
 	}
 	ops := []store.Op{
 		{Key: store.QueueKey(queueName, id), Delete: true},
-		{Key: store.QueueDueKey(msg.NextAttempt.Unix(), id), Delete: true},
+		{Key: store.QueueDueKey(duePos(msg).Unix(), id), Delete: true},
 	}
 	if err := m.kv.Batch(ops); err != nil {
 		return err
@@ -381,17 +414,25 @@ func (m *Manager) Cancel(ctx context.Context, id uint64) error {
 	return nil
 }
 
-func (m *Manager) nextID() (uint64, error) {
-	v, err := m.kv.Get(store.QueueCounterKey())
-	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		return 0, err
-	}
+// nextID allocates the next message ID. The read-modify-write runs inside
+// a transaction so multi-active managers sharing the store cannot hand out
+// the same ID (serialized by conflict replay on TiDB, by the write lock on
+// the in-memory backend, by m.mu on buffer-mode single-node backends).
+func (m *Manager) nextID(ctx context.Context) (uint64, error) {
 	var next uint64
-	if len(v) == 8 {
-		next = binary.BigEndian.Uint64(v)
-	}
-	next++
-	if err := m.kv.Put(store.QueueCounterKey(), beUint64(next)); err != nil {
+	err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+		v, err := t.Get(store.QueueCounterKey())
+		if err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+		if len(v) == 8 {
+			next = binary.BigEndian.Uint64(v)
+		}
+		next++
+		t.Put(store.QueueCounterKey(), beUint64(next))
+		return nil
+	})
+	if err != nil {
 		return 0, err
 	}
 	return next, nil
@@ -409,89 +450,132 @@ func (m *Manager) load(_ context.Context, id uint64) (Message, error) {
 	return msg, nil
 }
 
-// save persists metadata and keeps the due index consistent with
-// NextAttempt. oldNext is the value before the update (for index moves).
-func (m *Manager) save(msg Message, oldNext time.Time) error {
+// duePos is a message's position in the due index: when the scheduler next
+// needs to look at it — the next attempt while it waits, the claim expiry
+// while a worker delivers (so a crashed owner is rediscovered exactly when
+// its claim lapses).
+func duePos(msg Message) time.Time {
+	if msg.State == StateActive {
+		return msg.LeaseUntil
+	}
+	return msg.NextAttempt
+}
+
+// save persists metadata and keeps the due index consistent with duePos.
+// oldDue is the index position before the update (zero for new messages).
+func (m *Manager) save(msg Message, oldDue time.Time) error {
 	msg.UpdatedAt = m.opts.Now()
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 	ops := []store.Op{{Key: store.QueueKey(queueName, msg.ID), Value: data}}
+	newDue := duePos(msg)
 	switch {
 	case isTerminal(msg.State):
-		ops = append(ops, store.Op{Key: store.QueueDueKey(msg.NextAttempt.Unix(), msg.ID), Delete: true})
-	case oldNext.IsZero():
+		ops = append(ops, store.Op{Key: store.QueueDueKey(oldDue.Unix(), msg.ID), Delete: true})
+	case oldDue.IsZero():
 		// New message: create the due index entry here.
-		ops = append(ops, store.Op{Key: store.QueueDueKey(msg.NextAttempt.Unix(), msg.ID), Value: nil})
-	case !oldNext.Equal(msg.NextAttempt):
+		ops = append(ops, store.Op{Key: store.QueueDueKey(newDue.Unix(), msg.ID), Value: nil})
+	case !oldDue.Equal(newDue):
 		ops = append(ops,
-			store.Op{Key: store.QueueDueKey(oldNext.Unix(), msg.ID), Delete: true},
-			store.Op{Key: store.QueueDueKey(msg.NextAttempt.Unix(), msg.ID), Value: nil},
+			store.Op{Key: store.QueueDueKey(oldDue.Unix(), msg.ID), Delete: true},
+			store.Op{Key: store.QueueDueKey(newDue.Unix(), msg.ID), Value: nil},
 		)
 	}
 	return m.kv.Batch(ops)
 }
 
+// claim atomically takes ownership of one due message: a QUEUED/DEFERRED
+// message transitions to ACTIVE under this node's identity; an ACTIVE
+// message whose claim expired is stolen — counting as an attempt, so a
+// crash-looping owner cannot deliver forever. Terminal leftovers self-heal
+// their stale due entries. It returns false when another node holds a live
+// claim (the scheduler skips the message).
+func (m *Manager) claim(ctx context.Context, id uint64, out *Message) (bool, error) {
+	now := m.opts.Now()
+	claimed := false
+	err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+		claimed = false
+		v, err := t.Get(store.QueueKey(queueName, id))
+		if err != nil {
+			return err
+		}
+		var cur Message
+		if err := json.Unmarshal(v, &cur); err != nil {
+			return err
+		}
+		if isTerminal(cur.State) {
+			t.Delete(store.QueueDueKey(duePos(cur).Unix(), id))
+			return nil
+		}
+		if cur.State == StateActive && cur.LeaseUntil.After(now) {
+			return nil // live claim (ours or a foreign node's): hands off
+		}
+		if cur.State == StateActive {
+			// Steal after expiry: the previous owner crashed or stalled
+			// mid-delivery. The outcome is unknowable — at-least-once.
+			cur.LastError = "claim expired"
+		}
+		oldDue := duePos(cur)
+		cur.State = StateActive
+		cur.Owner = m.nodeID
+		cur.LeaseUntil = now.Add(m.lease)
+		cur.Attempts++
+		data, err := json.Marshal(cur)
+		if err != nil {
+			return err
+		}
+		t.Put(store.QueueKey(queueName, id), data)
+		// Re-index at the claim expiry so a crashed owner is rediscovered
+		// exactly when its claim lapses.
+		t.Append(
+			store.Op{Key: store.QueueDueKey(oldDue.Unix(), id), Delete: true},
+			store.Op{Key: store.QueueDueKey(cur.LeaseUntil.Unix(), id), Value: nil},
+		)
+		*out = cur
+		claimed = true
+		return nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return claimed, nil
+}
+
+// processMessage claims one due message and delivers it under the claim.
 func (m *Manager) processMessage(ctx context.Context, id uint64) error {
-	msg, err := m.load(ctx, id)
+	var msg Message
+	claimed, err := m.claim(ctx, id, &msg)
 	if err != nil {
 		return err
 	}
-	if isTerminal(msg.State) {
-		_ = m.kv.Delete(store.QueueDueKey(msg.NextAttempt.Unix(), id))
+	if !claimed {
 		return nil
 	}
+
 	var body bytes.Buffer
 	if err := m.blob.Get(ctx, msg.BlobID, &body); err != nil {
 		// Blob read failures are storage-transient, not a verdict on the
 		// message: defer with backoff instead of terminating it. Only retry
 		// exhaustion (or a permanently missing blob) bounces — with the DSN
 		// noting the storage failure rather than a delivery verdict.
-		oldNext := msg.NextAttempt
-		err = fmt.Errorf("blob read: %w", err)
-		msg.Attempts++
-		msg.LastError = err.Error()
-		for i := range msg.Recipients {
-			if msg.Recipients[i].Status == RecipientPending {
-				msg.Recipients[i].LastError = msg.LastError
-			}
-		}
-		if msg.Attempts >= msg.MaxAttempts {
-			for i := range msg.Recipients {
-				if msg.Recipients[i].Status == RecipientPending {
-					msg.Recipients[i].Status = RecipientBounced
-				}
-			}
-			msg.State = StateBounced
-			m.event("bounced")
-			m.maybeBounce(ctx, &msg, nil)
-		} else {
-			msg.State = StateDeferred
-			msg.NextAttempt = m.opts.Now().Add(backoff(m.opts, msg.Attempts))
-			m.event("deferred")
-		}
-		if isTerminal(msg.State) {
-			_ = m.blob.Delete(ctx, msg.BlobID)
-		}
-		return m.save(msg, oldNext)
+		m.applyTransportFailure(&msg, fmt.Errorf("blob read: %w", err))
+		return m.commitOutcome(ctx, &msg, nil)
 	}
 
-	var pending []string
+	pending := make([]string, 0, len(msg.Recipients))
 	for _, r := range msg.Recipients {
 		if r.Status == RecipientPending {
 			pending = append(pending, r.Address)
 		}
 	}
 	if len(pending) == 0 {
-		return nil
-	}
-
-	oldNext := msg.NextAttempt
-	msg.State = StateActive
-	msg.Attempts++
-	if err := m.save(msg, oldNext); err != nil {
-		return err
+		// Nothing left to deliver (cross-round leftovers): finalize now
+		// instead of idling on a claim that would ping-pong between nodes
+		// at every expiry.
+		m.finalizeState(&msg)
+		return m.commitOutcome(ctx, &msg, body.Bytes())
 	}
 
 	start := time.Now()
@@ -504,14 +588,13 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		// retry can duplicate for recipients whose copy actually landed
 		// (SMTP has no per-recipient transaction; LMTP is not an option
 		// against remote MXes). Failures before DATA cannot duplicate.
-		return m.deferAll(ctx, &msg, oldNext, derr, body.Bytes())
+		m.applyTransportFailure(&msg, derr)
+		return m.commitOutcome(ctx, &msg, body.Bytes())
 	}
 	byAddr := map[string]Result{}
 	for _, res := range results {
 		byAddr[res.To] = res
 	}
-
-	bounced := 0
 	for i := range msg.Recipients {
 		r := &msg.Recipients[i]
 		if r.Status != RecipientPending {
@@ -528,61 +611,16 @@ func (m *Manager) processMessage(ctx context.Context, id uint64) error {
 		r.LastError = resultError(res)
 		if res.Permanent {
 			r.Status = RecipientBounced
-			bounced++
 		}
 	}
-
-	// Terminal state is decided by "no recipient remains pending", not by
-	// this round's counts: a cross-round partial success (round 1 resolved
-	// some recipients, round 2 the rest) must still terminate — and a
-	// recipient that fails PERMANENTLY in a later round must still get its
-	// bounce DSN instead of the message idling in deferred forever.
-	pendingLeft := 0
-	for i := range msg.Recipients {
-		if msg.Recipients[i].Status == RecipientPending {
-			pendingLeft++
-		}
-	}
-	switch {
-	case pendingLeft == 0 && bounced == 0:
-		msg.State = StateDelivered
-		msg.LastError = ""
-		m.event("delivered")
-	case pendingLeft == 0:
-		msg.State = StateBounced
-		m.event("bounced")
-		m.maybeBounce(ctx, &msg, body.Bytes())
-	case msg.Attempts >= msg.MaxAttempts:
-		for i := range msg.Recipients {
-			if msg.Recipients[i].Status == RecipientPending {
-				msg.Recipients[i].Status = RecipientBounced
-				bounced++
-			}
-		}
-		msg.State = StateBounced
-		m.event("bounced")
-		m.maybeBounce(ctx, &msg, body.Bytes())
-	default:
-		msg.State = StateDeferred
-		msg.NextAttempt = m.opts.Now().Add(backoff(m.opts, msg.Attempts))
-		m.event("deferred")
-		m.maybeDelayWarning(ctx, &msg, body.Bytes())
-	}
-	// Commit the terminal state BEFORE reclaiming the blob: a crash between
-	// the two must leave the KV row terminal (a leaked blob is GC-able),
-	// never an active row pointing at a deleted blob — that would spin the
-	// retry loop on a missing body and, once attempts run out, bounce mail
-	// that may already have been delivered.
-	if err := m.save(msg, oldNext); err != nil {
-		return err
-	}
-	if isTerminal(msg.State) {
-		_ = m.blob.Delete(ctx, msg.BlobID)
-	}
-	return nil
+	m.finalizeState(&msg)
+	return m.commitOutcome(ctx, &msg, body.Bytes())
 }
 
-func (m *Manager) deferAll(ctx context.Context, msg *Message, oldNext time.Time, err error, body []byte) error {
+// applyTransportFailure mutates msg for a transport-level failure (or an
+// unreadable spool): every pending recipient defers with backoff, and retry
+// exhaustion terminates the message.
+func (m *Manager) applyTransportFailure(msg *Message, err error) {
 	for i := range msg.Recipients {
 		if msg.Recipients[i].Status == RecipientPending {
 			msg.Recipients[i].LastError = err.Error()
@@ -597,20 +635,114 @@ func (m *Manager) deferAll(ctx context.Context, msg *Message, oldNext time.Time,
 		}
 		msg.State = StateBounced
 		m.event("bounced")
-		m.maybeBounce(ctx, msg, body)
-	} else {
+		return
+	}
+	msg.State = StateDeferred
+	msg.NextAttempt = m.opts.Now().Add(backoff(m.opts, msg.Attempts))
+	m.event("deferred")
+}
+
+// finalizeState decides the post-round state after per-recipient outcomes
+// have been applied. Terminal state is decided by "no recipient remains
+// pending", not by this round's counts: a cross-round partial success
+// (round 1 resolved some recipients, round 2 the rest) must still
+// terminate — and a recipient that fails PERMANENTLY in a later round must
+// still get its bounce DSN instead of the message idling in deferred
+// forever.
+func (m *Manager) finalizeState(msg *Message) {
+	bounced, pendingLeft := 0, 0
+	for _, r := range msg.Recipients {
+		switch r.Status {
+		case RecipientPending:
+			pendingLeft++
+		case RecipientBounced:
+			bounced++
+		}
+	}
+	switch {
+	case pendingLeft == 0 && bounced == 0:
+		msg.State = StateDelivered
+		msg.LastError = ""
+		m.event("delivered")
+	case pendingLeft == 0:
+		msg.State = StateBounced
+		m.event("bounced")
+	case msg.Attempts >= msg.MaxAttempts:
+		for i := range msg.Recipients {
+			if msg.Recipients[i].Status == RecipientPending {
+				msg.Recipients[i].Status = RecipientBounced
+				bounced++
+			}
+		}
+		msg.State = StateBounced
+		m.event("bounced")
+	default:
 		msg.State = StateDeferred
 		msg.NextAttempt = m.opts.Now().Add(backoff(m.opts, msg.Attempts))
 		m.event("deferred")
-		m.maybeDelayWarning(ctx, msg, body)
 	}
-	// Same ordering as processMessage: terminal state first, blob reclaim
-	// only after the state is durably committed.
-	if err := m.save(*msg, oldNext); err != nil {
+}
+
+// commitOutcome durably records the outcome of a claimed delivery. The
+// write is fenced by claim ownership: when the claim was stolen after its
+// lease expired (owner changed under us), the outcome is discarded — the
+// stealing node is already re-delivering and must not be overwritten by a
+// stale worker. Bounce/delay DSNs fire only after the state is committed,
+// and the terminal blob reclaim follows the commit (a crash between the
+// two must leave the KV row terminal — a leaked blob is GC-able — never an
+// active row pointing at a deleted blob: that would spin the retry loop on
+// a missing body and, once attempts run out, bounce mail that may already
+// have been delivered).
+func (m *Manager) commitOutcome(ctx context.Context, msg *Message, body []byte) error {
+	oldDue := duePos(*msg) // our claim position in the due index
+	committed := false
+	err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+		committed = false
+		v, err := t.Get(store.QueueKey(queueName, msg.ID))
+		if err != nil {
+			return err
+		}
+		var cur Message
+		if err := json.Unmarshal(v, &cur); err != nil {
+			return err
+		}
+		if cur.State != StateActive || cur.Owner != m.nodeID {
+			return nil // claim was stolen; drop our outcome
+		}
+		msg.UpdatedAt = m.opts.Now()
+		data, err := json.Marshal(msg)
+		if err != nil {
+			return err
+		}
+		t.Put(store.QueueKey(queueName, msg.ID), data)
+		newDue := duePos(*msg)
+		if isTerminal(msg.State) {
+			t.Delete(store.QueueDueKey(oldDue.Unix(), msg.ID))
+		} else {
+			t.Append(
+				store.Op{Key: store.QueueDueKey(oldDue.Unix(), msg.ID), Delete: true},
+				store.Op{Key: store.QueueDueKey(newDue.Unix(), msg.ID), Value: nil},
+			)
+		}
+		committed = true
+		return nil
+	})
+	if err != nil {
 		return err
 	}
+	if !committed {
+		m.logger.Warn("queue: claim lost; outcome discarded", "message", msg.ID, "owner", msg.Owner)
+		return nil
+	}
 	if isTerminal(msg.State) {
-		_ = m.blob.Delete(ctx, msg.BlobID)
+		if err := m.blob.Delete(ctx, msg.BlobID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+	if msg.State == StateBounced {
+		m.maybeBounce(ctx, msg, body)
+	} else if msg.State == StateDeferred {
+		m.maybeDelayWarning(ctx, msg, body)
 	}
 	return nil
 }

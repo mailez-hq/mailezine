@@ -254,6 +254,21 @@ accept → session(限流/语法) → verify(SPF/DKIM/DMARC) → classify(rspamd
 - DSN：自研 `internal/maildsn`（RFC 3464）生成；bounce 走回入站管道。
 - SRS：转发路径在信封阶段经 `/stack/directory/srs/*` 改写（沿用 mailez 边界策略）。
 
+### 5.1.1 多活认领（cluster.mode=multi）
+
+多副本共享同一 KV+blob 时，`QUEUED/DEFERRED → ACTIVE` 的迁移是一次 KV 事务
+内的**认领**：记录 `owner`（节点 ID）与 `leaseUntil`（租期），并把到期索引
+条目挪到租期时刻——于是任一副本的调度扫描天然跳过“他副本持有有效租约”的
+消息，而持有者崩溃后，消息恰好在租期到期时重新可见、被任意副本接管
+（接管计一次尝试，crash-loop 有界）。投递结果的写回以 ownership fencing
+为前置条件：认领已丢失的迟到 worker 其写回整批丢弃，绝不覆盖接管者的
+状态。消息 ID 分配（counter 自增）同样在事务内，多副本不重号。租期默认
+10 分钟（`MAILEZINE_QUEUE_CLAIM_LEASE_SECONDS`），须大于最慢单次投递；
+租约窗口内接管造成的重复投递符合 at-least-once 语义（与单机崩溃恢复一致）。
+
+配套的全局单例 worker（snooze sweeper 等）用 `internal/kvlease` 的命名租约
+（owner + TTL，tick 即续约）跨节点选主，同一时刻全集群恰有一个执行者。
+
 ### 5.2 队列管理
 
 管理 API（`management`，仅内网 + 共享密钥）暴露：队列深度、按域视图、重试/冻结/

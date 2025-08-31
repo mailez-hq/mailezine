@@ -64,6 +64,12 @@ func (a *App) wireQueue(runCtx context.Context) error {
 	if q.DelayWarning > 0 {
 		qOpts.DelayWarning = q.DelayWarning
 	}
+	if q.ClaimLease > 0 {
+		qOpts.ClaimLease = q.ClaimLease
+	}
+	// Shared identity for queue claims and singleton leases so operations
+	// ("who owns this delivery") name the same node in every log line.
+	qOpts.NodeID = a.nodeID()
 	a.qm = queue.New(a.st.kv, a.st.blob, deliverer, qOpts, a.logger)
 	a.qm.SetSigner(opportunisticSigner{dkim.NewSigner(a.cfg.DKIMVaultURL, a.logger, a.cfg.StackSecret), a.logger})
 	a.qm.SetOnEvent(func(event string) {
