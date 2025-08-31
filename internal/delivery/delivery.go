@@ -90,10 +90,23 @@ type Pipeline struct {
 	// implementations spool into the outbound queue. When nil, redirects
 	// are logged and skipped (the local copy still applies).
 	Redirect func(ctx context.Context, from, to string, data []byte) error
-	Logger   *slog.Logger
+	// Gate optionally serializes per-account writers ACROSS nodes
+	// (multi-active): each target's storage section runs under the node's
+	// ownership lease for that account, absorbing cross-node write
+	// conflicts. Advisory — nil keeps direct writes.
+	Gate   AccountGate
+	Logger *slog.Logger
 
 	vacationMu   sync.Mutex
 	vacationLast map[string]time.Time // "account\x00sender" -> last auto-reply
+}
+
+// AccountGate serializes the per-account write section across nodes.
+// WithAccount returns once the account is locally owned (after a bounded
+// wait on a foreign owner) or proceeds without ownership — implementations
+// are advisory and never change write correctness.
+type AccountGate interface {
+	WithAccount(ctx context.Context, account string, fn func() error) error
 }
 
 // Notifier receives delivery receipts after mail lands in local mailboxes.
@@ -527,6 +540,28 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 		return fmt.Errorf("delivery: resolve %s: %w", rcpt, err)
 	}
 	for _, target := range targets {
+		if p.Gate == nil {
+			if err := p.deliverToTarget(ctx, target, envTo, from, targets, stored, raw); err != nil {
+				return err
+			}
+			continue
+		}
+		// The whole storage section for one account runs under the node's
+		// ownership lease: cross-node writers queue here instead of
+		// colliding on the account's hot keys.
+		if err := p.Gate.WithAccount(ctx, target, func() error {
+			return p.deliverToTarget(ctx, target, envTo, from, targets, stored, raw)
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// deliverToTarget runs the per-account section of the pipeline: quota
+// checks, Sieve routing and one stored copy per destination mailbox.
+func (p *Pipeline) deliverToTarget(ctx context.Context, target, envTo, from string, targets []string, stored, raw []byte) error {
+	{
 		size := int64(len(raw))
 		if err := p.checkQuota(ctx, target, size); err != nil {
 			return err
@@ -545,7 +580,7 @@ func (p *Pipeline) deliverTo(ctx context.Context, rcpt, from string, stored, raw
 					p.Logger.Warn("delivery: sieve run", "account", target, "err", rerr)
 				} else if res.Discard {
 					p.Logger.Debug("delivery: sieve discard", "account", target)
-					continue
+					return nil
 				} else if res.Reject != "" {
 					p.Logger.Info("delivery: sieve reject", "account", target, "reason", res.Reject)
 					return fmt.Errorf("%w: %s", ErrSieveReject, res.Reject)

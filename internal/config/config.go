@@ -34,6 +34,7 @@ type Config struct {
 	FTS            FTSConfig
 	HA             HAConfig
 	Cluster        ClusterConfig
+	AccountGate    AccountGateConfig
 	Directory      DirectoryConfig
 	Auth           AuthConfig
 	Management     ManagementConfig
@@ -260,6 +261,16 @@ type ClusterConfig struct {
 	NodeID string
 }
 
+// AccountGateConfig controls the per-account write serializer in
+// multi-active deployments: writers for one account queue on the node
+// holding the account's ownership lease instead of colliding on its hot
+// KV keys. Advisory (bounded wait, then proceed) — never affects
+// correctness.
+type AccountGateConfig struct {
+	Enabled     bool
+	WaitSeconds int // bounded wait on a foreign owner before proceeding
+}
+
 // FeaturesConfig gates optional components; switches only decide whether a
 // component starts, never the semantics of the core path (ARCHITECTURE.md §10.3).
 type FeaturesConfig struct {
@@ -424,6 +435,10 @@ func Load() (Config, error) {
 		Cluster: ClusterConfig{
 			Mode:   getenv("MAILEZINE_CLUSTER_MODE", "single"),
 			NodeID: getenv("MAILEZINE_CLUSTER_NODE_ID", ""),
+		},
+		AccountGate: AccountGateConfig{
+			Enabled:     envBool("MAILEZINE_ACCOUNT_GATE_ENABLED", true),
+			WaitSeconds: envInt("MAILEZINE_ACCOUNT_GATE_WAIT_SECONDS", 5),
 		},
 		Directory: DirectoryConfig{
 			Mode:     getenv("MAILEZINE_DIRECTORY_MODE", "dev"),

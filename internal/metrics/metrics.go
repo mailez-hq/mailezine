@@ -17,6 +17,7 @@ type Metrics struct {
 	DirectoryRequests *prometheus.CounterVec
 	QueueMessages     *prometheus.CounterVec
 	QueueClaims       *prometheus.CounterVec
+	AccountGateEvents *prometheus.CounterVec
 
 	SMTPConnections       prometheus.Counter
 	SMTPConnectionsActive prometheus.Gauge
@@ -49,6 +50,10 @@ func New() *Metrics {
 			Name: "mailezine_queue_claims_total",
 			Help: "Outbound delivery claims, by outcome: claimed (this node took a due message), stolen (took over an expired claim after a crashed/stalled owner), lost (this node's outcome was discarded because the claim was stolen from under it). Multi-active health signal: a sustained steal/lost rate means claim leases are too short or nodes are dying mid-delivery.",
 		}, []string{"outcome"}),
+		AccountGateEvents: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "mailezine_account_gate_events_total",
+			Help: "Per-account write-gate events, by kind: wait (a writer waited for a foreign account owner — the contention the gate exists to absorb) and fallback (a writer proceeded without the lease after the bounded wait; correctness unaffected, conflicts fall back to transactional replay).",
+		}, []string{"kind"}),
 		SMTPConnections: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "mailezine_smtp_connections_total",
 			Help: "SMTP connections accepted (inbound and submission).",
@@ -83,7 +88,7 @@ func New() *Metrics {
 			Buckets: prometheus.DefBuckets,
 		}, []string{"result"}),
 	}
-	reg.MustRegister(m.HealthChecks, m.DirectoryRequests, m.QueueMessages, m.QueueClaims,
+	reg.MustRegister(m.HealthChecks, m.DirectoryRequests, m.QueueMessages, m.QueueClaims, m.AccountGateEvents,
 		m.SMTPConnections, m.SMTPConnectionsActive, m.SMTPMessagesIn,
 		m.SMTPAuthFailures, m.IMAPSessionsActive, m.POP3Sessions,
 		m.QueueDepth, m.DeliveryDuration)
@@ -175,4 +180,22 @@ func (m *Metrics) QueueClaimEvent(outcome string) {
 		return
 	}
 	m.QueueClaims.WithLabelValues(outcome).Inc()
+}
+
+// AccountGateWait records one writer that had to wait for a foreign
+// account owner (the contention the gate absorbs).
+func (m *Metrics) AccountGateWait() {
+	if m == nil {
+		return
+	}
+	m.AccountGateEvents.WithLabelValues("wait").Inc()
+}
+
+// AccountGateFallback records one writer that proceeded without the lease
+// after the bounded wait (advisory gate; correctness via txn replay).
+func (m *Metrics) AccountGateFallback() {
+	if m == nil {
+		return
+	}
+	m.AccountGateEvents.WithLabelValues("fallback").Inc()
 }

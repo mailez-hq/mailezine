@@ -28,6 +28,7 @@ import (
 
 	gosmtp "github.com/emersion/go-smtp"
 
+	"mailezine/internal/accountgate"
 	"mailezine/internal/auth"
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
@@ -133,6 +134,8 @@ type App struct {
 	clusterNodeID     string
 	clusterNodeIDOnce sync.Once
 	kvReplayOnce      sync.Once
+	gate              *accountgate.Gate
+	gateRegOnce       sync.Once
 }
 
 // nodeID is this instance's cluster identity: the owner recorded in queue
@@ -385,6 +388,27 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		}
 		go sw.Run(runCtx)
 		a.logger.Info("fts: change-log tailer", "state", ftsIndexPath(a.cfg)+".sync.json")
+	}
+	if a.cfg.Cluster.Mode == "multi" && a.cfg.AccountGate.Enabled {
+		// Per-account write pinning: inbound writers for an account queue
+		// on its owning node instead of colliding on the account's hot KV
+		// keys. Advisory (bounded wait, then proceed — correctness is
+		// carried by the transactional store either way).
+		opts := accountgate.DefaultOptions()
+		if w := a.cfg.AccountGate.WaitSeconds; w > 0 {
+			opts.Wait = time.Duration(w) * time.Second
+		}
+		a.gate = accountgate.New(a.st.kv, a.nodeID(), opts, a.logger)
+		a.gate.SetMetrics(a.m)
+		a.pipeline.Gate = a.gate
+		go a.gate.Run(runCtx)
+		a.gateRegOnce.Do(func() {
+			_ = a.m.Registry.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+				Name: "mailezine_account_gate_held",
+				Help: "Accounts whose inbound write path this node currently owns (per-account write pinning).",
+			}, func() float64 { return float64(a.gate.Held()) }))
+		})
+		a.logger.Info("account write gate", "wait", opts.Wait, "ttl", opts.TTL)
 	}
 	if a.cfg.Notify.Enabled {
 		// Delivery receipts: the control plane raises push/webhooks/SSE the
