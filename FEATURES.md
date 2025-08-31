@@ -19,6 +19,7 @@ paired `*_ee.go` assembly files), guarded by the `mailez_ee` build tag.
 | Health / metrics / management API | ✓ | ✓ |
 | Compliance archive capture (SMTP wrap → control plane) | | ✓ (`internal/ee/archive`) |
 | HA: shared lease, standby/leader terms | | ✓ (`internal/ee/ha`) |
+| Multi-active cluster: per-message queue claims + fenced outcomes, cross-node singleton leases, per-node FTS convergence via change-log tailing, advisory per-account write gate | | ✓ (`internal/queue`, `internal/kvlease`, `internal/ftssync`, `internal/accountgate`) |
 | TiDB KV (distributed) backend | | ✓ (`internal/ee/storeee`) |
 | S3/MinIO blob backend | | ✓ (`internal/ee/storeee`) |
 | rspamd classifier (inbound scoring + Junk learning) | | ✓ (`internal/ee/spam`) |
