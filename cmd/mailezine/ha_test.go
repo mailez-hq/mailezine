@@ -42,7 +42,11 @@ func buildEngine(t *testing.T) string {
 			exe += ".exe"
 		}
 		engineBin = filepath.Join(dir, exe)
-		cmd := exec.Command("go", "build", "-o", engineBin, ".")
+		// The engine binary must match the test build's edition: this file
+		// only compiles under -tags mailez_ee, and an EE test driving a CE
+		// binary silently loses every enterprise backend (TiDB, HA) — the
+		// engine exits on the missing opener instead of serving.
+		cmd := exec.Command("go", "build", "-tags", "mailez_ee", "-o", engineBin, ".")
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			engineBinErr = fmt.Errorf("build engine: %v: %s", err, out)

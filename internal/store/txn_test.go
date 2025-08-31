@@ -111,6 +111,25 @@ func runKVContract(t *testing.T, newKV func(*testing.T) KV) {
 			}
 		}
 	})
+
+	// Present-but-empty values (index marker entries carry Value nil) must
+	// survive every backend: SQL-backed stores bind a nil []byte as NULL,
+	// which a NOT NULL value column rejects.
+	sub("nil value round-trips as empty", func(t *testing.T, kv KV) {
+		if err := kv.Put([]byte("marker"), nil); err != nil {
+			t.Fatalf("put nil value: %v", err)
+		}
+		v, err := kv.Get([]byte("marker"))
+		if err != nil || len(v) != 0 {
+			t.Fatalf("get nil-valued key: v=%q err=%v", v, err)
+		}
+		if err := kv.Batch([]Op{{Key: []byte("marker2"), Value: nil}}); err != nil {
+			t.Fatalf("batch nil value: %v", err)
+		}
+		if _, err := kv.Get([]byte("marker2")); err != nil {
+			t.Fatalf("batched nil-valued key: %v", err)
+		}
+	})
 }
 
 // runTxnContract exercises the TxnOps semantics AsTxn promises on every
