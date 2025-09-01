@@ -286,7 +286,7 @@ func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
 		return err
 	}
 	for _, e := range emails {
-		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, 0); err != nil {
 			return err
 		}
 	}
@@ -462,11 +462,14 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 	for _, u := range uids {
 		uidFilter[u] = struct{}{}
 	}
-	var deleted []uint32
+	// Decide the deletion set first, then pre-allocate the expunge modseq:
+	// every tombstone of this batch joins its deletion's atomic commit (a
+	// crash must never drop a message without its QRESYNC tombstone), and
+	// an expunge that deletes nothing must not bump HIGHESTMODSEQ. One
+	// modseq for the whole batch: VANISHED queries compare "expunged after
+	// modseq M", which a shared value satisfies.
+	var targets []*Email
 	for _, e := range emails {
-		// An explicit UID set deletes exactly those messages (the caller —
-		// POP3 QUIT — owns the precondition); the flagless form deletes
-		// everything carrying \Deleted (IMAP EXPUNGE).
 		if len(uidFilter) > 0 {
 			if _, ok := uidFilter[e.UID]; !ok {
 				continue
@@ -474,7 +477,19 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 		} else if !e.HasFlag("\\Deleted") {
 			continue
 		}
-		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID); err != nil {
+		targets = append(targets, e)
+	}
+	var expungeModSeq uint64
+	if len(targets) > 0 {
+		m, err := k.s.BumpMailboxModSeq(ctx, acctID, mbID)
+		if err != nil {
+			return nil, err
+		}
+		expungeModSeq = m
+	}
+	var deleted []uint32
+	for _, e := range targets {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, expungeModSeq); err != nil {
 			if errors.Is(err, store.ErrNotFound) {
 				// Another session won the race and removed it first: the
 				// uid is gone, which is exactly what this command promises
@@ -486,12 +501,46 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 		}
 		deleted = append(deleted, e.UID)
 	}
-	if len(deleted) > 0 {
-		if _, err := k.s.BumpMailboxModSeq(ctx, acctID, mbID); err != nil {
-			return deleted, err
-		}
-	}
 	return deleted, nil
+}
+
+// ExpungedSince returns the UIDs tombstoned as expunged from the mailbox
+// after the given modseq (QRESYNC VANISHED (EARLIER) / UID FETCH ...
+// (CHANGEDSINCE ... VANISHED)). Tombstones share the batch modseq of the
+// expunge that produced them; ascending key order makes one range scan the
+// complete answer.
+func (k *KV) ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error) {
+	acctID, err := k.s.AccountByEmail(ctx, account)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	prefix := store.IndexExpungePrefix(uint32(acctID), mbID)
+	start := append(append([]byte(nil), prefix...), beUint64(sinceModSeq+1)...)
+	// Keys are prefix || BE8(modseq): the range end is prefix || FF×8 so
+	// every modseq of this mailbox is included.
+	end := append(append([]byte(nil), prefix...), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)
+	var uids []uint32
+	err = k.s.ScanRawRange(ctx, start, end, func(_, v []byte) error {
+		if len(v) == 8 {
+			uids = append(uids, uint32(binary.BigEndian.Uint64(v)))
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(uids, func(i, j int) bool { return uids[i] < uids[j] })
+	return uids, nil
 }
 
 // Copy appends copies of the given UIDs to dst and returns the UID mapping.
@@ -559,6 +608,18 @@ func (k *KV) Move(ctx context.Context, account, src, dst string, uids []uint32) 
 		uidFilter[u] = struct{}{}
 	}
 	mapping := map[uint32]uint32{}
+	// Pre-allocate the source expunge modseq: moved-away UIDs get a
+	// QRESYNC tombstone in the source mailbox (joined to each deletion's
+	// atomic commit), so QRESYNC clients learn the move without a full
+	// folder resync.
+	var moveModSeq uint64
+	if len(uidFilter) > 0 {
+		if m, err := k.s.BumpMailboxModSeq(ctx, acctID, srcMBID); err != nil {
+			return nil, err
+		} else {
+			moveModSeq = m
+		}
+	}
 	for _, e := range emails {
 		if len(uidFilter) > 0 {
 			if _, ok := uidFilter[e.UID]; !ok {
@@ -579,15 +640,10 @@ func (k *KV) Move(ctx context.Context, account, src, dst string, uids []uint32) 
 		if err != nil {
 			return mapping, err
 		}
-		if err := k.deleteEmail(ctx, acctID, e.DocID, srcMBID); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, srcMBID, moveModSeq); err != nil {
 			return mapping, err
 		}
 		mapping[e.UID] = uint32(newUID)
-	}
-	if len(mapping) > 0 {
-		if _, err := k.s.BumpMailboxModSeq(ctx, acctID, srcMBID); err != nil {
-			return mapping, err
-		}
 	}
 	return mapping, nil
 }
@@ -614,8 +670,11 @@ func (k *KV) OpenMessage(ctx context.Context, account, mailbox string, uid uint3
 }
 
 // deleteEmail removes one email document (and its per-mailbox index entry,
-// committed in the same batch) and garbage-collects its blob.
-func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbID uint64) error {
+// committed in the same batch) and garbage-collects its blob. When
+// expungeModSeq is non-zero, a QRESYNC tombstone (expunge modseq → UID) is
+// committed in the same atomic batch, so a crash can never drop a message
+// without recording its UID for later VANISHED (EARLIER) answers.
+func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbID, expungeModSeq uint64) error {
 	// Read the blob reference and UID before deletion (the fields are
 	// removed in the same batch as the link decrement and index delete).
 	var blobID string
@@ -626,6 +685,12 @@ func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbI
 		if len(fields[fieldUID]) == 8 {
 			uid := binary.BigEndian.Uint64(fields[fieldUID])
 			idx = append(idx, store.Op{Key: store.IndexEmailKey(uint32(acctID), mbID, uid), Delete: true})
+			if expungeModSeq != 0 {
+				idx = append(idx, store.Op{
+					Key:   store.IndexExpungeKey(uint32(acctID), mbID, expungeModSeq),
+					Value: binary.BigEndian.AppendUint64(nil, uid),
+				})
+			}
 		}
 	}
 	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID, idx...); err != nil {

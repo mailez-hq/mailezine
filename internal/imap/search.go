@@ -23,6 +23,16 @@ import (
 var errVanished = errors.New("imap: message vanished")
 
 func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions) (*imap.SearchData, error) {
+	return s.searchImpl(kind, criteria, options, 0)
+}
+
+// SearchModSeq serves RFC 7162 §3.1.6 "SEARCH MODSEQ n": messages whose
+// mod-sequence is greater than or equal to n AND which match criteria.
+func (s *session) SearchModSeq(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions, modSeq uint64) (*imap.SearchData, error) {
+	return s.searchImpl(kind, criteria, options, modSeq)
+}
+
+func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions, modSeqAtLeast uint64) (*imap.SearchData, error) {
 	ctx := context.Background()
 	// Sequence numbers resolve against the session snapshot (snapshotMsgs)
 	// so reported seqs match the client's view.
@@ -51,6 +61,9 @@ func (s *session) Search(kind imapserver.NumKind, criteria *imap.SearchCriteria,
 	}
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
+		if modSeqAtLeast != 0 && msg.ModSeq < modSeqAtLeast {
+			continue
+		}
 		if ftsCandidates != nil {
 			if _, ok := ftsCandidates[msg.UID]; !ok {
 				continue

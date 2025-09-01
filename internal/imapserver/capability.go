@@ -66,6 +66,9 @@ func (c *Conn) availableCaps() []imap.Cap {
 		caps = append(caps, imap.CapLoginDisabled)
 	}
 	if c.state == imap.ConnStateAuthenticated || c.state == imap.ConnStateSelected {
+		// RFC 7162 CONDSTORE/QRESYNC: stateless wire-level extensions, no
+		// backend negotiation required (modseq data comes from the session).
+		caps = append(caps, imap.CapCondStore, imap.CapQResync)
 		if available.Has(imap.CapIMAP4rev1) {
 			// IMAP4rev1-specific capabilities that don't require backend
 			// support and are not applicable to IMAP4rev2

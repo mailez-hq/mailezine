@@ -162,6 +162,12 @@ func (s *Store) ScanRaw(_ context.Context, prefix []byte, fn func(key, value []b
 	return s.kv.Scan(prefix, fn)
 }
 
+// ScanRawRange visits every raw key in [start, end) in ascending order.
+// Returning an error from fn aborts the scan and is propagated.
+func (s *Store) ScanRawRange(_ context.Context, start, end []byte, fn func(key, value []byte) error) error {
+	return s.kv.ScanRange(start, end, fn)
+}
+
 // MailboxModSeq returns the mailbox's current modification sequence
 // (CONDSTORE HIGHESTMODSEQ; 0 when the mailbox has no modseq yet).
 func (s *Store) MailboxModSeq(ctx context.Context, accountID AccountID, mbID uint64) (uint64, error) {

@@ -124,3 +124,44 @@ type SessionAppendLimit interface {
 	// this server in an APPEND command.
 	AppendLimit() uint32
 }
+
+// QRESYNCParam carries the RFC 7162 resynchronization arguments of a
+// SELECT/EXAMINE command: SELECT mbox (QRESYNC (uidvalidity modseq
+// [known-uids [seq-match-data]])).
+type QRESYNCParam struct {
+	UIDValidity uint32
+	ModSeq      uint64
+	KnownUIDs   imap.NumSet // optional; may be nil
+}
+
+// QResyncFlagUpdate is one message whose flags changed after the client's
+// modseq, reported during a QRESYNC resynchronization.
+type QResyncFlagUpdate struct {
+	SeqNum uint32
+	UID    imap.UID
+	Flags  []imap.Flag
+	ModSeq uint64
+}
+
+// QResyncData carries the resynchronization payload a session produces for
+// a SELECT with a QRESYNC parameter; the conn writes it to the wire between
+// the standard untagged SELECT responses and the tagged OK.
+type QResyncData struct {
+	VanishedEarlier []imap.UID
+	FlagUpdates     []QResyncFlagUpdate
+}
+
+// SessionQRESYNC is implemented by sessions that back RFC 7162 QRESYNC.
+// The conn parses the wire commands; the session produces the payloads.
+type SessionQRESYNC interface {
+	Session
+	// SelectQRESYNC selects the mailbox and computes the resynchronization
+	// data (vanished UIDs and flag updates since param.ModSeq). A
+	// UIDVALIDITY mismatch yields empty data, not an error.
+	SelectQRESYNC(mailbox string, options *imap.SelectOptions, param QRESYNCParam, w *UpdateWriter) (*imap.SelectData, *QResyncData, error)
+	// FetchQRESYNC serves UID FETCH ... (CHANGEDSINCE modseq [VANISHED]).
+	FetchQRESYNC(w *FetchWriter, numSet imap.NumSet, options *imap.FetchOptions, sinceModSeq uint64, vanished bool) error
+	// SearchModSeq serves SEARCH MODSEQ n: messages whose modseq is greater
+	// than or equal to modSeq AND which match criteria.
+	SearchModSeq(kind NumKind, criteria *imap.SearchCriteria, options *imap.SearchOptions, modSeq uint64) (*imap.SearchData, error)
+}

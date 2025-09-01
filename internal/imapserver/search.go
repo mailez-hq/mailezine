@@ -50,10 +50,21 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 	}
 
 	var criteria imap.SearchCriteria
+	// RFC 7162 §3.1.6: MODSEQ <n> search key (QRESYNC clients issue it as
+	// a top-level key). Intercepted here because imap.SearchCriteria has no
+	// modseq field; the session ANDs it with the remaining criteria.
+	var searchModSeq uint64
 	for {
 		var err error
 		if atom != "" {
-			err = readSearchKeyWithAtom(&criteria, dec, atom)
+			if strings.EqualFold(atom, "MODSEQ") {
+				if !dec.ExpectSP() || !dec.ExpectModSeq(&searchModSeq) {
+					return fmt.Errorf("in search-key: %w", dec.Err())
+				}
+				atom = ""
+			} else {
+				err = readSearchKeyWithAtom(&criteria, dec, atom)
+			}
 			atom = ""
 		} else {
 			err = readSearchKey(&criteria, dec)
@@ -80,7 +91,19 @@ func (c *Conn) handleSearch(tag string, dec *imapwire.Decoder, numKind NumKind) 
 		options.ReturnAll = true
 	}
 
-	data, err := c.session.Search(numKind, &criteria, &options)
+	var (
+		data *imap.SearchData
+		err  error
+	)
+	if searchModSeq != 0 {
+		qs, ok := c.session.(SessionQRESYNC)
+		if !ok {
+			return newClientBugError("MODSEQ search requires QRESYNC support")
+		}
+		data, err = qs.SearchModSeq(numKind, &criteria, &options, searchModSeq)
+	} else {
+		data, err = c.session.Search(numKind, &criteria, &options)
+	}
 	if err != nil {
 		return err
 	}

@@ -210,6 +210,12 @@ func (c *Cached) Expunge(ctx context.Context, account, mailbox string, uids []ui
 	return expunged, err
 }
 
+// ExpungedSince reads the QRESYNC tombstone log straight through: it is a
+// write-history query, not part of the cached mailbox view.
+func (c *Cached) ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error) {
+	return c.inner.ExpungedSince(ctx, account, mailbox, sinceModSeq)
+}
+
 func (c *Cached) Copy(ctx context.Context, account, src, dst string, uids []uint32) (map[uint32]uint32, error) {
 	m, err := c.inner.Copy(ctx, account, src, dst, uids)
 	if err == nil {

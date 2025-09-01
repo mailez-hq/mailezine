@@ -298,7 +298,8 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 			}
 		}
 	}
-	// EXPUNGEs (descending sequence order, RFC 3501).
+	// EXPUNGEs: RFC 3501 per-message EXPUNGE (descending sequence order),
+	// or one ascending VANISHED (RFC 7162) for QRESYNC connections.
 	if allowExpunge {
 		var removed []uint32
 		for uid := range old {
@@ -306,10 +307,16 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 				removed = append(removed, uid)
 			}
 		}
-		sort.Slice(removed, func(i, j int) bool { return oldSeq[removed[i]] > oldSeq[removed[j]] })
-		for _, uid := range removed {
-			if err := w.WriteExpunge(oldSeq[uid]); err != nil {
+		if w.QResyncEnabled() {
+			if err := w.WriteVanished(toUIDs(removed)); err != nil {
 				return err
+			}
+		} else {
+			sort.Slice(removed, func(i, j int) bool { return oldSeq[removed[i]] > oldSeq[removed[j]] })
+			for _, uid := range removed {
+				if err := w.WriteExpunge(oldSeq[uid]); err != nil {
+					return err
+				}
 			}
 		}
 		s.snap = current
@@ -441,7 +448,11 @@ func (s *session) Expunge(w *imapserver.ExpungeWriter, uids *imap.UIDSet) error 
 			}
 		}
 	}
-	// RFC 3501: expunge responses in descending sequence order.
+	// RFC 3501: expunge responses in descending sequence order; RFC 7162:
+	// one ascending VANISHED for QRESYNC connections.
+	if w.QResyncEnabled() {
+		return w.WriteVanished(toUIDs(deleted))
+	}
 	for i := len(deleted) - 1; i >= 0; i-- {
 		if seq, ok := seqOf[deleted[i]]; ok {
 			if err := w.WriteExpunge(seq); err != nil {
@@ -521,6 +532,10 @@ func (s *session) Move(w *imapserver.MoveWriter, numSet imap.NumSet, dest string
 	}
 	if err := w.WriteCopyData(data); err != nil {
 		return err
+	}
+	if w.QResyncEnabled() {
+		// RFC 7162: the moved-away source UIDs surface as VANISHED.
+		return w.WriteVanished(toUIDs(moved))
 	}
 	sortUint32(moved)
 	for i := len(moved) - 1; i >= 0; i-- {

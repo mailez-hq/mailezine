@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"runtime/debug"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -647,6 +648,24 @@ type UpdateWriter struct {
 	allowExpunge bool
 }
 
+// QResyncEnabled reports whether this connection ENABLEd QRESYNC
+// (RFC 7162): when true, expunges are reported as VANISHED responses
+// instead of per-message EXPUNGE responses.
+func (w *UpdateWriter) QResyncEnabled() bool {
+	w.conn.mutex.Lock()
+	defer w.conn.mutex.Unlock()
+	return w.conn.enabled.Has(imap.CapQResync)
+}
+
+// WriteVanished writes a VANISHED response for the given UIDs (ascending
+// order on the wire).
+func (w *UpdateWriter) WriteVanished(uids []imap.UID) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	return w.conn.writeVanished(false, uids)
+}
+
 // WriteExpunge writes an EXPUNGE response.
 func (w *UpdateWriter) WriteExpunge(seqNum uint32) error {
 	if !w.allowExpunge {
@@ -671,6 +690,55 @@ func (w *UpdateWriter) WriteNumRecent(n uint32) error {
 // WriteMailboxFlags writes a FLAGS response.
 func (w *UpdateWriter) WriteMailboxFlags(flags []imap.Flag) error {
 	return w.conn.writeFlags(flags)
+}
+
+// writeVanished writes a VANISHED response (RFC 7162 §3.2.10). With
+// earlier=true the "(EARLIER)" variant used during SELECT resynchronization
+// is emitted. UIDs are sorted ascending and compressed into ranges.
+func (c *Conn) writeVanished(earlier bool, uids []imap.UID) error {
+	sorted := append([]imap.UID(nil), uids...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	set := uidRangesString(sorted)
+	enc := newResponseEncoder(c)
+	defer enc.end()
+	enc.Atom("*").SP().Atom("VANISHED")
+	if earlier {
+		enc.SP().Special('(').Atom("EARLIER").Special(')')
+	}
+	enc.SP().Atom(set)
+	return enc.CRLF()
+}
+
+// uidRangesString renders ascending UIDs as an IMAP sequence-set string,
+// compressing consecutive values into "a:b" ranges.
+func uidRangesString(uids []imap.UID) string {
+	if len(uids) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	start := uids[0]
+	prev := uids[0]
+	flush := func() {
+		if b.Len() > 0 {
+			b.WriteByte(',')
+		}
+		if start == prev {
+			fmt.Fprintf(&b, "%d", start)
+		} else {
+			fmt.Fprintf(&b, "%d:%d", start, prev)
+		}
+	}
+	for _, u := range uids[1:] {
+		if u == prev+1 {
+			prev = u
+			continue
+		}
+		flush()
+		start = u
+		prev = u
+	}
+	flush()
+	return b.String()
 }
 
 // WriteMessageFlags writes a FETCH response with FLAGS.

@@ -14,15 +14,30 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		return dec.Err()
 	}
 	options := imap.SelectOptions{ReadOnly: readOnly}
+	var qresync *QRESYNCParam
 	if dec.SP() {
-		// RFC 7162 CONDSTORE: SELECT ... (CONDSTORE)
+		// RFC 7162: SELECT ... (CONDSTORE) and
+		// SELECT ... (QRESYNC (uidvalidity modseq [known-uids]))
 		if _, err := dec.List(func() error {
 			var name string
-			if !dec.ExpectAtom(&name) || !strings.EqualFold(name, "CONDSTORE") {
+			if !dec.ExpectAtom(&name) {
 				return dec.Err()
 			}
-			options.CondStore = true
-			return nil
+			if strings.EqualFold(name, "CONDSTORE") {
+				options.CondStore = true
+				return nil
+			}
+			if strings.EqualFold(name, "QRESYNC") {
+				p, err := readQRESYNCParam(dec)
+				if err != nil {
+					return err
+				}
+				qresync = p
+				// RFC 7162 §3.2.5: the parameter implies CONDSTORE.
+				options.CondStore = true
+				return nil
+			}
+			return dec.Err()
 		}); err != nil {
 			return err
 		}
@@ -31,6 +46,15 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		}
 	} else if !dec.ExpectCRLF() {
 		return dec.Err()
+	}
+
+	if qresync != nil {
+		c.mutex.Lock()
+		enabled := c.enabled.Has(imap.CapQResync)
+		c.mutex.Unlock()
+		if !enabled {
+			return newClientBugError("QRESYNC parameter requires ENABLE QRESYNC first")
+		}
 	}
 
 	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
@@ -52,7 +76,20 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 		}
 	}
 
-	data, err := c.session.Select(mailbox, &options)
+	var (
+		data  *imap.SelectData
+		qdata *QResyncData
+		err   error
+	)
+	if qresync != nil {
+		qs, ok := c.session.(SessionQRESYNC)
+		if !ok {
+			return newClientBugError("QRESYNC is not supported by this backend")
+		}
+		data, qdata, err = qs.SelectQRESYNC(mailbox, &options, *qresync, &UpdateWriter{conn: c, allowExpunge: true})
+	} else {
+		data, err = c.session.Select(mailbox, &options)
+	}
 	if err != nil {
 		return err
 	}
@@ -82,7 +119,7 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 	if err := c.writePermanentFlags(data.PermanentFlags); err != nil {
 		return err
 	}
-	if options.CondStore {
+	if options.CondStore || qresync != nil {
 		// RFC 7162 §3.2: HIGHESTMODSEQ response code when CONDSTORE is
 		// requested (or NOMODSEQ when the mailbox has no modseq support).
 		enc := newResponseEncoder(c)
@@ -91,6 +128,31 @@ func (c *Conn) handleSelect(tag string, dec *imapwire.Decoder, readOnly bool) er
 			return err
 		}
 		enc.end()
+	}
+	if qdata != nil {
+		// RFC 7162 §3.2.5.2: resynchronization payload between the standard
+		// untagged responses and the tagged OK. VANISHED (EARLIER) first,
+		// then the flag updates; skipped entirely on UIDVALIDITY mismatch
+		// (the client's cache is void anyway).
+		if qresync.UIDValidity == data.UIDValidity {
+			if len(qdata.VanishedEarlier) > 0 {
+				if err := c.writeVanished(true, qdata.VanishedEarlier); err != nil {
+					return err
+				}
+			}
+			for _, u := range qdata.FlagUpdates {
+				fw := &FetchWriter{conn: c}
+				mw := fw.CreateMessage(u.SeqNum)
+				mw.WriteUID(u.UID)
+				if u.ModSeq != 0 {
+					mw.WriteModSeq(u.ModSeq)
+				}
+				mw.WriteFlags(u.Flags)
+				if err := mw.Close(); err != nil {
+					return err
+				}
+			}
+		}
 	}
 	if data.List != nil {
 		if err := c.writeList(data.List); err != nil {
@@ -146,6 +208,40 @@ func (c *Conn) handleUnselect(dec *imapwire.Decoder, expunge bool) error {
 	c.readOnly = false
 	c.mbox = ""
 	return nil
+}
+
+// readQRESYNCParam parses the RFC 7162 §3.2.5 parameter body after the
+// QRESYNC atom: SP "(uidvalidity modseq [known-uids [seq-match-data]])".
+func readQRESYNCParam(dec *imapwire.Decoder) (*QRESYNCParam, error) {
+	p := &QRESYNCParam{}
+	if !dec.ExpectSP() || !dec.ExpectSpecial('(') {
+		return nil, dec.Err()
+	}
+	if !dec.ExpectNumber(&p.UIDValidity) || !dec.ExpectSP() || !dec.ExpectModSeq(&p.ModSeq) {
+		return nil, dec.Err()
+	}
+	if dec.SP() {
+		var known imap.NumSet
+		if !dec.ExpectNumSet(NumKindUID.wire(), &known) {
+			return nil, dec.Err()
+		}
+		p.KnownUIDs = known
+		// Optional seq-match-data: "(known-sequence-set known-uid-set)". It
+		// is a client-convenience hint for narrowing EXPUNGE replays; the
+		// authoritative resynchronization payload is computed from the
+		// tombstone log, so we only validate the syntax here.
+		if dec.SP() && dec.Special('(') {
+			var seqSet, matchUIDs imap.NumSet
+			if !dec.ExpectNumSet(NumKindSeq.wire(), &seqSet) || !dec.ExpectSP() ||
+				!dec.ExpectNumSet(NumKindUID.wire(), &matchUIDs) || !dec.ExpectSpecial(')') {
+				return nil, dec.Err()
+			}
+		}
+	}
+	if !dec.ExpectSpecial(')') {
+		return nil, dec.Err()
+	}
+	return p, nil
 }
 
 func (c *Conn) writeExists(numMessages uint32) error {

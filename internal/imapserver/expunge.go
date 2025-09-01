@@ -48,3 +48,23 @@ func (w *ExpungeWriter) WriteExpunge(seqNum uint32) error {
 	}
 	return w.conn.writeExpunge(seqNum)
 }
+
+// QResyncEnabled reports whether this connection ENABLEd QRESYNC
+// (RFC 7162): when true, expunges are reported as VANISHED responses.
+func (w *ExpungeWriter) QResyncEnabled() bool {
+	if w.conn == nil {
+		return false
+	}
+	w.conn.mutex.Lock()
+	defer w.conn.mutex.Unlock()
+	return w.conn.enabled.Has(imap.CapQResync)
+}
+
+// WriteVanished writes a VANISHED response replacing per-message EXPUNGE
+// responses for QRESYNC sessions.
+func (w *ExpungeWriter) WriteVanished(uids []imap.UID) error {
+	if w.conn == nil || len(uids) == 0 {
+		return nil
+	}
+	return w.conn.writeVanished(false, uids)
+}

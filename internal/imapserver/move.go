@@ -38,3 +38,20 @@ func (w *MoveWriter) WriteCopyData(data *imap.CopyData) error {
 func (w *MoveWriter) WriteExpunge(seqNum uint32) error {
 	return w.conn.writeExpunge(seqNum)
 }
+
+// QResyncEnabled reports whether this connection ENABLEd QRESYNC
+// (RFC 7162): when true, the move is reported as VANISHED in the source
+// mailbox instead of per-message EXPUNGE responses.
+func (w *MoveWriter) QResyncEnabled() bool {
+	w.conn.mutex.Lock()
+	defer w.conn.mutex.Unlock()
+	return w.conn.enabled.Has(imap.CapQResync)
+}
+
+// WriteVanished writes a VANISHED response for the moved-away source UIDs.
+func (w *MoveWriter) WriteVanished(uids []imap.UID) error {
+	if len(uids) == 0 {
+		return nil
+	}
+	return w.conn.writeVanished(false, uids)
+}

@@ -75,6 +75,36 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 		}
 	}
 
+	// RFC 7162 §3.1.4.1: UID FETCH ... (CHANGEDSINCE <modseq> [VANISHED])
+	var changedSince uint64
+	var vanished bool
+	if dec.SP() && dec.Special('(') {
+		if numKind != NumKindUID {
+			return newClientBugError("CHANGEDSINCE requires UID FETCH")
+		}
+		for {
+			var item string
+			if !dec.ExpectAtom(&item) {
+				return dec.Err()
+			}
+			if strings.EqualFold(item, "CHANGEDSINCE") {
+				if !dec.ExpectSP() || !dec.ExpectModSeq(&changedSince) {
+					return dec.Err()
+				}
+			} else if strings.EqualFold(item, "VANISHED") {
+				vanished = true
+			} else {
+				return newClientBugError("unknown FETCH modifier " + item)
+			}
+			if !dec.SP() {
+				break
+			}
+		}
+		if !dec.ExpectSpecial(')') {
+			return dec.Err()
+		}
+	}
+
 	if !dec.ExpectCRLF() {
 		return dec.Err()
 	}
@@ -88,6 +118,21 @@ func (c *Conn) handleFetch(dec *imapwire.Decoder, numKind NumKind) error {
 	}
 
 	w := &FetchWriter{conn: c, options: writerOptions}
+	if changedSince != 0 || vanished {
+		if vanished {
+			c.mutex.Lock()
+			enabled := c.enabled.Has(imap.CapQResync)
+			c.mutex.Unlock()
+			if !enabled {
+				return newClientBugError("VANISHED requires ENABLE QRESYNC first")
+			}
+		}
+		qs, ok := c.session.(SessionQRESYNC)
+		if !ok {
+			return newClientBugError("QRESYNC is not supported by this backend")
+		}
+		return qs.FetchQRESYNC(w, numSet, &options, changedSince, vanished)
+	}
 	if err := c.session.Fetch(w, numSet, &options); err != nil {
 		return err
 	}
@@ -328,6 +373,12 @@ func maybeReadPartial(dec *imapwire.Decoder) (*imap.SectionPartial, error) {
 type FetchWriter struct {
 	conn    *Conn
 	options fetchWriterOptions
+}
+
+// WriteVanished writes a VANISHED response (RFC 7162), used by
+// UID FETCH ... (CHANGEDSINCE ... VANISHED). UIDs are emitted ascending.
+func (fw *FetchWriter) WriteVanished(uids []imap.UID) error {
+	return fw.conn.writeVanished(false, uids)
 }
 
 // CreateMessage writes a FETCH response for a message.

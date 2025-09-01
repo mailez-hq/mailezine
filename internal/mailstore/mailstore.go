@@ -64,6 +64,10 @@ type MailboxStore interface {
 	SetFlags(ctx context.Context, account, mailbox string, uid uint32, flags []string) error
 	Append(ctx context.Context, account, mailbox string, msg *Message) (uint32, error)
 	Expunge(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error)
+	// ExpungedSince returns the UIDs tombstoned as expunged from the
+	// mailbox after the given CONDSTORE modseq (QRESYNC VANISHED (EARLIER)
+	// and UID FETCH ... (CHANGEDSINCE ... VANISHED)).
+	ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error)
 	Copy(ctx context.Context, account, src, dst string, uids []uint32) (map[uint32]uint32, error)
 	Move(ctx context.Context, account, src, dst string, uids []uint32) (map[uint32]uint32, error)
 	OpenMessage(ctx context.Context, account, mailbox string, uid uint32) (io.ReadCloser, error)

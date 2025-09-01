@@ -25,6 +25,11 @@ const (
 const (
 	IdxMailboxName byte = 'n' // (account, mailbox name) → mailbox docID
 	IdxEmailMbox   byte = 'e' // (account, mailbox docID, UID) → email docID
+	// IdxEmailExpunged is the QRESYNC (RFC 7162) tombstone index:
+	// (account, mailbox docID, expunge modseq) → UID. Written in the same
+	// atomic batch as the email deletion, so a crash cannot lose the
+	// tombstone while dropping the message.
+	IdxEmailExpunged byte = 'x'
 )
 
 // Counter kinds inside the account space (ARCHITECTURE.md §5.1).
@@ -176,6 +181,21 @@ func IndexEmailKey(accountID uint32, mbID, uid uint64) []byte {
 func IndexEmailPrefix(accountID uint32, mbID uint64) []byte {
 	k := appendSpaceID(SpaceIndex, accountID)
 	k = append(k, IdxEmailMbox)
+	return appendUint64(k, mbID)
+}
+
+// IndexExpungeKey maps (account, mailbox docID, expunge modseq) to the
+// expunged UID. Ascending key order yields tombstones in expunge order,
+// so a range scan answers "vanished since modseq M" in one pass.
+func IndexExpungeKey(accountID uint32, mbID, modSeq uint64) []byte {
+	k := IndexExpungePrefix(accountID, mbID)
+	return appendUint64(k, modSeq)
+}
+
+// IndexExpungePrefix is the scan prefix of one mailbox's expunge log.
+func IndexExpungePrefix(accountID uint32, mbID uint64) []byte {
+	k := appendSpaceID(SpaceIndex, accountID)
+	k = append(k, IdxEmailExpunged)
 	return appendUint64(k, mbID)
 }
 
