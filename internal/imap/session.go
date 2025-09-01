@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -147,7 +148,24 @@ func (s *session) Delete(mailbox string) error {
 	if errors.Is(err, mailstore.ErrNotFound) {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
 	}
+	if err == nil && sameMailbox(s.mbox, mailbox) {
+		// RFC 3501 §6.3.4: deleting the currently selected mailbox leaves
+		// this session unselected. The pooled-connection clients of the
+		// mailez control plane reuse authenticated sessions across API
+		// calls; a stale selection would make the next command's poll
+		// list the vanished mailbox and kill the connection.
+		s.Unselect()
+	}
 	return err
+}
+
+// sameMailbox compares mailbox names with INBOX's case-insensitivity
+// (RFC 3501 §5.1); other names compare exactly.
+func sameMailbox(a, b string) bool {
+	if strings.EqualFold(a, "INBOX") && strings.EqualFold(b, "INBOX") {
+		return true
+	}
+	return a == b
 }
 
 func (s *session) Rename(mailbox, newName string, options *imap.RenameOptions) error {
@@ -157,6 +175,12 @@ func (s *session) Rename(mailbox, newName string, options *imap.RenameOptions) e
 	err := s.srv.Store.RenameMailbox(context.Background(), s.user, mailbox, newName)
 	if errors.Is(err, mailstore.ErrNotFound) {
 		return &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
+	}
+	if err == nil && s.mbox == mailbox {
+		// The selected mailbox survived under its new name; keep the
+		// selection attached to it so the session's poll snapshot stays
+		// valid instead of listing the vanished old name.
+		s.mbox = newName
 	}
 	return err
 }
@@ -268,6 +292,17 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	}
 	current, err := s.srv.Store.ListMessages(context.Background(), s.user, s.mbox)
 	if err != nil {
+		if errors.Is(err, mailstore.ErrNotFound) {
+			// The selected mailbox vanished from under this session — most
+			// often another connection deleted it while the control plane
+			// kept this pooled connection alive. Become unselected instead
+			// of failing the command that is about to be acknowledged: an
+			// error here would close the connection right after the command
+			// succeeded, so clients see EOF ("connection closed") for an
+			// operation that actually completed.
+			s.Unselect()
+			return nil
+		}
 		return err
 	}
 	old := map[uint32]*mailstore.Message{}

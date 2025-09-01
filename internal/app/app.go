@@ -334,7 +334,12 @@ func (a *App) openServices(runCtx context.Context) error {
 	}
 	// Metadata cache: message/mailbox lists are memoized per account with a
 	// TTL safety net; every write path invalidates the affected mailboxes.
-	if a.cfg.MetaCacheSizeBytes > 0 {
+	// Multi-active keeps it off: the cache is per-process and invalidation
+	// only covers local writes, so a folder created on node A would stay
+	// invisible (or still visible after deletion) on nodes B/C for up to a
+	// full TTL — SELECT/DELETE on those nodes then disagree with reality.
+	// Re-enable once cross-node invalidation (e.g. via the change log) lands.
+	if a.cfg.MetaCacheSizeBytes > 0 && a.cfg.Cluster.Mode != "multi" {
 		a.st.mailbox = mailstore.NewCached(a.st.mailbox,
 			mailcache.NewCacheWithTTL(a.cfg.MetaCacheSizeBytes, 30*time.Second))
 	}
