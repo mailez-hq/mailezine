@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // testSMTPServer is a minimal in-process SMTP server used to validate the
@@ -330,5 +331,88 @@ func TestSMTPDeliverNoAuthToMX(t *testing.T) {
 	}
 	if srv.gotAuth != "" {
 		t.Fatalf("direct delivery authenticated: %q", srv.gotAuth)
+	}
+}
+
+// slowMXResolver delays MX lookups so cross-domain parallelism is observable
+// in timing assertions.
+type slowMXResolver struct {
+	inner MXResolver
+	delay time.Duration
+}
+
+func (r *slowMXResolver) LookupMX(ctx context.Context, name string) ([]*net.MX, error) {
+	time.Sleep(r.delay)
+	return r.inner.LookupMX(ctx, name)
+}
+
+func (r *slowMXResolver) LookupIPAddr(ctx context.Context, host string) ([]net.IPAddr, error) {
+	return r.inner.LookupIPAddr(ctx, host)
+}
+
+// Three destination domains must be delivered concurrently: with a 150ms MX
+// delay each, serial delivery would take >=450ms, the bounded fan-out should
+// land near one lookup.
+func TestSMTPDeliverParallelAcrossDomains(t *testing.T) {
+	srv, port := newTestSMTPServer(t, nil)
+	resolver := &slowMXResolver{
+		inner: &staticResolver{mx: map[string][]*net.MX{
+			"a.test": {{Host: "127.0.0.1."}},
+			"b.test": {{Host: "127.0.0.1."}},
+			"c.test": {{Host: "127.0.0.1."}},
+		}},
+		delay: 150 * time.Millisecond,
+	}
+	d := testDeliverer(port, resolver)
+	d.DomainConcurrency = 8
+
+	results, err := d.Deliver(context.Background(), "sender@example.com",
+		[]string{"x@a.test", "y@b.test", "z@c.test"}, strings.NewReader("Subject: p\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 3 || results[0].To != "x@a.test" || results[1].To != "y@b.test" || results[2].To != "z@c.test" {
+		t.Fatalf("results out of input order: %+v", results)
+	}
+	for _, r := range results {
+		if !r.OK {
+			t.Fatalf("delivery failed: %+v", r)
+		}
+	}
+	if n := srv.messageCount(); n != 3 {
+		t.Fatalf("server received %d messages, want 3", n)
+	}
+}
+
+// Results must come back in input recipient order even when domains finish
+// out of order, and invalid/rejected recipients keep their outcomes.
+func TestSMTPDeliverResultOrderAcrossDomains(t *testing.T) {
+	_, port := newTestSMTPServer(t, map[string]bool{"bad@b.test": true})
+	resolver := &staticResolver{mx: map[string][]*net.MX{
+		"a.test": {{Host: "127.0.0.1."}},
+		"b.test": {{Host: "127.0.0.1."}},
+	}}
+	d := testDeliverer(port, resolver)
+	to := []string{"ok1@a.test", "not-an-address", "bad@b.test", "ok2@b.test"}
+	results, err := d.Deliver(context.Background(), "sender@example.com", to, strings.NewReader("Subject: o\r\n\r\nbody\r\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != len(to) {
+		t.Fatalf("results = %d, want %d", len(results), len(to))
+	}
+	for i, r := range results {
+		if r.To != to[i] {
+			t.Fatalf("results[%d].To = %q, want %q", i, r.To, to[i])
+		}
+	}
+	if !results[0].OK || !results[3].OK {
+		t.Fatalf("good recipients failed: %+v", results)
+	}
+	if results[1].OK || !results[1].Permanent {
+		t.Fatalf("invalid recipient outcome wrong: %+v", results[1])
+	}
+	if results[2].OK || !results[2].Permanent {
+		t.Fatalf("rejected recipient outcome wrong: %+v", results[2])
 	}
 }

@@ -13,6 +13,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mailezine/internal/maildns"
@@ -65,6 +66,10 @@ type SMTPDeliverer struct {
 	PolicyResolver maildns.Resolver
 	// MTSTS supplies MTA-STS policies; nil skips MTA-STS (DANE still runs).
 	MTSTS mtastsSource
+	// DomainConcurrency bounds the parallel delivery across a message's
+	// destination domains (0 → default 8; negative → fully serial, the
+	// pre-parallel behaviour). Per-domain MX fallback stays sequential.
+	DomainConcurrency int
 }
 
 // Deliver groups recipients by domain, resolves MX (with A/AAAA fallback)
@@ -95,10 +100,12 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 		return d.deliverToHost(ctx, from, to, body, d.FixedHost, port, tlsMode, daneRecords)
 	}
 
-	var results []Result
-	groups := map[string][]string{}
-	var domains []string
-	for _, addr := range to {
+	results := make([]Result, len(to))
+	// domains maps each destination domain to the indexes of its recipients
+	// in `to`; order keeps the first-appearance order for determinism.
+	domains := map[string][]int{}
+	var order []string
+	for i, addr := range to {
 		domain, ok := domainOf(addr)
 		if !ok {
 			// Malformed recipient: resolve permanently right away so it
@@ -106,77 +113,113 @@ func (d *SMTPDeliverer) Deliver(ctx context.Context, from string, to []string, m
 			// without even a DSN — the address is unparseable for bounces
 			// too, but the sender at least gets the rejection at RCPT time
 			// semantics via the queue result).
-			results = append(results, Result{
+			results[i] = Result{
 				To:        addr,
 				Permanent: true,
 				Err:       fmt.Errorf("queue: invalid recipient address %q", addr),
-			})
+			}
 			continue
 		}
-		if _, seen := groups[domain]; !seen {
-			domains = append(domains, domain)
+		if _, seen := domains[domain]; !seen {
+			order = append(order, domain)
 		}
-		groups[domain] = append(groups[domain], addr)
+		domains[domain] = append(domains[domain], i)
 	}
 
-	for _, domain := range domains {
-		hosts, err := d.mxCandidates(ctx, domain)
-		if err != nil {
-			for _, addr := range groups[domain] {
-				results = append(results, Result{To: addr, Permanent: true, Err: err})
-			}
+	// Domains deliver in parallel with a bounded fan-out: a newsletter to 20
+	// domains costs the slowest domain, not their sum, while the cap keeps
+	// the peak connection/MX-resolver load predictable. Each task writes
+	// only its own recipients' indexes, so the shared results slice needs
+	// no locking.
+	conc := d.DomainConcurrency
+	if conc == 0 {
+		conc = defaultDomainConcurrency
+	}
+	if conc < 0 {
+		conc = 1
+	} else if conc > len(order) {
+		conc = len(order)
+	}
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, conc)
+	for _, domain := range order {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(domain string, idxs []int) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			d.deliverDomain(ctx, from, domain, to, idxs, body, port, results)
+		}(domain, domains[domain])
+	}
+	wg.Wait()
+	return results, nil
+}
+
+// defaultDomainConcurrency bounds the per-message cross-domain fan-out.
+const defaultDomainConcurrency = 8
+
+// deliverDomain resolves MX and delivers one domain's recipients over one
+// connection (trying MX hosts in preference order), writing every outcome
+// into results at the recipient's original index.
+func (d *SMTPDeliverer) deliverDomain(ctx context.Context, from, domain string, to []string, idxs []int, body []byte, port int, results []Result) {
+	addrs := make([]string, len(idxs))
+	for i, idx := range idxs {
+		addrs[i] = to[idx]
+	}
+	hosts, err := d.mxCandidates(ctx, domain)
+	if err != nil {
+		for _, idx := range idxs {
+			results[idx] = Result{To: to[idx], Permanent: true, Err: err}
+		}
+		return
+	}
+	// RFC 5321 §5.1: try each MX host in preference order; a transient
+	// failure (unreachable primary) advances to the next secondary
+	// within the same attempt instead of burning a retry round.
+	var resps []mailsmtp.Response
+	var lastErr error
+	delivered := false
+	for _, host := range hosts {
+		tlsMode, daneRecords, policyErr := outboundTLSPolicy(ctx, d.PolicyResolver, d.MTSTS, d.Logger, domain, host)
+		if policyErr != nil {
+			lastErr = policyErr
 			continue
 		}
-		addrs := groups[domain]
-		// RFC 5321 §5.1: try each MX host in preference order; a transient
-		// failure (unreachable primary) advances to the next secondary
-		// within the same attempt instead of burning a retry round.
-		var resps []mailsmtp.Response
-		var lastErr error
-		delivered := false
-		for _, host := range hosts {
-			tlsMode, daneRecords, policyErr := outboundTLSPolicy(ctx, d.PolicyResolver, d.MTSTS, d.Logger, domain, host)
-			if policyErr != nil {
-				lastErr = policyErr
-				continue
-			}
-			resps, lastErr = d.deliverGroup(ctx, from, host, addrs, body, port, tlsMode, daneRecords)
-			if lastErr == nil || len(resps) > 0 {
-				delivered = true
-				break
-			}
-			if permanentError(lastErr) {
-				break
-			}
-			d.Logger.Info("queue: MX host failed, trying next", "domain", domain, "host", host, "err", lastErr)
+		resps, lastErr = d.deliverGroup(ctx, from, host, addrs, body, port, tlsMode, daneRecords)
+		if lastErr == nil || len(resps) > 0 {
+			delivered = true
+			break
 		}
-		if !delivered {
-			permanent := lastErr != nil && permanentError(lastErr)
-			for _, addr := range addrs {
-				results = append(results, Result{To: addr, Permanent: permanent, Err: lastErr})
-			}
-			continue
+		if permanentError(lastErr) {
+			break
 		}
-		for i, addr := range addrs {
-			res := Result{To: addr, OK: true}
-			if i < len(resps) {
-				r := resps[i]
-				// Success is code 2xx. Rejected recipients carry their RCPT
-				// response, so Err alone is not a reliable signal.
-				if r.Code/100 != 2 {
-					res.OK = false
-					res.Permanent = r.Permanent
-					if r.Err != nil {
-						res.Err = r.Err
-					} else {
-						res.Err = &mailsmtp.ResponseError{Response: r}
-					}
+		d.Logger.Info("queue: MX host failed, trying next", "domain", domain, "host", host, "err", lastErr)
+	}
+	if !delivered {
+		permanent := lastErr != nil && permanentError(lastErr)
+		for _, idx := range idxs {
+			results[idx] = Result{To: to[idx], Permanent: permanent, Err: lastErr}
+		}
+		return
+	}
+	for i, idx := range idxs {
+		res := Result{To: to[idx], OK: true}
+		if i < len(resps) {
+			r := resps[i]
+			// Success is code 2xx. Rejected recipients carry their RCPT
+			// response, so Err alone is not a reliable signal.
+			if r.Code/100 != 2 {
+				res.OK = false
+				res.Permanent = r.Permanent
+				if r.Err != nil {
+					res.Err = r.Err
+				} else {
+					res.Err = &mailsmtp.ResponseError{Response: r}
 				}
 			}
-			results = append(results, res)
 		}
+		results[idx] = res
 	}
-	return results, nil
 }
 
 // deliverToHost sends every recipient to one fixed host (smarthost path).
