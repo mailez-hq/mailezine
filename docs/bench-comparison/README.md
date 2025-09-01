@@ -44,16 +44,39 @@ reference server Mail Server v0.11.8 官方镜像 (RocksDB) 做两条核心路�
 - 数据从命名卷改为容器内部层:8.4/s —— 排除卷 I/O 为唯一因素。
 - 引擎容器 CPU 全程 <12%,瓶颈是等待/串行而非算力。
 
+### 根因定位与修复 (pprof 实证,已完成)
+
+给引擎加了 `MAILEZINE_PPROF` 开关后在负载下抓取 mutex/block/CPU profile:
+
+- 70 秒负载累计 **1222 秒互斥等待**,全部落在 `internal/store` 的账号锁上:
+  旧版 `KV.Deliver` 每封邮件要**四次**进临界区(nextUID → CreateDocument →
+  BumpMailboxModSeq → AppendEmailAtomically),每次各做一次 KV 提交。
+- 修复(`internal/store.DeliverEmail`):UID / modseq / 文档 ID / 字段 /
+  blob 链接 / 配额 / 变更日志 / 二级索引合并为**一次加锁一次提交**;
+  blob 改为内容寻址 (sha256),上传移到账号锁之外,并发投递可流水线化。
+- 修复后同场景复测:
+
+| 引擎 | 入站 SMTP 2000×4KB | IMAP 50 会话 FETCH |
+|---|---|---|
+| reference server 0.11.8 | 57.1 msg/s (p50 282ms) | 1590 ops/s (p50 27ms) |
+| mailezine 修复前 | 14.5 msg/s (p50 1.15s) | 570 ops/s (p50 73ms) |
+| **mailezine 修复后** | **24.3 msg/s (p50 732ms, +68%)** | **754 ops/s (p50 55ms, +32%)** |
+
+- 剩余差距主因:每消息一次 Pebble 提交的 fsync 延迟(基准环境放大),
+  而 RocksDB 对并发写入做组提交摊薄 fsync。下一个杠杆是投递微批
+  (同账号多封合并一次提交),涉及正确性关键路径,另立任务跟进。
+
 ## 结论 (如实)
 
-在两条基准路径上,**reference server v0.11.8 均明显快于 mailezine 当前版本**
-(入站 SMTP ~4×,IMAP FETCH ~2.8×)。此前宣传材料中的 3.3× 数字是对比
-legacy MTA/IMAP stack 栈的,不适用于此处;对 reference server 的原始吞吐我们目前落后。
+修复前两条路径 reference server 均领先(入站 ~4×,IMAP ~2.8×)。**差距不是
+Go vs Rust 语言**:修复前引擎 CPU 闲置、互斥等待占绝对大头,是提交次数/
+锁粒度的架构问题;单次提交合并即拿回入站 1.7×、IMAP 1.3×。修复后入站
+差距收窄到 ~2.4×。此前宣传材料中的 3.3× 数字是对比 legacy MTA/IMAP stack
+栈的,不适用于此处。
 
-跟进优化方向 (③d 后续):
-1. mailezine 入站投递管线 profile:定位每消息 ~70ms 的串行点
-   (疑似投递确认路径上的同步 KV 提交/索引写入)。
-2. IMAP FETCH 热路径缓存对比 (reference server 的 IMAP 元数据缓存命中更高效)。
+后续跟进:
+1. 投递微批合并提交(对标 RocksDB 组提交),预期再接近一档。
+2. IMAP FETCH 热路径缓存命中率对比(reference server 元数据缓存更高效)。
 
 ## 复现
 

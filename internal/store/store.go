@@ -202,6 +202,98 @@ func (s *Store) BumpMailboxModSeq(ctx context.Context, accountID AccountID, mbID
 	return modseq, nil
 }
 
+// DeliverEmail commits one delivered message in a SINGLE account-locked
+// transaction: UID allocation (INV-UID, per mailbox identity), document ID
+// allocation (INV-UID, per collection), the mailbox modseq bump (CONDSTORE),
+// the message fields, the blob link (INV-BLOB), quota accounting (INV-QUOTA)
+// and the change-log entry (INV-CHANGE) plus any extra ops (secondary
+// index). The blob DATA must already be in the blob store under blobID —
+// callers upload it outside the account lock so concurrent deliveries
+// pipeline. modseq is allocated here and written as the message's
+// fieldModSeq; fields must not contain it.
+func (s *Store) DeliverEmail(
+	ctx context.Context,
+	accountID AccountID,
+	mbID uint64,
+	fields map[byte][]byte,
+	blobID string,
+	size int64,
+	extra ...Op,
+) (uid uint64, modseq uint64, docID uint64, err error) {
+	unlock := s.lockAccount(accountID)
+	defer unlock()
+
+	uidKey := CounterKey(uint32(accountID), CounterKindNextDoc, append([]byte{CollectionEmail}, beUint64(mbID)...))
+	docKey := CounterKey(uint32(accountID), CounterKindNextDoc, []byte{CollectionEmail})
+	modseqKey := FieldKey(uint32(accountID), CollectionMailbox, mbID, FieldMailboxModSeq)
+	quotaKey := QuotaKey(uint32(accountID))
+	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
+
+	err = s.txn.WithTxn(ctx, func(t TxnOps) error {
+		cur, err := readCounter(t.Get, uidKey)
+		if err != nil {
+			return err
+		}
+		uid = cur + 1
+		t.Put(uidKey, beUint64(uid))
+
+		curMs, err := t.Get(modseqKey)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		modseq = beUint64Value(curMs) + 1
+		t.Put(modseqKey, beUint64(modseq))
+
+		curDoc, err := readCounter(t.Get, docKey)
+		if err != nil {
+			return err
+		}
+		docID = curDoc + 1
+		t.Append(
+			Op{Key: docKey, Value: beUint64(docID)},
+			Op{Key: FieldKey(uint32(accountID), CollectionEmail, docID, FieldMeta), Value: []byte{1}},
+		)
+
+		full := make(map[byte][]byte, len(fields)+2)
+		for field, value := range fields {
+			full[field] = value
+		}
+		full[EmailFieldUID] = beUint64(uid)
+		full[EmailFieldModSeq] = beUint64(modseq)
+		t.Append(orderedFieldOps(accountID, CollectionEmail, docID, full)...)
+
+		if err := stageBlobLink(t, accountID, blobID); err != nil {
+			return err
+		}
+
+		curQuota, err := quotaValue(t.Get, quotaKey)
+		if err != nil {
+			return err
+		}
+		t.Append(Op{Key: quotaKey, Value: beUint64(uint64(curQuota + size))})
+
+		nextChange, err := readCounter(t.Get, changeCounter)
+		if err != nil {
+			return err
+		}
+		nextChange++
+		t.Append(
+			Op{Key: changeCounter, Value: beUint64(nextChange)},
+			Op{Key: ChangeLogKey(uint32(accountID), CollectionEmail, nextChange), Value: encodeChangeValue(CollectionEmail, docID, OpCreate)},
+		)
+
+		// Per-mailbox secondary index: (account, mailbox, UID) -> docID.
+		t.Append(Op{Key: IndexEmailKey(uint32(accountID), mbID, uid), Value: beUint64(docID)})
+
+		t.Append(extra...)
+		return nil
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return uid, modseq, docID, nil
+}
+
 // GetBlob streams a blob to w.
 func (s *Store) GetBlob(ctx context.Context, id string, w io.Writer) error {
 	return s.blob.Get(ctx, id, w)

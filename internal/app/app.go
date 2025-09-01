@@ -23,6 +23,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -616,6 +618,17 @@ func (a *App) serveHealth(ctx context.Context) error {
 			a.classifier != nil, a.cfg.Outbound.Enabled, a.fts != nil)
 	})
 	mux.Handle("/metrics", promhttp.HandlerFor(a.m.Registry, promhttp.HandlerOpts{}))
+	if a.cfg.Pprof {
+		// Sample mutex/block events so /debug/pprof/{mutex,block} carry
+		// signal under load. Rates are only paid when profiling is on.
+		runtime.SetMutexProfileFraction(5)
+		runtime.SetBlockProfileRate(10_000) // record blocking >= 10µs
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+	}
 	a.healthSrv = &http.Server{Addr: a.cfg.HealthAddr, Handler: mux}
 	return serveHTTP(ctx, a.healthSrv, a.logger)
 }

@@ -5,9 +5,10 @@ package mailstore
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 	"time"
@@ -58,8 +59,13 @@ func NewKV(s *store.Store) *KV {
 	return &KV{s: s}
 }
 
-// Deliver stores one message: blob first, then an Email document with the
-// metadata, then quota and change log — the ARCHITECTURE.md §3.5 ordering.
+// Deliver stores one message. The blob is content-addressed and uploaded
+// BEFORE anything locks the account, so concurrent deliveries pipeline the
+// blob I/O; then one account-locked transaction commits UID, modseq,
+// document ID, fields, blob link, quota, change log and the per-mailbox
+// index together (ARCHITECTURE.md §3.5 ordering: the blob exists before any
+// link to it becomes visible). Concurrent delivery used to serialize at
+// ~4 KV commits per message; this path takes the account lock once.
 func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message) (uint32, error) {
 	acctID, err := k.ensureAccount(ctx, account)
 	if err != nil {
@@ -69,23 +75,12 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 	if err != nil {
 		return 0, err
 	}
-	uid, err := k.nextUID(ctx, acctID, mbID)
-	if err != nil {
-		return 0, err
-	}
-	modseq, err := k.s.BumpMailboxModSeq(ctx, acctID, mbID)
-	if err != nil {
-		return 0, err
-	}
-	docID, err := k.s.CreateDocument(ctx, acctID, store.CollectionEmail)
-	if err != nil {
-		return 0, err
-	}
-	blobID := fmt.Sprintf("email-%d-%d", acctID, docID)
 	data := msg.Data
 	if data == nil {
 		data = []byte{}
 	}
+	sum := sha256.Sum256(data)
+	blobID := "sha256-" + hex.EncodeToString(sum[:])
 	size, err := k.s.PutBlob(ctx, blobID, int64(len(data)), bytes.NewReader(data))
 	if err != nil {
 		return 0, err
@@ -99,19 +94,15 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 	keywords := append(append([]string(nil), kws...), msg.Keywords...)
 	fields := map[byte][]byte{
 		fieldBlobID:   []byte(blobID),
-		fieldUID:      beUint64(uid),
 		fieldMailbox:  []byte(mailbox),
 		fieldFlags:    []byte(strings.Join(system, ",")),
 		fieldDate:     []byte(date.UTC().Format(time.RFC3339)),
 		fieldFrom:     []byte(msg.From),
 		fieldSize:     beUint64(uint64(size)),
 		fieldKeywords: []byte(strings.Join(keywords, ",")),
-		fieldModSeq:   beUint64(modseq),
 	}
-	// Fields + blob link + quota + change log + per-mailbox index commit
-	// atomically.
-	idx := store.Op{Key: store.IndexEmailKey(uint32(acctID), mbID, uid), Value: beUint64(docID)}
-	if err := k.s.AppendEmailAtomically(ctx, acctID, store.CollectionEmail, docID, fields, blobID, size, idx); err != nil {
+	uid, _, _, err := k.s.DeliverEmail(ctx, acctID, mbID, fields, blobID, size)
+	if err != nil {
 		return 0, err
 	}
 	return uint32(uid), nil

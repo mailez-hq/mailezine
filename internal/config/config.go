@@ -29,6 +29,10 @@ const (
 type Config struct {
 	Log            LogConfig
 	HealthAddr     string
+	// Pprof exposes net/http/pprof under /debug/pprof on the health
+	// listener (MAILEZINE_PPROF). Off by default; profiling support for
+	// benchmark and production diagnosis.
+	Pprof          bool
 	Listeners      ListenersConfig
 	Storage        StorageConfig
 	FTS            FTSConfig
@@ -394,6 +398,7 @@ func Load() (Config, error) {
 			Format: getenv("MAILEZINE_LOG_FORMAT", "text"),
 		},
 		HealthAddr:         getenv("MAILEZINE_HEALTH_ADDR", fmt.Sprintf(":%d", DefaultHealthPort)),
+		Pprof:              envBool("MAILEZINE_PPROF", false),
 		Hostname:           getenv("MAILEZINE_HOSTNAME", defaultHostname()),
 		RecipientDelimiter: getenv("MAILEZINE_RECIPIENT_DELIMITER", "+"),
 		Listeners: ListenersConfig{
