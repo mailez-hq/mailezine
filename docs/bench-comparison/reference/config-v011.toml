@@ -1,0 +1,96 @@
+# reference server 0.11.8 benchmark instance (TOML era, mounted at
+# /opt/reference-mail/etc/config.toml). One RocksDB store backing data,
+# blobs, lookup lists and FTS; internal directory "bench" provisioned via
+# reference-cli; spam filter and webadmin disabled (engine measurement,
+# no outbound network needed).
+
+# Top-level dotted settings (kept above table sections).
+webadmin.enabled = false
+spam-filter.pyzor.host = "127.0.0.1"
+session.data.spam-filter = false
+smtp.require-tls = false
+imap.auth.allow-plain-text = true
+session.ehlo.reject-non-fqdn = false
+server.auto-ban.auth.rate = "1000000/1h"
+session.auth.mechanisms = "PLAIN"
+
+# Disable DNS-backed sender verification for the benchmark (no reachable
+# DNS in the isolated bench network; mirrors the mailezine side where the
+# junk/auth pipeline is disabled). SPF/iprev/DKIM/DMARC checks would stall
+# ~10s per message on DNS timeouts and dominate the results.
+auth.spf.verify.ehlo = false
+auth.spf.verify.mail-from = false
+auth.dmarc.verify = false
+auth.iprev.verify = false
+
+# Disable SMTP inbound rate limits for the benchmark (defaults cap senders
+# at 25 messages/hour and throttle by IP/recipient).
+queue.limiter.inbound.ip.enable = false
+queue.limiter.inbound.ip.rate = "100000000/1h"
+queue.limiter.inbound.sender.enable = false
+queue.limiter.inbound.sender.rate = "100000000/1h"
+resolver.timeout = "1s"
+resolver.attempts = 1
+
+# Zero out the DNSBL tag queries (they run even with an empty spam filter
+# and cost ~5s per message on the isolated bench network).
+spam-filter.dnsbl.servers = []
+spam-filter.dnsbl.max-check.ip = 0
+spam-filter.dnsbl.max-check.domains = 0
+spam-filter.dnsbl.max-check.email = 0
+spam-filter.dnsbl.max-check.url = 0
+
+# The empty filter must not try to fetch its ruleset from GitHub on every
+# message (GitHub is unreachable from the bench network = ~5s stall each).
+# Point the resource at the jsdelivr mirror of the same file so the one-time
+# load succeeds quickly; the filter expression itself stays empty.
+spam-filter.auto-update = false
+spam-filter.resource = "https://cdn.jsdelivr.net/gh/reference/spam-filter@main/spam-filter.toml"
+webadmin.auto-update = false
+
+[server]
+hostname = "bench-reference"
+
+[server.listener."smtp"]
+bind = "[::]:25"
+protocol = "smtp"
+
+[server.listener."submission"]
+bind = "[::]:587"
+protocol = "smtp"
+
+[server.listener."imap"]
+bind = "[::]:143"
+protocol = "imap"
+
+[server.listener."http"]
+bind = "[::]:8080"
+protocol = "http"
+
+[storage]
+data = "data"
+blob = "data"
+directory = "bench"
+lookup = "data"
+fts = "data"
+full-index = true
+
+[store.data]
+type = "rocksdb"
+path = "/opt/reference-mail/data"
+compression = "lz4"
+
+[authentication.fallback-admin]
+user = "admin"
+secret = "{plain}benchadmin"
+
+[tracer.console]
+type = "console"
+level = "debug"
+ansi = false
+
+[directory."bench"]
+type = "internal"
+store = "data"
+
+# All recipients are local; no outbound relay is configured.

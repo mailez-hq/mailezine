@@ -313,8 +313,11 @@ func runConcurrent(n, total int, fn func() error) benchResult {
 // seed delivers messages to local users over inbound SMTP (no auth,
 // trusted-peer model). Recipients cycle through the user range.
 func seed() {
-	body := randomBody("bench seed", *size, "")
 	res := runConcurrent(*conns, *msgs, func() error {
+		// A fresh body (and Message-ID) per message: engines that dedupe
+		// by Message-ID would otherwise fold the whole run into one stored
+		// message and skew the mailbox-population results.
+		body := randomBody("bench seed", *size, fmt.Sprintf("%d@bench.test", randInt()))
 		c, err := gosmtp.Dial(*inSmtp)
 		if err != nil {
 			return err
@@ -344,8 +347,8 @@ func seed() {
 // smtpBench runs concurrent authenticated submissions (one message per
 // connection) to local recipients.
 func smtpBench() {
-	body := randomBody("bench smtp", *size, "")
 	res := runConcurrent(*conns, *msgs, func() error {
+		body := randomBody("bench smtp", *size, fmt.Sprintf("%d@bench.test", randInt()))
 		c, err := gosmtp.Dial(*smtpAddr)
 		if err != nil {
 			return err

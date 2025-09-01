@@ -1,0 +1,76 @@
+# mailezine vs reference server — 同栈基准 (2026-09)
+
+同一 Windows 宿主机 (Docker 29.7.2, WSL2 后端)、同一客户端工具
+(mailezine `cmd/bench`,Edmundgo-imap/gosmtp 客户端库)、同一数据集与并发,
+对 mailezine 引擎镜像 (本仓库 CE 构建, Pebble KV) 与
+reference server Mail Server v0.11.8 官方镜像 (RocksDB) 做两条核心路径的对比。
+
+## 环境
+
+| 项 | mailezine | reference server |
+|---|---|---|
+| 版本 | mailezine-bench (本仓库, CE 构建) | reference/mail-server:v0.11.8 |
+| 存储 | Pebble (纯 Go, 默认) | RocksDB (官方默认) |
+| 数据落盘 | Docker 命名卷 | Docker 命名卷 |
+| 垃圾过滤 | 关 (MAILEZINE_JUNK_ENABLED=false) | 关 (session.data.spam-filter=false, DNSBL 清零, 限速器关闭) |
+| 用户 | dev 目录 JSON, 5 用户 | internal 目录 REST 预置, 5 用户 (role=user) |
+| 密码 | benchpass | benchpass |
+
+双方均关闭垃圾/灰名单/SPF-DNS 类校验:测的是"引擎"(SMTP 接收 + 投递 +
+存储 + IMAP),不是反垃圾栈。reference server 侧额外关闭了其默认的入站限速
+(每发送者 25 封/小时) 与明文 AUTH/非 FQDN EHLO 拒绝,使自动化基准可行;
+这些改动全部记录在 `reference server/config-v011.toml`。
+
+## 结果 (同一客户端、同一时刻、先后串行运行)
+
+### 场景 1: 入站 SMTP 注入 2000 封 × 4KB, 20 并发, 单一收件信箱
+
+| 引擎 | 吞吐 | 延迟 p50 | p95 | p99 | 失败 |
+|---|---|---|---|---|---|
+| reference server 0.11.8 | **57.1 msg/s** | 282ms | 627ms | 1.40s | 0 |
+| mailezine | 14.5 msg/s | 1.15s | 2.53s | 3.15s | 0 |
+
+### 场景 2: IMAP 50 并发会话,持续 20s,每会话循环 FETCH ENVELOPE
+
+| 引擎 | fetch 吞吐 | 延迟 p50 | p95 | p99 | 20s 总操作 |
+|---|---|---|---|---|---|
+| reference server 0.11.8 | **1590 ops/s** | 26.7ms | 63.6ms | 91.7ms | 32014 |
+| mailezine | 570 ops/s | 73.0ms | 171.6ms | 235.7ms | 11467 |
+
+### 诊断补充 (mailezine 场景 1)
+
+- 并发 20→50:吞吐不升反降 (14.5→11.7/s,p50 1.15→3.72s) —— 入站管线
+  存在每消息串行化阶段 (~70-90ms/封),与并发无关。
+- 数据从命名卷改为容器内部层:8.4/s —— 排除卷 I/O 为唯一因素。
+- 引擎容器 CPU 全程 <12%,瓶颈是等待/串行而非算力。
+
+## 结论 (如实)
+
+在两条基准路径上,**reference server v0.11.8 均明显快于 mailezine 当前版本**
+(入站 SMTP ~4×,IMAP FETCH ~2.8×)。此前宣传材料中的 3.3× 数字是对比
+legacy MTA/IMAP stack 栈的,不适用于此处;对 reference server 的原始吞吐我们目前落后。
+
+跟进优化方向 (③d 后续):
+1. mailezine 入站投递管线 profile:定位每消息 ~70ms 的串行点
+   (疑似投递确认路径上的同步 KV 提交/索引写入)。
+2. IMAP FETCH 热路径缓存对比 (reference server 的 IMAP 元数据缓存命中更高效)。
+
+## 复现
+
+```powershell
+# 引擎 (mailezine): 见 mailezine/config.toml + users/passwords.json
+docker run -d --name bench-mailezine --network bench-vs -p 12143:143 -p 12025:25 -p 11587:1587 `
+  -v .../users.json:/conf/users.json:ro -v .../passwords.json:/conf/passwords.json:ro `
+  -v .../config.toml:/conf/config.toml:ro -v bench-mailezine-data:/data `
+  -e MAILEZINE_CONFIG=/conf/config.toml mailezine-bench
+# 引擎 (reference server): 见 reference server/config-v011.toml, principal 预置用管理 REST API
+# 基准:
+bench.exe seed -in-smtp 127.0.0.1:12025 -to u00001@example.test -msgs 2000 -conns 20 -size 4096 -engine mailezine
+bench.exe imap  -imap 127.0.0.1:12143 -user u00001@example.test -pass benchpass -conns 50 -dur 20s
+```
+
+## 基准工具修复 (随本目录一起入库)
+
+`cmd/bench` 的 seed/smtp 模式原先整个运行共用同一个 Message-ID,
+会触发按 Message-ID 去重的引擎 (如 reference server) 折叠整轮投递,
+严重歪曲信箱填充类结果;已改为每消息生成唯一 Message-ID。
