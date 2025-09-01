@@ -266,6 +266,128 @@ func runConcurrentAllocation(t *testing.T, s *Store) {
 	}
 }
 
+// runDeliverBatch pins the micro-batch contract: state after one
+// DeliverEmailBatch equals state after the same messages go through
+// DeliverEmail one by one (uids, docs, modseqs, quota, changelog), batches
+// span multiple mailboxes correctly, and concurrent batchers never duplicate
+// identities.
+func runDeliverBatch(t *testing.T, s *Store) {
+	ctx := context.Background()
+	acct, _ := s.CreateAccount(ctx, "alice@example.com")
+	mb, err := s.CreateDocument(ctx, acct, CollectionMailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mb2, err := s.CreateDocument(ctx, acct, CollectionMailbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := func(subject string) map[byte][]byte {
+		return map[byte][]byte{99: []byte(subject)}
+	}
+
+	// Sequential baseline.
+	var wantUID, wantModseq, wantDoc []uint64
+	for i := 0; i < 3; i++ {
+		uid, ms, doc, err := s.DeliverEmail(ctx, acct, mb, fields("x"), "b-seq", 100)
+		if err != nil {
+			t.Fatal(err)
+		}
+		wantUID = append(wantUID, uid)
+		wantModseq = append(wantModseq, ms)
+		wantDoc = append(wantDoc, doc)
+	}
+
+	// One batch of 3 in the same mailbox: identical allocations continuing
+	// the sequence (as if the three had been delivered one by one).
+	batch := []DeliverRequest{
+		{MailboxID: mb, Fields: fields("a"), BlobID: "b1", Size: 100},
+		{MailboxID: mb, Fields: fields("b"), BlobID: "b2", Size: 100},
+		{MailboxID: mb, Fields: fields("c"), BlobID: "b3", Size: 100},
+	}
+	res, err := s.DeliverEmailBatch(ctx, acct, batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, r := range res {
+		if r.UID != wantUID[i]+3 || r.ModSeq != wantModseq[i]+3 || r.DocID != wantDoc[i]+3 {
+			t.Fatalf("batch[%d] = uid %d modseq %d doc %d, want uid %d modseq %d doc %d",
+				i, r.UID, r.ModSeq, r.DocID, wantUID[i]+3, wantModseq[i]+3, wantDoc[i]+3)
+		}
+	}
+
+	// Counter state must equal six sequential deliveries.
+	uidKey := CounterKey(uint32(acct), CounterKindNextDoc, append([]byte{CollectionEmail}, beUint64(mb)...))
+	cur, err := readCounter(s.kv.Get, uidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur != 6 {
+		t.Fatalf("uid counter = %d, want 6", cur)
+	}
+	quotaKey := QuotaKey(uint32(acct))
+	qv, err := quotaValue(s.kv.Get, quotaKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qv != 600 {
+		t.Fatalf("quota = %d, want 600", qv)
+	}
+
+	// Multi-mailbox batch: per-mailbox UID sequences are independent.
+	res, err = s.DeliverEmailBatch(ctx, acct, []DeliverRequest{
+		{MailboxID: mb2, Fields: fields("d"), BlobID: "b4", Size: 10},
+		{MailboxID: mb, Fields: fields("e"), BlobID: "b5", Size: 10},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res[0].UID != 1 || res[1].UID != 7 || res[0].ModSeq != 1 {
+		t.Fatalf("multi-mailbox batch = %+v", res)
+	}
+
+	// Concurrent batches must never duplicate or skip identities.
+	const goroutines = 8
+	const per = 5
+	var wg sync.WaitGroup
+	uids := make(chan uint64, goroutines*per)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			reqs := make([]DeliverRequest, per)
+			for i := range reqs {
+				reqs[i] = DeliverRequest{MailboxID: mb, Fields: fields("r"), BlobID: "br", Size: 1}
+			}
+			out, err := s.DeliverEmailBatch(ctx, acct, reqs)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			for _, r := range out {
+				uids <- r.UID
+			}
+		}()
+	}
+	wg.Wait()
+	close(uids)
+	seen := map[uint64]bool{}
+	for uid := range uids {
+		if seen[uid] {
+			t.Fatalf("duplicate UID %d under concurrent batches", uid)
+		}
+		seen[uid] = true
+	}
+	wantTotal := uint64(7 + goroutines*per) // 3 seq + 3 batch + multi(mb→7) + 40 raced
+	cur, err = readCounter(s.kv.Get, uidKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur != wantTotal {
+		t.Fatalf("uid counter = %d, want %d", cur, wantTotal)
+	}
+}
+
 // runStoreSuite executes the full invariant suite against one backend
 // constructor. Every KV/Blob backend must pass the same suite (双后端对拍).
 func runStoreSuite(t *testing.T, newStore func(t *testing.T) *Store) {
@@ -281,6 +403,7 @@ func runStoreSuite(t *testing.T, newStore func(t *testing.T) *Store) {
 	sub("quota accounting", runQuotaAccounting)
 	sub("blob links", runBlobLinks)
 	sub("concurrent allocation", runConcurrentAllocation)
+	sub("deliver batch", runDeliverBatch)
 }
 
 func TestStoreMemory(t *testing.T) {

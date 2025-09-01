@@ -222,75 +222,136 @@ func (s *Store) DeliverEmail(
 ) (uid uint64, modseq uint64, docID uint64, err error) {
 	unlock := s.lockAccount(accountID)
 	defer unlock()
+	err = s.txn.WithTxn(ctx, func(t TxnOps) error {
+		uid, modseq, docID, err = s.deliverOne(t, accountID, mbID, fields, blobID, size, extra...)
+		return err
+	})
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return uid, modseq, docID, nil
+}
 
+// DeliverRequest is one message staged for DeliverEmailBatch. Same contract
+// as the DeliverEmail parameters.
+type DeliverRequest struct {
+	MailboxID uint64
+	Fields    map[byte][]byte
+	BlobID    string
+	Size      int64
+}
+
+// DeliverResult reports the identities allocated for one DeliverRequest.
+type DeliverResult struct {
+	UID    uint64
+	ModSeq uint64
+	DocID  uint64
+}
+
+// DeliverEmailBatch commits k delivered messages under ONE account lock and
+// ONE transaction — one fsync instead of k. The resulting storage state is
+// identical to k sequential DeliverEmail calls: each message still gets its
+// own sequential UID, document ID, modseq bump, change-log entry, blob link
+// and index entry; the KV write buffer collapses the repeated counter
+// writes into their final values. This is the delivery-side micro-batch:
+// under load several SMTP arrivals queue while the leader holds the account
+// gate, and they drain into a single commit.
+func (s *Store) DeliverEmailBatch(ctx context.Context, accountID AccountID, reqs []DeliverRequest) ([]DeliverResult, error) {
+	unlock := s.lockAccount(accountID)
+	defer unlock()
+	res := make([]DeliverResult, len(reqs))
+	err := s.txn.WithTxn(ctx, func(t TxnOps) error {
+		for i := range reqs {
+			r := &reqs[i]
+			uid, modseq, docID, err := s.deliverOne(t, accountID, r.MailboxID, r.Fields, r.BlobID, r.Size)
+			if err != nil {
+				return err
+			}
+			res[i] = DeliverResult{UID: uid, ModSeq: modseq, DocID: docID}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// deliverOne stages exactly one message's mutations (see DeliverEmail).
+// Counters are written per call; the transaction write buffer's
+// last-write-wins collapsing keeps repeated writes of the same key cheap
+// and correct.
+func (s *Store) deliverOne(
+	t TxnOps,
+	accountID AccountID,
+	mbID uint64,
+	fields map[byte][]byte,
+	blobID string,
+	size int64,
+	extra ...Op,
+) (uid uint64, modseq uint64, docID uint64, err error) {
 	uidKey := CounterKey(uint32(accountID), CounterKindNextDoc, append([]byte{CollectionEmail}, beUint64(mbID)...))
 	docKey := CounterKey(uint32(accountID), CounterKindNextDoc, []byte{CollectionEmail})
 	modseqKey := FieldKey(uint32(accountID), CollectionMailbox, mbID, FieldMailboxModSeq)
 	quotaKey := QuotaKey(uint32(accountID))
 	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
 
-	err = s.txn.WithTxn(ctx, func(t TxnOps) error {
-		cur, err := readCounter(t.Get, uidKey)
-		if err != nil {
-			return err
-		}
-		uid = cur + 1
-		t.Put(uidKey, beUint64(uid))
-
-		curMs, err := t.Get(modseqKey)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			return err
-		}
-		modseq = beUint64Value(curMs) + 1
-		t.Put(modseqKey, beUint64(modseq))
-
-		curDoc, err := readCounter(t.Get, docKey)
-		if err != nil {
-			return err
-		}
-		docID = curDoc + 1
-		t.Append(
-			Op{Key: docKey, Value: beUint64(docID)},
-			Op{Key: FieldKey(uint32(accountID), CollectionEmail, docID, FieldMeta), Value: []byte{1}},
-		)
-
-		full := make(map[byte][]byte, len(fields)+2)
-		for field, value := range fields {
-			full[field] = value
-		}
-		full[EmailFieldUID] = beUint64(uid)
-		full[EmailFieldModSeq] = beUint64(modseq)
-		t.Append(orderedFieldOps(accountID, CollectionEmail, docID, full)...)
-
-		if err := stageBlobLink(t, accountID, blobID); err != nil {
-			return err
-		}
-
-		curQuota, err := quotaValue(t.Get, quotaKey)
-		if err != nil {
-			return err
-		}
-		t.Append(Op{Key: quotaKey, Value: beUint64(uint64(curQuota + size))})
-
-		nextChange, err := readCounter(t.Get, changeCounter)
-		if err != nil {
-			return err
-		}
-		nextChange++
-		t.Append(
-			Op{Key: changeCounter, Value: beUint64(nextChange)},
-			Op{Key: ChangeLogKey(uint32(accountID), CollectionEmail, nextChange), Value: encodeChangeValue(CollectionEmail, docID, OpCreate)},
-		)
-
-		// Per-mailbox secondary index: (account, mailbox, UID) -> docID.
-		t.Append(Op{Key: IndexEmailKey(uint32(accountID), mbID, uid), Value: beUint64(docID)})
-
-		t.Append(extra...)
-		return nil
-	})
+	cur, err := readCounter(t.Get, uidKey)
 	if err != nil {
 		return 0, 0, 0, err
 	}
+	uid = cur + 1
+	t.Put(uidKey, beUint64(uid))
+
+	curMs, err := t.Get(modseqKey)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return 0, 0, 0, err
+	}
+	modseq = beUint64Value(curMs) + 1
+	t.Put(modseqKey, beUint64(modseq))
+
+	curDoc, err := readCounter(t.Get, docKey)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	docID = curDoc + 1
+	t.Append(
+		Op{Key: docKey, Value: beUint64(docID)},
+		Op{Key: FieldKey(uint32(accountID), CollectionEmail, docID, FieldMeta), Value: []byte{1}},
+	)
+
+	full := make(map[byte][]byte, len(fields)+2)
+	for field, value := range fields {
+		full[field] = value
+	}
+	full[EmailFieldUID] = beUint64(uid)
+	full[EmailFieldModSeq] = beUint64(modseq)
+	t.Append(orderedFieldOps(accountID, CollectionEmail, docID, full)...)
+
+	if err := stageBlobLink(t, accountID, blobID); err != nil {
+		return 0, 0, 0, err
+	}
+
+	curQuota, err := quotaValue(t.Get, quotaKey)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	t.Append(Op{Key: quotaKey, Value: beUint64(uint64(curQuota + size))})
+
+	nextChange, err := readCounter(t.Get, changeCounter)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	nextChange++
+	t.Append(
+		Op{Key: changeCounter, Value: beUint64(nextChange)},
+		Op{Key: ChangeLogKey(uint32(accountID), CollectionEmail, nextChange), Value: encodeChangeValue(CollectionEmail, docID, OpCreate)},
+	)
+
+	// Per-mailbox secondary index: (account, mailbox, UID) -> docID.
+	t.Append(Op{Key: IndexEmailKey(uint32(accountID), mbID, uid), Value: beUint64(docID)})
+
+	t.Append(extra...)
 	return uid, modseq, docID, nil
 }
 

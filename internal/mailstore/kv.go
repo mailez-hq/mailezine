@@ -9,8 +9,10 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"mailezine/internal/store"
@@ -51,12 +53,184 @@ const (
 
 // KV implements Store on top of a store.Store facade.
 type KV struct {
-	s *store.Store
+	s      *store.Store
+	batch  deliverBatcher
+	batchLimit int
 }
 
 // NewKV wraps a store facade.
 func NewKV(s *store.Store) *KV {
-	return &KV{s: s}
+	return &KV{s: s, batchLimit: defaultDeliverBatchLimit}
+}
+
+// deliverBatchLimit bounds one micro-batch: the number of queued messages a
+// leader drains into a single transaction. It bounds txn memory under
+// sustained overload; excess stays queued for the next leader.
+const defaultDeliverBatchLimit = 256
+
+// deliverRequest is one staged delivery waiting to join a batch. All the
+// expensive pre-lock work (blob upload, field building) has already happened
+// by the time a request is staged.
+type deliverRequest struct {
+	mbID   uint64
+	fields map[byte][]byte
+	blobID string
+	size   int64
+	done   chan deliverResult
+}
+
+type deliverResult struct {
+	uid uint32
+	err error
+}
+
+// perAccountBatch coalesces concurrent same-account deliveries. Exactly one
+// goroutine is the leader at a time: it keeps draining staged requests and
+// committing them batch-by-batch until the queue runs dry, then resigns.
+// Arrivals during a commit queue behind the leader and join its NEXT batch —
+// the same equilibrium RocksDB group commit reaches, where the WAL fsync is
+// amortized over the whole arrival burst. No background goroutines, no
+// timers, nothing to shut down.
+type perAccountBatch struct {
+	mu     sync.Mutex
+	queue  []*deliverRequest
+	active bool
+}
+
+// deliverBatcher owns one perAccountBatch per account.
+type deliverBatcher struct {
+	mu    sync.Mutex
+	accts map[store.AccountID]*perAccountBatch
+}
+
+// submit stages req. It returns false when the caller becomes the leader
+// (no batch is in flight) — the caller must run the commit loop in runBatch.
+// It returns true when a leader is active: req is queued and that leader
+// will deliver its result to req.done.
+func (b *deliverBatcher) submit(id store.AccountID, req *deliverRequest) bool {
+	b.mu.Lock()
+	ab := b.accts[id]
+	if ab == nil {
+		ab = &perAccountBatch{}
+		if b.accts == nil {
+			b.accts = make(map[store.AccountID]*perAccountBatch)
+		}
+		b.accts[id] = ab
+	}
+	b.mu.Unlock()
+
+	ab.mu.Lock()
+	if ab.active {
+		// A leader is committing: join the queue, wait for its result.
+		ab.queue = append(ab.queue, req)
+		ab.mu.Unlock()
+		return true
+	}
+	ab.active = true
+	ab.mu.Unlock()
+	return false
+}
+
+// take hands the leader up to limit queued requests. It does NOT touch the
+// active flag — resignation happens in resignIfEmpty after the leader's last
+// commit has finished, so arrivals during a commit are always served.
+func (b *deliverBatcher) take(id store.AccountID, limit int) []*deliverRequest {
+	b.mu.Lock()
+	ab := b.accts[id]
+	b.mu.Unlock()
+	if ab == nil {
+		return nil
+	}
+	ab.mu.Lock()
+	n := len(ab.queue)
+	if n > limit {
+		n = limit
+	}
+	batch := ab.queue[:n:n]
+	ab.queue = ab.queue[n:]
+	ab.mu.Unlock()
+	return batch
+}
+
+// resignIfEmpty retires the leadership when no requests are queued. It
+// reports true when leadership was handed off (queue empty): the caller's
+// commit loop ends. A non-empty queue means arrivals raced in during the
+// last commit and the same leader keeps serving them.
+func (b *deliverBatcher) resignIfEmpty(id store.AccountID) bool {
+	b.mu.Lock()
+	ab := b.accts[id]
+	b.mu.Unlock()
+	if ab == nil {
+		return true
+	}
+	ab.mu.Lock()
+	if len(ab.queue) == 0 {
+		ab.active = false
+		ab.mu.Unlock()
+		return true
+	}
+	ab.mu.Unlock()
+	return false
+}
+
+// failAll hands every queued request the same error (commit-path abort).
+func (b *deliverBatcher) failAll(id store.AccountID, err error) {
+	for {
+		batch := b.take(id, 1<<30)
+		if len(batch) == 0 {
+			return
+		}
+		for _, r := range batch {
+			r.done <- deliverResult{err: err}
+		}
+	}
+}
+
+func (k *KV) runBatch(ctx context.Context, acctID store.AccountID, req *deliverRequest) (uint32, error) {
+	if k.batch.submit(acctID, req) {
+		res := <-req.done
+		return res.uid, res.err
+	}
+	// Leader loop: commit the staged requests (self first), then keep
+	// draining whatever queued while we were committing. Batching thus
+	// scales with load by itself: the faster requests arrive, the larger
+	// the batches. The commit deliberately detaches from the leader's
+	// context — an unrelated follower's failure must not doom peers that
+	// were batched together.
+	commitCtx := context.WithoutCancel(ctx)
+	batch := append([]*deliverRequest{req}, k.batch.take(acctID, k.batchLimit)...)
+	var out []store.DeliverResult
+	var err error
+	myUID := uint32(0) // batch[0] is req in the first iteration
+	for iter := 0; ; iter++ {
+		in := make([]store.DeliverRequest, len(batch))
+		for i, r := range batch {
+			in[i] = store.DeliverRequest{MailboxID: r.mbID, Fields: r.fields, BlobID: r.blobID, Size: r.size}
+		}
+		out, err = k.s.DeliverEmailBatch(commitCtx, acctID, in)
+		if err != nil {
+			err = fmt.Errorf("batch delivery: %w", err)
+			break
+		}
+		if iter == 0 {
+			myUID = uint32(out[0].UID)
+		}
+		for i, r := range batch {
+			r.done <- deliverResult{uid: uint32(out[i].UID)}
+		}
+		if k.batch.resignIfEmpty(acctID) {
+			return myUID, nil
+		}
+		batch = k.batch.take(acctID, k.batchLimit)
+	}
+	// Commit failed: fail this batch and every queued request, then resign
+	// so the account is not wedged.
+	for _, r := range batch {
+		r.done <- deliverResult{err: err}
+	}
+	k.batch.failAll(acctID, err)
+	k.batch.resignIfEmpty(acctID)
+	return 0, err
 }
 
 // Deliver stores one message. The blob is content-addressed and uploaded
@@ -101,13 +275,21 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 		fieldSize:     beUint64(uint64(size)),
 		fieldKeywords: []byte(strings.Join(keywords, ",")),
 	}
-	uid, _, _, err := k.s.DeliverEmail(ctx, acctID, mbID, fields, blobID, size)
+	// Delivery micro-batch: join (or lead) a per-account batch so a burst
+	// of arrivals commits in ONE transaction/fsync. Idle traffic keeps the
+	// single-message path — batching only emerges under load.
+	uid, err := k.runBatch(ctx, acctID, &deliverRequest{
+		mbID:   mbID,
+		fields: fields,
+		blobID: blobID,
+		size:   size,
+		done:   make(chan deliverResult, 1),
+	})
 	if err != nil {
 		return 0, err
 	}
-	return uint32(uid), nil
+	return uid, nil
 }
-
 func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err == nil {
