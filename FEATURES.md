@@ -2,7 +2,7 @@
 
 mailezine ships in two editions from one repository. The community edition
 is the open-source, single-binary mail engine; the enterprise edition adds
-the compliance, scale-out and ML-scanning capabilities. The split is
+the compliance and scale-out capabilities (plus rspamd learning). The split is
 enforced by the compiler: EE code lives only under `internal/ee/` (plus
 paired `*_ee.go` assembly files), guarded by the `mailez_ee` build tag.
 
@@ -22,7 +22,8 @@ paired `*_ee.go` assembly files), guarded by the `mailez_ee` build tag.
 | Multi-active cluster: per-message queue claims + fenced outcomes, cross-node singleton leases, per-node FTS convergence via change-log tailing, advisory per-account write gate | | ✓ (`internal/queue`, `internal/kvlease`, `internal/ftssync`, `internal/accountgate`) |
 | TiDB KV (distributed) backend | | ✓ (`internal/ee/storeee`) |
 | S3/MinIO blob backend | | ✓ (`internal/ee/storeee`) |
-| rspamd classifier (inbound scoring + Junk learning) | | ✓ (`internal/ee/spam`) |
+| rspamd inbound scanning (checkv2 verdicts, Junk headers/reject) | ✓ (`internal/rspamd`) | ✓ |
+| rspamd learning (IMAP learn-spam/ham + fuzzy) | | ✓ (app hook) |
 | DLP verdict client (outbound policy) | | ✓ (`internal/ee/dlp`) |
 
 Rules:

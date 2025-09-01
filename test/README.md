@@ -70,7 +70,7 @@ dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
   优先级测试（本地活动脚本覆盖目录默认）；`TestEndToEndIMAP` 全栈
   ManageSieve 写 + 过滤落 Junk 验证。
 - M4 推送 / 真容器：`TestIMAPIdlePush`（IDLE 中外部投递/删除 → EXISTS/
-  EXPUNGE 非请求更新）；`internal/spam` 与 `cmd/mailezine` 的
+  EXPUNGE 非请求更新）；`internal/rspamd` 与 `cmd/mailezine` 的
   `-tags docker` 真 rspamd 测试（本地：
   `docker run -d -p 11333:11333 mailez/rspamd:local /usr/bin/rspamd -f --insecure`
   后 `go test -tags docker ...`；CI 用官方镜像跑同一套）。

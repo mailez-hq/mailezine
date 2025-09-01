@@ -360,8 +360,8 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 	}
 	var classifier spamClassifier
 	if a.cfg.Rspamd.URL != "" {
-		// Enterprise tier: the rspamd client re-scans the whole message and
-		// takes precedence over the community baseline.
+		// rspamd tier: the client re-scans the whole message and takes
+		// precedence over the built-in baseline (learning is enterprise-only).
 		classifier = newSpamClassifier(a.cfg, a.logger)
 	} else if a.cfg.Junk.Enabled {
 		// Community baseline: score the verifier's authentication results

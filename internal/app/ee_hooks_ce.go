@@ -10,6 +10,7 @@ import (
 	"log/slog"
 
 	"mailezine/internal/config"
+	"mailezine/internal/rspamd"
 )
 
 // errHAUnavailable pairs with the enterprise-side error of the same name.
@@ -29,11 +30,14 @@ func (a *App) superviseTerms(ctx context.Context) error {
 	return errHAUnavailable
 }
 
-// newSpamClassifier: ML spam scoring (rspamd) ships in the enterprise
-// edition; the community build scans nothing (delivery fails open).
+// newSpamClassifier: rspamd inbound scanning ships in both editions, but
+// supervised learning is enterprise-only: the community client is built
+// with empty learning endpoints, which turns Learn/Fuzzy calls into no-ops.
 func newSpamClassifier(cfg config.Config, logger *slog.Logger) spamClassifier {
-	logger.Warn("rspamd: classifier requires the enterprise edition; inbound scanning disabled")
-	return nil
+	if cfg.Rspamd.LearnURL != "" || cfg.Rspamd.Password != "" {
+		logger.Warn("rspamd: classifier learning requires the enterprise edition; scanning without learning")
+	}
+	return rspamd.New(cfg.Rspamd.URL, "", "", cfg.Hostname, logger)
 }
 
 // wireArchive: compliance capture ships in the enterprise edition.

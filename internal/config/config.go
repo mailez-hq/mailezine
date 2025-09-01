@@ -669,8 +669,9 @@ func (c Config) Summary() string {
 	if c.License.IsEnterprise() {
 		lic = fmt.Sprintf("enterprise(max=%d)", c.License.MaxMailboxes)
 	}
-	// Anti-spam tier actually in effect: rspamd (enterprise high tier),
-	// basic (built-in Authentication-Results + DNSBL classifier) or off.
+	// Anti-spam tier actually in effect: rspamd (both editions; supervised
+	// learning is enterprise), basic (built-in Authentication-Results +
+	// DNSBL classifier) or off.
 	junk := "off"
 	if c.Rspamd.URL != "" {
 		junk = "rspamd"

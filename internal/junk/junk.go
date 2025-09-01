@@ -277,8 +277,8 @@ func (c *Classifier) greySeen(peer net.IP, from string, to []string) bool {
 // Junk-boundary feedback). The baseline classifier has no statistical
 // learner to feed, so this is an explicit no-op: marking mail as Junk in
 // the IMAP client still works (it is a mailbox move), it just does not
-// retrain anything. The enterprise rspamd client implements real
-// supervised learning.
+// retrain anything. The rspamd classifier implements real supervised
+// learning, with learning itself gated to the enterprise edition.
 func (c *Classifier) LearnWithFuzzy(ctx context.Context, isSpam bool, data []byte) error {
 	return nil
 }
