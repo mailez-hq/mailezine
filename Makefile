@@ -40,12 +40,20 @@ build-ee:
 	go build -tags mailez_ee ./...
 
 ## check-ce-purity: the community (no-tag) dependency graph must never
-## reach internal/ee — the compiler-level half of the edition split.
+## reach internal/ee — the compiler-level half of the edition split — and
+## every EE-tagged file must match the export strip contract (internal/ee/
+## or *_ee.go / *_ee_test.go), or it would leak into the public tree.
 check-ce-purity:
 	@deps=$$(go list -deps ./... 2>/dev/null | grep -c 'mailezine/internal/ee'); \
 	if [ "$$deps" != "0" ]; then \
 		echo "CE build reaches internal/ee ($$deps packages) — forbidden"; \
 		go list -deps ./... | grep 'mailezine/internal/ee'; \
+		exit 1; \
+	fi; \
+	bad=$$(grep -rlE '^//go:build mailez_ee' --include='*.go' --exclude-dir=.git . | grep -vE '/internal/ee/' | grep -vE '_ee\.go$$|_ee_test\.go$$'); \
+	if [ -n "$$bad" ]; then \
+		echo "EE-tagged files outside the export strip contract (rename with an _ee suffix):"; \
+		echo "$$bad"; \
 		exit 1; \
 	fi
 	@echo "ce-purity: ok"
