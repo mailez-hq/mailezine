@@ -213,7 +213,9 @@ func s3Check(endpoint, access, secret, bucket string) error {
 	if first.Err != nil {
 		return first.Err
 	}
-	if !strings.HasPrefix(first.Key, "email-") {
+	// Blob keys are content-addressed in production (mailstore/kv.go keys
+	// bodies as "sha256-<hex>"); "email-" only appears in test fixtures.
+	if !strings.HasPrefix(first.Key, "email-") && !strings.HasPrefix(first.Key, "sha256-") {
 		return fmt.Errorf("expected email blob, got %q", first.Key)
 	}
 	return nil
