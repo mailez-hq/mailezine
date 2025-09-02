@@ -20,9 +20,13 @@ import (
 type Handler func(ctx context.Context, conn net.Conn) error
 
 // LimitListener wraps a net.Listener and applies backpressure at max
-// concurrent connections: Accept blocks while the semaphore is full, so the
-// underlying accept loop never sees a rejected connection (safe for
-// libraries that own their own accept loop, e.g. go-smtp).
+// concurrent connections. The slot is acquired without blocking before the
+// connection is handed out: an owner of its own accept loop (e.g. go-smtp,
+// go-imap) would otherwise block inside Accept while holding an accepted but
+// unserved connection — with every slot pinned by idle peers, that accepted
+// socket (and the whole accept loop behind it) would hang forever. With the
+// non-blocking acquire, an over-limit connection is closed immediately and
+// the accept loop keeps draining.
 type LimitListener struct {
 	ln  net.Listener
 	sem chan struct{}
@@ -36,15 +40,22 @@ func NewLimitListener(ln net.Listener, max int) *LimitListener {
 	return &LimitListener{ln: ln, sem: make(chan struct{}, max)}
 }
 
-// Accept blocks until a slot is free, then returns the next connection. The
-// returned conn releases its slot when closed.
+// Accept returns the next connection that fits within the limit; over-limit
+// connections are closed immediately. The returned conn releases its slot
+// when closed.
 func (l *LimitListener) Accept() (net.Conn, error) {
-	conn, err := l.ln.Accept()
-	if err != nil {
-		return nil, err
+	for {
+		conn, err := l.ln.Accept()
+		if err != nil {
+			return nil, err
+		}
+		select {
+		case l.sem <- struct{}{}:
+			return &limitedConn{Conn: conn, release: func() { <-l.sem }}, nil
+		default:
+			_ = conn.Close()
+		}
 	}
-	l.sem <- struct{}{}
-	return &limitedConn{Conn: conn, release: func() { <-l.sem }}, nil
 }
 
 // Close closes the underlying listener.

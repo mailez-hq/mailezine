@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"mailezine/internal/store"
 )
@@ -172,9 +173,11 @@ func TestConcurrentFirstDeliverSingleMailbox(t *testing.T) {
 }
 
 // TestKVExpungeReclaimsBlob proves the blob GC path is live: once the last
-// reference disappears the blob itself must be gone (stageBlobUnlink used
-// to delete the link row outright, making the refs==0 reclaim branch in
-// deleteEmail unreachable — every message blob leaked forever).
+// reference disappears the blob must be reclaimable by the sweep (stageBlob
+// unlink used to delete the link row outright, making the refs==0 reclaim
+// branch unreachable — every message blob leaked forever; later the inline
+// reclaim was removed because it raced deliveries and could delete another
+// account's shared copy — the sweep is the only reclamation path now).
 func TestKVExpungeReclaimsBlob(t *testing.T) {
 	ms, s := newTestKV(t)
 	ctx := context.Background()
@@ -191,12 +194,24 @@ func TestKVExpungeReclaimsBlob(t *testing.T) {
 	if blobID == "" {
 		t.Fatal("delivered email has no blob reference")
 	}
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 1, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ms.Expunge(ctx, "alice@example.com", "INBOX", []uint32{1}); err != nil {
 		t.Fatal(err)
 	}
+	// Reclamation is deferred to the globally-verified sweep; a zero-grace
+	// pass reclaims the claimed blob immediately.
+	n, err := s.SweepBlobs(ctx, 0, time.Now(), s.DeleteBlob)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("sweep reclaimed %d blobs, want 1", n)
+	}
 	var buf bytes.Buffer
 	if err := s.GetBlob(ctx, blobID, &buf); !errors.Is(err, store.ErrNotFound) {
-		t.Fatalf("blob survived expunge: err=%v", err)
+		t.Fatalf("blob survived expunge+sweep: err=%v", err)
 	}
 	// The zero-count tombstone must be dropped as well.
 	aid, err := s.AccountByEmail(ctx, "alice@example.com")
@@ -206,4 +221,114 @@ func TestKVExpungeReclaimsBlob(t *testing.T) {
 	if refs, err := s.BlobRefCount(ctx, aid, blobID); err == nil {
 		t.Fatalf("blob link tombstone survived reclaim: refs=%d", refs)
 	}
+}
+
+// TestBlobGCSharedAcrossAccounts pins the reason reclamation is a sweep:
+// blob IDs are content-addressed and global, so identical content delivered
+// to two accounts shares one file. Deleting one account's copy (and sweeping
+// at zero grace) must leave the other account's mail readable.
+func TestBlobGCSharedAcrossAccounts(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+	body := "From: s@remote.test\r\nTo: both@example.test\r\nSubject: shared\r\n\r\nsame bytes\r\n"
+
+	for _, acct := range []string{"alice@example.com", "bob@example.com"} {
+		if _, err := ms.Deliver(ctx, acct, "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	ae, err := ms.EmailByUID(ctx, "alice@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	be, err := ms.EmailByUID(ctx, "bob@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ae.BlobID != be.BlobID {
+		t.Fatalf("expected content-addressed sharing: %q vs %q", ae.BlobID, be.BlobID)
+	}
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 1, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Expunge(ctx, "alice@example.com", "INBOX", []uint32{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SweepBlobs(ctx, 0, time.Now(), s.DeleteBlob); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if err := s.GetBlob(ctx, be.BlobID, &buf); err != nil {
+		t.Fatalf("bob's mail lost after alice's expunge: %v", err)
+	}
+	if _, err := ms.OpenMessage(ctx, "bob@example.com", "INBOX", 1); err != nil {
+		t.Fatalf("bob cannot read his message: %v", err)
+	}
+}
+
+// TestExpungeTombstonesSurviveBatch guards the QRESYNC tombstone key
+// layout: a batch expunge of N messages shares one expunge modseq, and the
+// tombstone key must carry the UID — without it the N writes collapse onto
+// one key and VANISHED (EARLIER) reports only the last UID of the batch.
+func TestExpungeTombstonesSurviveBatch(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+	for i := 1; i <= 3; i++ {
+		body := "From: s@remote.test\r\nSubject: m\r\n\r\nbody\r\n"
+		if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 1; i <= 3; i++ {
+		if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", uint32(i), []string{"\\Deleted"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gone, err := ms.Expunge(ctx, "alice@example.com", "INBOX", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gone) != 3 {
+		t.Fatalf("expunged %d messages, want 3", len(gone))
+	}
+	uids, err := ms.ExpungedSince(ctx, "alice@example.com", "INBOX", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uids) != 3 || uids[0] != 1 || uids[1] != 2 || uids[2] != 3 {
+		t.Fatalf("VANISHED reported %v, want [1 2 3] — tombstones collapsed?", uids)
+	}
+	_ = s
+}
+
+// TestUIDExpungeRespectsDeletedFlag pins the store-level \Deleted check:
+// UID EXPUNGE must not destroy a message whose \Deleted flag was cleared by
+// a concurrent session between the caller's snapshot and the delete
+// transaction.
+func TestUIDExpungeRespectsDeletedFlag(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+	body := "From: s@remote.test\r\nSubject: keep\r\n\r\nstay\r\n"
+	if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 1, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	// Simulate the concurrent clear: drop the flag behind the caller's back
+	// (direct flag rewrite, no expunge).
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	gone, err := ms.Expunge(ctx, "alice@example.com", "INBOX", []uint32{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gone) != 0 {
+		t.Fatalf("UID EXPUNGE deleted %v despite cleared \\Deleted flag", gone)
+	}
+	if _, err := ms.EmailByUID(ctx, "alice@example.com", "INBOX", 1); err != nil {
+		t.Fatalf("message must survive: %v", err)
+	}
+	_ = s
 }

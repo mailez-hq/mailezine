@@ -210,6 +210,14 @@ func (c *Cached) Expunge(ctx context.Context, account, mailbox string, uids []ui
 	return expunged, err
 }
 
+func (c *Cached) DeleteUIDs(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error) {
+	deleted, err := c.inner.DeleteUIDs(ctx, account, mailbox, uids)
+	if err == nil {
+		c.invalidate(account, mailbox)
+	}
+	return deleted, err
+}
+
 // ExpungedSince reads the QRESYNC tombstone log straight through: it is a
 // write-history query, not part of the cached mailbox view.
 func (c *Cached) ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error) {

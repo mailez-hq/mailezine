@@ -128,7 +128,7 @@ func TestLimitListenerBackpressure(t *testing.T) {
 
 	accepted := make(chan net.Conn, 2)
 	go func() {
-		for i := 0; i < 2; i++ {
+		for {
 			conn, err := lim.Accept()
 			if err != nil {
 				return
@@ -145,7 +145,11 @@ func TestLimitListenerBackpressure(t *testing.T) {
 	conn1 := <-accepted
 	defer conn1.Close()
 
-	// Second connection: the first has not closed, so Accept must block.
+	// Second connection while the slot is held: the listener must CLOSE it
+	// immediately instead of queueing it inside Accept — a blocked Accept
+	// holding an accepted socket stalls the whole accept loop (one idle peer
+	// per slot = permanent port outage for accept loops owned by protocol
+	// libraries).
 	second, err := net.Dial("tcp", lim.Addr().String())
 	if err != nil {
 		t.Fatal(err)
@@ -156,15 +160,24 @@ func TestLimitListenerBackpressure(t *testing.T) {
 		t.Fatal("second connection accepted while first is open")
 	case <-time.After(150 * time.Millisecond):
 	}
+	second.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := second.Read(make([]byte, 1)); err == nil {
+		t.Fatal("over-limit connection still open; want immediate close")
+	}
 
-	// Closing the first connection releases the slot.
+	// Once the slot is released, a NEW connection is accepted.
 	if err := conn1.Close(); err != nil {
 		t.Fatal(err)
 	}
+	third, err := net.Dial("tcp", lim.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer third.Close()
 	select {
 	case <-accepted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second connection not accepted after slot release")
+		t.Fatal("new connection not accepted after slot release")
 	}
 }
 

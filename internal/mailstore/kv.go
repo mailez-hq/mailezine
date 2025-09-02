@@ -288,6 +288,16 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 	if err != nil {
 		return 0, err
 	}
+	// The sweep may have reclaimed this blob between the PutBlob above and
+	// the link commit (it re-creates content that was claimed ≥10 min ago;
+	// the sweep's own scan interleaved with that window). The link row is
+	// committed — make sure the file exists again. Content-addressed puts
+	// are idempotent, so this is always safe.
+	if _, serr := k.s.BlobStat(ctx, blobID); serr != nil {
+		if _, perr := k.s.PutBlob(ctx, blobID, int64(len(data)), bytes.NewReader(data)); perr != nil {
+			return 0, perr
+		}
+	}
 	return uid, nil
 }
 func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID, error) {

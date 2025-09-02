@@ -13,6 +13,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"time"
 
 	"mailezine/internal/store"
 )
@@ -261,8 +262,13 @@ func (k *KV) DeleteAccount(ctx context.Context, account string) error {
 			return err
 		}
 	}
+	// The account's link rows are gone (purged above), but the blobs may be
+	// content-shared with other accounts — blob IDs are global, link counts
+	// are per-account. Stage GC claims instead of deleting files inline: the
+	// sweep reclaims each blob only once no account references it anywhere.
+	now := uint64(time.Now().Unix())
 	for _, b := range blobs {
-		_ = k.s.DeleteBlob(ctx, b)
+		_ = k.s.PutRaw(ctx, store.MetaBlobGCKey(b), beUint64(now))
 	}
 	// Drop the registry rows last so a crash mid-purge leaves an account
 	// that still resolves and can be purged again.
@@ -286,7 +292,7 @@ func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
 		return err
 	}
 	for _, e := range emails {
-		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, 0); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, 0, false); err != nil {
 			return err
 		}
 	}
@@ -443,9 +449,26 @@ func (k *KV) Append(ctx context.Context, account, mailbox string, msg *Message) 
 	return k.Deliver(ctx, account, mailbox, msg)
 }
 
-// Expunge removes messages marked \Deleted (or, for UID EXPUNGE, the given
-// UIDs regardless of flag) and returns the expunged UIDs in ascending order.
+// Expunge removes \Deleted messages — for UID EXPUNGE (uids non-empty),
+// only the given UIDs that are still \Deleted. The \Deleted premise is
+// re-verified inside each delete's transaction: a session's snapshot of the
+// flag can be stale, and a UID EXPUNGE that trusted it could destroy a
+// message whose flag a concurrent session had just cleared (RFC 3501
+// §6.4.3, RFC 4315 §2.1). Returns the expunged UIDs in ascending order.
 func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error) {
+	return k.expungeUIDs(ctx, account, mailbox, uids, true)
+}
+
+// DeleteUIDs removes the given UIDs unconditionally — POP3 DELE has no
+// \Deleted concept, so the deletion decision belongs to the POP3 session
+// alone and the IMAP flag premise must not apply. The removals still
+// tombstone with a shared expunge modseq: they are expunges as far as
+// concurrent IMAP (QRESYNC) clients are concerned.
+func (k *KV) DeleteUIDs(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error) {
+	return k.expungeUIDs(ctx, account, mailbox, uids, false)
+}
+
+func (k *KV) expungeUIDs(ctx context.Context, account, mailbox string, uids []uint32, requireDeleted bool) ([]uint32, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if err != nil {
 		return nil, err
@@ -474,7 +497,7 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 			if _, ok := uidFilter[e.UID]; !ok {
 				continue
 			}
-		} else if !e.HasFlag("\\Deleted") {
+		} else if requireDeleted && !e.HasFlag("\\Deleted") {
 			continue
 		}
 		targets = append(targets, e)
@@ -489,7 +512,15 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 	}
 	var deleted []uint32
 	for _, e := range targets {
-		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, expungeModSeq); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, mbID, expungeModSeq, requireDeleted); err != nil {
+			if errors.Is(err, store.ErrNotMarkedDeleted) {
+				// The \Deleted flag is gone by the time the delete
+				// transaction ran (a concurrent session cleared it between
+				// this session's snapshot and now): the message stays and
+				// must not be reported expunged (RFC 3501 §6.4.3, RFC 4315
+				// §2.1).
+				continue
+			}
 			if errors.Is(err, store.ErrNotFound) {
 				// Another session won the race and removed it first: the
 				// uid is gone, which is exactly what this command promises
@@ -506,9 +537,9 @@ func (k *KV) Expunge(ctx context.Context, account, mailbox string, uids []uint32
 
 // ExpungedSince returns the UIDs tombstoned as expunged from the mailbox
 // after the given modseq (QRESYNC VANISHED (EARLIER) / UID FETCH ...
-// (CHANGEDSINCE ... VANISHED)). Tombstones share the batch modseq of the
-// expunge that produced them; ascending key order makes one range scan the
-// complete answer.
+// (CHANGEDSINCE ... VANISHED)). Keys are (modseq, UID) — a batch expunge
+// shares its modseq across N distinct keys — so ascending key order makes
+// one range scan the complete answer.
 func (k *KV) ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error) {
 	acctID, err := k.s.AccountByEmail(ctx, account)
 	if errors.Is(err, store.ErrNotFound) {
@@ -526,8 +557,8 @@ func (k *KV) ExpungedSince(ctx context.Context, account, mailbox string, sinceMo
 	}
 	prefix := store.IndexExpungePrefix(uint32(acctID), mbID)
 	start := append(append([]byte(nil), prefix...), beUint64(sinceModSeq+1)...)
-	// Keys are prefix || BE8(modseq): the range end is prefix || FF×8 so
-	// every modseq of this mailbox is included.
+	// Keys are prefix || BE8(modseq) || BE8(uid): the range end is
+	// prefix || FF×8 so every modseq/uid of this mailbox is included.
 	end := append(append([]byte(nil), prefix...), 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff)
 	var uids []uint32
 	err = k.s.ScanRawRange(ctx, start, end, func(_, v []byte) error {
@@ -640,7 +671,7 @@ func (k *KV) Move(ctx context.Context, account, src, dst string, uids []uint32) 
 		if err != nil {
 			return mapping, err
 		}
-		if err := k.deleteEmail(ctx, acctID, e.DocID, srcMBID, moveModSeq); err != nil {
+		if err := k.deleteEmail(ctx, acctID, e.DocID, srcMBID, moveModSeq, false); err != nil {
 			return mapping, err
 		}
 		mapping[e.UID] = uint32(newUID)
@@ -670,40 +701,38 @@ func (k *KV) OpenMessage(ctx context.Context, account, mailbox string, uid uint3
 }
 
 // deleteEmail removes one email document (and its per-mailbox index entry,
-// committed in the same batch) and garbage-collects its blob. When
-// expungeModSeq is non-zero, a QRESYNC tombstone (expunge modseq → UID) is
-// committed in the same atomic batch, so a crash can never drop a message
-// without recording its UID for later VANISHED (EARLIER) answers.
-func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbID, expungeModSeq uint64) error {
-	// Read the blob reference and UID before deletion (the fields are
-	// removed in the same batch as the link decrement and index delete).
-	var blobID string
+// committed in the same batch). When expungeModSeq is non-zero, a QRESYNC
+// tombstone (expunge modseq → UID) is committed in the same atomic batch, so
+// a crash can never drop a message without recording its UID for later
+// VANISHED (EARLIER) answers. When requireDeleted is set, the message's
+// \Deleted flag is re-verified inside the delete transaction (UID EXPUNGE
+// must never destroy an unmarked message whose flag was concurrently
+// cleared). The blob is NOT reclaimed here: content-addressed blob IDs are
+// global while link counts are per-account, so the unlink stages a GC claim
+// and SweepBlobs reclaims the file only once no account references it.
+func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbID, expungeModSeq uint64, requireDeleted bool) error {
+	// Read the UID before deletion for the tombstone (the index entries are
+	// removed in the same batch as the link decrement).
 	var idx []store.Op
 	fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, docID)
 	if err == nil {
-		blobID = string(fields[fieldBlobID])
 		if len(fields[fieldUID]) == 8 {
 			uid := binary.BigEndian.Uint64(fields[fieldUID])
 			idx = append(idx, store.Op{Key: store.IndexEmailKey(uint32(acctID), mbID, uid), Delete: true})
 			if expungeModSeq != 0 {
 				idx = append(idx, store.Op{
-					Key:   store.IndexExpungeKey(uint32(acctID), mbID, expungeModSeq),
+					Key:   store.IndexExpungeKey(uint32(acctID), mbID, expungeModSeq, uid),
 					Value: binary.BigEndian.AppendUint64(nil, uid),
 				})
 			}
 		}
 	}
-	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID, idx...); err != nil {
-		return err
+	require := ""
+	if requireDeleted {
+		require = "\\Deleted"
 	}
-	// Garbage-collect the blob when the link count reaches zero, then drop
-	// the zero-count tombstone so link rows do not accumulate.
-	if blobID != "" {
-		if refs, err := k.s.BlobRefCount(ctx, acctID, blobID); err == nil && refs == 0 {
-			if derr := k.s.DeleteBlob(ctx, blobID); derr == nil {
-				_ = k.s.DeleteRaw(ctx, store.BlobLinkKey(uint32(acctID), blobID))
-			}
-		}
+	if err := k.s.DeleteEmailAtomically(ctx, acctID, store.CollectionEmail, docID, require, idx...); err != nil {
+		return err
 	}
 	return nil
 }

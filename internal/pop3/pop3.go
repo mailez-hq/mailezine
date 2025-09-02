@@ -524,7 +524,10 @@ func (s *session) commit(ctx context.Context) error {
 	for uid := range s.deleted {
 		uids = append(uids, uid)
 	}
-	if _, err := s.srv.Store.Expunge(ctx, s.user, "INBOX", uids); err != nil && !errors.Is(err, mailstore.ErrNotFound) {
+	// POP3 DELE is an unconditional deletion decision: no \Deleted flag
+	// exists to re-verify, so DeleteUIDs (not the IMAP Expunge premise).
+	// The removals still tombstone for QRESYNC clients.
+	if _, err := s.srv.Store.DeleteUIDs(ctx, s.user, "INBOX", uids); err != nil && !errors.Is(err, mailstore.ErrNotFound) {
 		s.srv.Logger.Error("pop3: expunge on quit", "user", s.user, "err", err)
 	}
 	return nil

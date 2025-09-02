@@ -64,6 +64,10 @@ type MailboxStore interface {
 	SetFlags(ctx context.Context, account, mailbox string, uid uint32, flags []string) error
 	Append(ctx context.Context, account, mailbox string, msg *Message) (uint32, error)
 	Expunge(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error)
+	// DeleteUIDs removes the given UIDs unconditionally (no \Deleted
+	// premise): POP3's DELE owns its deletion decision outright. The
+	// removals still tombstone for QRESYNC clients.
+	DeleteUIDs(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error)
 	// ExpungedSince returns the UIDs tombstoned as expunged from the
 	// mailbox after the given CONDSTORE modseq (QRESYNC VANISHED (EARLIER)
 	// and UID FETCH ... (CHANGEDSINCE ... VANISHED)).

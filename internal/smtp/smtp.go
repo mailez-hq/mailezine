@@ -97,6 +97,14 @@ func NewServer(b *Backend) *gosmtp.Server {
 	s.EnableDSN = true
 	s.EnableSMTPUTF8 = true
 	s.ErrorLog = slogAdapter{b.Logger}
+	// Per-command deadlines. ReadTimeout is an absolute deadline set when the
+	// command line is read, so it also caps a whole DATA transfer: 10 minutes
+	// carries MaxMessageBytes (50 MiB) over a ~90 KB/s link while still
+	// recycling slots of clients that connect and go silent. WriteTimeout
+	// bounds each response write. Without these, one wedged peer per slot
+	// pins every listener slot indefinitely.
+	s.ReadTimeout = 10 * time.Minute
+	s.WriteTimeout = time.Minute
 	return s
 }
 

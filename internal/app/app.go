@@ -481,10 +481,27 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 			a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval)
 		}
 	}
+	{
+		// Blob GC: deletes stage reclaim claims; the sweep physically
+		// reclaims a blob only once no account links it anywhere (blob IDs
+		// are content-global, link counts per-account). Leased in multi
+		// mode so exactly one node sweeps. Interval 0 = mailstore default
+		// (10 minutes). Only the KV backend carries blobs; the assertion
+		// skips other mailbox backends.
+		if kv, ok := a.st.mailbox.(*mailstore.KV); ok {
+			if a.cfg.Cluster.Mode == "multi" {
+				l := kvlease.New(a.st.kv, "blob-gc", a.nodeID(), 20*time.Minute)
+				go kv.RunBlobGC(runCtx, l, 0, 0, a.logger)
+				a.logger.Info("blob gc sweeper", "interval", "10m", "leased", true)
+			} else {
+				go kv.RunBlobGC(runCtx, nil, 0, 0, a.logger)
+				a.logger.Info("blob gc sweeper", "interval", "10m")
+			}
+		}
+	}
 	if classifier != nil {
 		// Never assign a typed nil to the interface: an unconfigured
-		// classifier must leave the field nil (delivery fails open).
-		a.pipeline.Classifier = classifier
+		// classifier must leave the field nil (delivery fails open).		a.pipeline.Classifier = classifier
 	}
 	return a.wireQueue(runCtx)
 }

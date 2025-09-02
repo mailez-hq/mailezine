@@ -104,9 +104,13 @@ func TestTailRemovesExpunged(t *testing.T) {
 	if _, err := w.SyncOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
+	if err := ms.SetFlags(context.Background(), "user@example.com", "INBOX", gone, []string{"\\Deleted"}); err != nil {
+		t.Fatalf("mark deleted: %v", err)
+	}
 	if _, err := ms.Expunge(context.Background(), "user@example.com", "INBOX", []uint32{gone}); err != nil {
 		t.Fatalf("expunge: %v", err)
 	}
+
 	if _, err := w.SyncOnce(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -243,6 +247,9 @@ func TestExtendedDeleteEncoding(t *testing.T) {
 	ctx := context.Background()
 
 	uid := deliver(t, ms, "user@example.com", "Sent", "delete me")
+	if err := ms.SetFlags(ctx, "user@example.com", "Sent", uid, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := ms.Expunge(ctx, "user@example.com", "Sent", []uint32{uid}); err != nil {
 		t.Fatal(err)
 	}

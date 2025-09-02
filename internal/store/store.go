@@ -15,6 +15,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 	"sync"
 )
 
@@ -457,16 +458,45 @@ func orderedFieldOps(accountID AccountID, collection byte, docID uint64, fields 
 	return ops
 }
 
+// ErrNotMarkedDeleted is returned by DeleteEmailAtomically when a
+// requireFlag was requested and the message's live flags (read inside the
+// delete transaction) do not carry it. No rows are written; the caller must
+// treat the message as not expunged.
+var ErrNotMarkedDeleted = errors.New("store: message not marked for deletion")
+// hasListToken reports whether the comma-joined system-flag list contains
+// want exactly (no substring matches across flag boundaries). IMAP flags are
+// case-insensitive, so the comparison folds case.
+func hasListToken(list, want string) bool {
+	for list != "" {
+		var tok string
+		if i := strings.IndexByte(list, ','); i >= 0 {
+			tok, list = list[:i], list[i+1:]
+		} else {
+			tok, list = list, ""
+		}
+		if strings.EqualFold(tok, want) {
+			return true
+		}
+	}
+	return false
+}
+
 // DeleteEmailAtomically removes an Email document together with its blob
 // link, quota accounting and a delete changelog entry in one batch
-// (INV-BLOB / INV-QUOTA / INV-CHANGE). The blob itself is garbage-collected
-// by the caller when the link count reaches zero. Extra ops (e.g. secondary
+// (INV-BLOB / INV-QUOTA / INV-CHANGE). The blob itself is reclaimed by the
+// sweep (SweepBlobs) once no account links it. Extra ops (e.g. secondary
 // index removal) commit in the same batch.
+//
+// requireFlag (empty = no check) is verified inside the transaction against
+// the message's live flags: UID EXPUNGE must only delete messages that are
+// still marked \Deleted, and a session's snapshot of that flag can be stale
+// — the authoritative check has to share the delete's atomic commit.
 func (s *Store) DeleteEmailAtomically(
 	ctx context.Context,
 	accountID AccountID,
 	collection byte,
 	docID uint64,
+	requireFlag string,
 	extra ...Op,
 ) error {
 	unlock := s.lockAccount(accountID)
@@ -481,6 +511,7 @@ func (s *Store) DeleteEmailAtomically(
 		var size int64
 		var mailbox string
 		var uid uint32
+		var flags string
 		var ops []Op
 		// Scan INSIDE the transaction (read-your-writes): the read set joins
 		// the commit, so a concurrent writer racing the delete either
@@ -493,6 +524,8 @@ func (s *Store) DeleteEmailAtomically(
 			switch field := k[len(k)-1]; field {
 			case EmailFieldBlob:
 				blobID = string(v)
+			case EmailFieldFlags:
+				flags = string(v)
 			case EmailFieldSize:
 				if len(v) == 8 {
 					size = int64(binary.BigEndian.Uint64(v))
@@ -511,6 +544,14 @@ func (s *Store) DeleteEmailAtomically(
 		}
 		if len(ops) == 0 {
 			return ErrNotFound
+		}
+		// Authoritative \Deleted check (UID EXPUNGE): evaluated against the
+		// flags read in THIS transaction, so a concurrent flag clear between
+		// the caller's snapshot and here aborts the delete instead of
+		// destroying an unmarked message. Staged ops roll back on closure
+		// error.
+		if requireFlag != "" && !hasListToken(flags, requireFlag) {
+			return ErrNotMarkedDeleted
 		}
 		t.Append(ops...)
 

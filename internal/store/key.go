@@ -184,12 +184,18 @@ func IndexEmailPrefix(accountID uint32, mbID uint64) []byte {
 	return appendUint64(k, mbID)
 }
 
-// IndexExpungeKey maps (account, mailbox docID, expunge modseq) to the
-// expunged UID. Ascending key order yields tombstones in expunge order,
-// so a range scan answers "vanished since modseq M" in one pass.
-func IndexExpungeKey(accountID uint32, mbID, modSeq uint64) []byte {
+// IndexExpungeKey maps one expunged message to its expunge modseq:
+// (account, mailbox docID, modseq, UID). The UID is part of the key because
+// a batch expunge of N messages shares one expunge modseq — without the UID
+// component the N tombstones would collapse onto one key, each write
+// overwriting the last, and VANISHED (EARLIER) would report only the final
+// UID of every batch (silent client desync). Ascending key order still
+// yields tombstones in (modseq, UID) order, so a range scan answers
+// "vanished since modseq M" in one pass.
+func IndexExpungeKey(accountID uint32, mbID, modSeq, uid uint64) []byte {
 	k := IndexExpungePrefix(accountID, mbID)
-	return appendUint64(k, modSeq)
+	k = appendUint64(k, modSeq)
+	return appendUint64(k, uid)
 }
 
 // IndexExpungePrefix is the scan prefix of one mailbox's expunge log.
@@ -223,6 +229,23 @@ func MetaVacationKey(account, sender string) []byte {
 	k = append(k, account...)
 	k = append(k, '\x1f')
 	return append(k, sender...)
+}
+
+// MetaBlobGCKey claims a blob as physically reclaimable: written in the
+// same transaction that drops an account's last link (value: BE8 unix
+// seconds queued-at), deleted by the sweep after the blob is reclaimed — or
+// by a later delivery re-linking the same content-addressed ID. Blobs are
+// global (one file per content hash) while link counts are per-account, so
+// physical reclamation must be a separate globally-verified step, never an
+// inline consequence of one account's refcount hitting zero.
+func MetaBlobGCKey(blobID string) []byte {
+	return append(MetaBlobGCPrefix(), blobID...)
+}
+
+// MetaBlobGCPrefix is the scan prefix of all blob GC claims.
+func MetaBlobGCPrefix() []byte {
+	k := []byte{SpaceMeta}
+	return append(k, "gc:blob:"...)
 }
 
 // DocumentIDFromFieldKey extracts the document ID from a field key.
