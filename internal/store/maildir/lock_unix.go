@@ -9,7 +9,7 @@ import (
 )
 
 // lockMaildir takes the dovecot-uidlist.lock flock. This serializes against
-// a legacy IMAP process sharing the maildir (rollback scenario); in-process the
+// an external maildir process sharing the directory (rollback scenario); in-process the
 // mailbox mutex is the primary guard.
 func lockMaildir(dir string) (func(), error) {
 	path := filepath.Join(dir, "dovecot-uidlist.lock")

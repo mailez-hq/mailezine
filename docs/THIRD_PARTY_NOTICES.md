@@ -2,14 +2,6 @@
 
 mailezine 遵循"可复用则复用、合规署名"原则。以下组件随版本演进持续登记。
 
-## peer engine（已移除）
-
-- 项目：<https://github.com/mjl-/peer engine>（MIT OR MPL-2.0）
-- 版权：Copyright 2021 Mechiel Lukkien <mechiel@ueber.net>
-- 状态：**D43/D44 已彻底移除**——生产与测试代码均无 mjl-/ 依赖，go.mod 不再
-  引用。原使用面全部由自研实现或 go-msgauth 替代（替换映射见
-  DECISIONS.md D43/D44 与 PLAN.md §3）。
-
 ## go-msgauth
 
 - 项目：<https://github.com/emersion/go-msgauth>（MIT）

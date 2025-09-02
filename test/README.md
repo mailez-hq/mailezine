@@ -16,7 +16,7 @@
 | IMAP | openssl s_client、emersion/go-imap 集成测试 |
 | POP3 | telnet |
 | ManageSieve | 后端 sieve 客户端（mailez/backend/internal/mail/sieve.go）|
-| 一致性 | legacy IMAP imaptest（临时容器） |
+| 一致性 | imaptest 合规套件（临时容器） |
 
 ## 层三：backend REST 全链路（webmail 替身）
 
@@ -103,9 +103,9 @@ dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
   LISTRIGHTS/DELETEACL/NIL 语义 + 未知命令仍 BAD）、
   `TestIMAPACLBackendCompat`（用 mailez 后端实际解析逻辑——go-imap v1
   `ParseNamedResp`——消费 GETACL/MYRIGHTS/LISTRIGHTS 响应）。
-- M4 客户端矩阵：`TestMoxClientLifecycle`（peer engine `imapclient` 独立实现驱动
+- M4 客户端矩阵：`TestGoImapClientLifecycle`（go-imap v1 客户端独立实现驱动
   Create/Append/Select/Status/Search/Store/Copy/Move/Expunge/Rename/
-  Delete 全流程）与 `TestMoxClientFetch`（Proto 低级命令 FETCH 的 FLAGS/
+  Delete 全流程）与 `TestGoImapClientFetch`（Proto 低级命令 FETCH 的 FLAGS/
   RFC822.SIZE/HEADER.FIELDS 响应语义）；`deploy/scripts/smoke-container-e2e.sh`
   容器冒烟（镜像构建、健康端点、IMAP/SMTP/POP3 端口契约 + ACL 能力）。
 - M6 补强（Sieve 扩展）：`TestMailezTemplateCompiles`（mailez 控制面默认

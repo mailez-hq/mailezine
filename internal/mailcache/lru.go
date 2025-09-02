@@ -1,7 +1,7 @@
 // Package mailcache provides a concurrency-safe cache primitive shared by
 // every memoization point in the engine. Capacity is measured in weight
-// (bytes) rather than entry count, matching reference server's design, so large
-// entries cannot silently balloon memory. Three variants are available:
+// (bytes) rather than entry count, the reference design for single-binary
+// mail servers, so large entries cannot silently balloon memory. Three variants are available:
 //
 //   - NewCache: immutable values, no expiry (IMAP envelope / body structure —
 //     messages never change and UIDs are never reused);

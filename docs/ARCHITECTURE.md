@@ -6,8 +6,8 @@
 ## 0. 设计立场
 
 mailezine 的架构以"可验证的正确性、可解释的并发、清晰的边界、可操作的运维、
-长期可演进"为第一原则。它站在 legacy MTA（队列与投递语义）、legacy IMAP（maildir 保真）、
-peer engine（Go 邮件实现细节）、reference server（单二进制 + 可插拔存储）的肩膀上，但不照搬任何
+长期可演进"为第一原则。它站在经典邮件系统（队列与投递语义、maildir 保真、
+Go 实现细节、单二进制 + 可插拔存储形态）的肩膀上，但不照搬任何
 一家的实现。
 
 三条铁律，任何代码评审、任何重构都不得违反：
@@ -58,7 +58,7 @@ cmd/mailezine ──▶ config/lifecycle ──▶ management ──▶ smtp/ima
 
 ### 2.1 概念
 
-一切以 reference server 同构、但独立设计的模型展开：
+一切以业界单二进制实现同构、但独立设计的模型展开：
 
 ```
 Account（= 一个邮箱账户，来自目录契约 user）
@@ -161,12 +161,12 @@ space(1B) | accountID(4B BE) | collection(1B) | documentID(8B BE) | field(1B) | 
 - 读路径：统一走迭代器包装（`Scan`），外层禁止泄漏迭代器；长扫描限时、可取消。
 - 打开时校验 `schema_version`（meta space），不匹配则拒绝启动并给出迁移指引。
 
-### 3.4 maildir 后端（legacy IMAP 保真）
+### 3.4 maildir 后端（存量格式保真）
 
 目标不是"像 maildir"，而是**就是 maildir**：
 
 - 目录布局：`/mail/<account>/{cur,new,tmp}` + 子文件夹，兼容 `maildir:/mail/%u`。
-- `dovecot-uidlist`：按 legacy IMAP 格式读写（含 `dovecot-uidlist.lock`），首次挂载
+- `dovecot-uidlist`：按该既有格式读写（含 `dovecot-uidlist.lock`），首次挂载
   旧目录时解析接管；UID 分配与消息文件落盘在同一临界区。
 - `dovecot-keywords`：关键词持久化；系统旗标（S/R/F/T/D/P）落 maildir `:2,` 信息段。
 - 派生索引（搜索、thread、snooze 视图）放**可重建 sidecar**（默认 SQLite），
@@ -248,8 +248,7 @@ accept → session(限流/语法) → verify(SPF/DKIM/DMARC) → classify(rspamd
 - 元数据在 KV `q` space；消息体是 blob。调度器按到期时间轮询，事件驱动唤醒
   （避免空转）。
 - 重试：指数退避 + 抖动，上限可配；每域并发与节流独立。
-- 投递：自研 `internal/mailsmtp` + `internal/maildns`（D43/D44，已无 peer engine
-  依赖）；出站策略依次 DANE → MTA-STS → 普通 TLS → 明文（可配，机会式升级
+- 投递：自研 `internal/mailsmtp` + `internal/maildns`（D43/D44，已无上游邮件服务器依赖）；出站策略依次 DANE → MTA-STS → 普通 TLS → 明文（可配，机会式升级
   失败自动明文重连）；DKIM 签名在入队时完成一次（go-msgauth）。
 - DSN：自研 `internal/maildsn`（RFC 3464）生成；bounce 走回入站管道。
 - SRS：转发路径在信封阶段经 `/stack/directory/srs/*` 改写（沿用 mailez 边界策略）。
@@ -289,7 +288,7 @@ delete 精确删除（变更日志的删除条目扩展携带被删副本的 mai
 
 ### 6.2 SMTP 会话
 
-go-smtp 基座（D9，`BackendFunc` 暴露对端地址）+ peer engine 会话语义参考。状态表：
+go-smtp 基座（D9，`BackendFunc` 暴露对端地址）+ 上游会话语义参考。状态表：
 
 ```
 GREETING → EHLO/HELO → AUTH? → MAIL → RCPT* → DATA → 下一封
@@ -458,21 +457,21 @@ POP3、junk、JMAP、全文搜索、远程 blob 等为显式开关，默认值�
 
 - 存储格式版本化（`meta.schema_version`）；升级脚本与迁移工具随版本发布。
 - 配置字段一旦发布即受兼容约束：只加不改删，弃用至少保留一个版本。
-- 与 postdove 的行为差距以兼容矩阵跟踪（webmail 功能、IMAP 扩展、Sieve 扩展、
+- 与传统栈的行为差距以兼容矩阵跟踪（webmail 功能、IMAP 扩展、Sieve 扩展、
   POP3、配额、转发/SRS），MVP 切换只允许"已枚举、可接受"的差距。
-- 回退路径：切换前保留 postdove 副本；maildir 后端本身零拷贝，回退成本最低。
+- 回退路径：切换前保留传统栈副本；maildir 后端本身零拷贝，回退成本最低。
 
 ## 13. 决策记录（ADR）
 
 | ADR | 主题 | 决定 | 后果 |
 |---|---|---|---|
 | ADR-001 | 存储抽象 | KV + Blob 双接口，逻辑模型 account/collection/document | 协议层不感知后端；双后端成本显式化 |
-| ADR-002 | 认证信任边界 | gateway 前置认证，引擎信任受信子网 | 与 legacy IMAP 现状一致；裸部署需显式直连认证 |
+| ADR-002 | 认证信任边界 | gateway 前置认证，引擎信任受信子网 | 与传统栈现状一致；裸部署需显式直连认证 |
 | ADR-003 | 出站队列 | KV spool + 事件驱动调度 + 状态机 | 单实例内可靠；多实例协调留 v2 |
-| ADR-004 | maildir 保真 | 一等后端，legacy IMAP uidlist/keywords 兼容 | 存量零迁移；单实例单写者约束 |
-| ADR-005 | IMAP 基座 | go-imap/v2 或自研，peer engine 语义/测试参考 | 面收敛到 §6.2 表格；互操作套件兜底 |
+| ADR-004 | maildir 保真 | 一等后端，uidlist/keywords 既有格式兼容 | 存量零迁移；单实例单写者约束 |
+| ADR-005 | IMAP 基座 | go-imap/v2 或自研，上游语义/测试参考 | 面收敛到 §6.2 表格；互操作套件兜底 |
 | ADR-006 | Sieve 子集 | v1 交付 mailez 模板子集，v2 全量 | 筛选编辑器可用；正确性风险有界 |
-| ADR-007 | peer engine 复用边界 | **已废弃（D43/D44）**：peer engine 全量移除；协议组件自研或 go-msgauth/go-imap/miekg-dns | 无 peer engine 依赖，许可证面更干净 |
+| ADR-007 | 上游复用边界 | **已废弃（D43/D44）**：上游邮件服务器全量移除；协议组件自研或 go-msgauth/go-imap/miekg-dns | 无上游依赖，许可证面更干净 |
 
 ## 14. 不变式总表（Invariants Wall）
 

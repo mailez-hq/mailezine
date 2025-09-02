@@ -81,7 +81,7 @@ type Config struct {
 	// (MAILEZINE_AUTH_CACHE_TTL, integer seconds).
 	// The key is the credential pair, so a password change invalidates the new
 	// password immediately; the old pair remains valid for at most one TTL,
-	// same as legacy IMAP's auth_cache_ttl. Keep it >= the control-plane IMAP
+	// the common auth-cache semantic. Keep it >= the control-plane IMAP
 	// connection-pool idle time so a re-dial after pool eviction still hits
 	// the cache instead of paying a full control-plane round trip.
 	AuthCacheTTL time.Duration
@@ -215,7 +215,7 @@ type OutboundConfig struct {
 	Enabled bool
 	Port    int // delivery port for remote MXes, default 25
 	// FixedHost/FixedPort relay every outbound message to one smarthost,
-	// skipping MX resolution (equivalent to legacy MTA relayhost). Empty
+	// skipping MX resolution (the classic fixed-relay-host setup). Empty
 	// FixedHost keeps direct MX delivery.
 	FixedHost string
 	FixedPort int

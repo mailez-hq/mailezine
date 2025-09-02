@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestParseUIDListDovecotFormat(t *testing.T) {
+func TestParseUIDListFormat(t *testing.T) {
 	data := "3\n1700000000\n1 cur/123.M1:2,S\n2 new/456.M2:2,\n3 cur/789.M3:2,FR\n"
 	ul, err := parseUIDList([]byte(data))
 	if err != nil {
@@ -43,17 +43,17 @@ func TestUIDListSerializeRoundTrip(t *testing.T) {
 	if strings.Index(text, "1 a:2,S") > strings.Index(text, "2 :b:2,") {
 		t.Fatalf("UIDs not sorted:\n%s", text)
 	}
-	// The metadata line keeps the legacy IMAP V/N/G shape.
+	// The metadata line keeps the format's V/N/G shape.
 	if !strings.Contains(text, "V42 N3 G") {
 		t.Fatalf("metadata line missing V/N/G:\n%s", text)
 	}
 }
 
-// TestParseDovecotV3RealFormat pins compatibility with a uidlist actually
-// written by legacy IMAP 2.3.21 (the seeding container): version and V/N/G
+// TestParseUIDListV3RealFormat pins compatibility with a uidlist actually
+// written by the reference implementation (seeding container): version and V/N/G
 // metadata on one line, ":" prefix for new/ files, and ",S=,W=" info on
 // flag-less filenames.
-func TestParseDovecotV3RealFormat(t *testing.T) {
+func TestParseUIDListV3RealFormat(t *testing.T) {
 	data := "3 V1787599608 N1 Gd82b6613f89a8c6a12000000ef8c9014\n" +
 		"1 :1787599608.M325463P18.d386b03ffafa,S=431,W=445\n" +
 		"2 cur/2.example,S=100,W=120:2,S\n"
@@ -104,9 +104,9 @@ func TestLoadUIDListMissing(t *testing.T) {
 	}
 }
 
-// TestDovecotCompatibility mounts a maildir exactly as legacy IMAP would have
+// TestMaildirInteropCompatibility mounts a maildir exactly as the reference
 // left it and verifies UIDs and flags come through.
-func TestDovecotCompatibility(t *testing.T) {
+func TestMaildirInteropCompatibility(t *testing.T) {
 	root := t.TempDir()
 	acct, err := OpenAccount(root)
 	if err != nil {

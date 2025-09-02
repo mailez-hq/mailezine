@@ -12,8 +12,8 @@ index, regex, date, mailbox). This directory vendors `foxcpp/go-sieve` (MIT):
 
 - `sieve.go` is the upstream root package (package `sieve`).
 - `interp/` is the upstream `interp` package (package `interp`), extended:
-  - `mailez.go`: vacation (RFC 5230 subset), spamtestplus (legacy IMAP
-    `X-Spam-Level` semantics), editheader (RFC 5293), date/currentdate
+  - `mailez.go`: vacation (RFC 5230 subset), spamtestplus
+    (`X-Spam-Level` header semantics), editheader (RFC 5293), date/currentdate
     (RFC 5260 subset), mailboxexists/metadataexists (RFC 5490), and the
     regex match type (RFC 5182).
   - `load.go`: extension registry entries for the above.

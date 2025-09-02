@@ -21,8 +21,8 @@ const uidListVersion = 3
 // uid → relative-filename mapping ("cur/..." or "new/...").
 type uidList struct {
 	validity uint32
-	guid     string // legacy IMAP mailbox GUID (kept verbatim when present)
-	next     uint32 // legacy IMAP next-uid hint (N field)
+	guid     string // mailbox GUID field of the format (kept verbatim when present)
+	next     uint32 // next-uid hint (N field)
 	entries  map[uint32]string
 }
 
@@ -93,7 +93,7 @@ func syncDir(dir string) {
 //	<uid> <relative filename>
 //
 // The two-line legacy shape (version, then a bare uidvalidity) is also
-// accepted. Relative filenames follow legacy IMAP's convention: "cur/<name>" or
+// accepted. Relative filenames follow the format's convention: "cur/<name>" or
 // "<name>", and "new/<name>" or ":<name>".
 func parseUIDList(data []byte) (*uidList, error) {
 	lines := strings.Split(string(data), "\n")
@@ -186,7 +186,7 @@ func parseMetadataLine(line string, ul *uidList) error {
 	return nil
 }
 
-// normalizeRelPath maps legacy IMAP's uidlist path forms to "<dir>/<name>".
+// normalizeRelPath maps the uidlist format's path forms to "<dir>/<name>".
 func normalizeRelPath(rel string) string {
 	if strings.HasPrefix(rel, "cur/") || strings.HasPrefix(rel, "new/") {
 		return rel

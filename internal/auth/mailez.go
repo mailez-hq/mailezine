@@ -17,7 +17,7 @@ import (
 
 // Mailez is a Service backed by the mailez auth contract.
 //
-// Retry budget mirrors the postdove gateway's login.lua (max_attempts=3):
+// Retry budget mirrors the legacy gateway's login rate policy (3 attempts):
 // under concurrent logins the control plane's bcrypt verification (cost 12)
 // can push tail latency past one request timeout, so transport-level failures
 // are retried with backoff. Credential rejections are never retried.
