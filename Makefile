@@ -42,7 +42,8 @@ build-ee:
 ## check-ce-purity: the community (no-tag) dependency graph must never
 ## reach internal/ee — the compiler-level half of the edition split — and
 ## every EE-tagged file must match the export strip contract (internal/ee/
-## or *_ee.go / *_ee_test.go), or it would leak into the public tree.
+## or *_ee.go / *_ee_test.go), and no enterprise-named Go file may sit
+## outside those patterns, or it would leak into the public tree.
 check-ce-purity:
 	@deps=$$(go list -deps ./... 2>/dev/null | grep -c 'mailezine/internal/ee'); \
 	if [ "$$deps" != "0" ]; then \
@@ -54,6 +55,12 @@ check-ce-purity:
 	if [ -n "$$bad" ]; then \
 		echo "EE-tagged files outside the export strip contract (rename with an _ee suffix):"; \
 		echo "$$bad"; \
+		exit 1; \
+	fi; \
+	namebad=$$(find . -name '*enterprise*.go' -not -path './internal/ee/*' | grep -vE '_ee(_test)?\.go$$|_ce(_test)?\.go$$'); \
+	if [ -n "$$namebad" ]; then \
+		echo "enterprise-named files outside the export strip contract (split with _ee/_ce suffixes):"; \
+		echo "$$namebad"; \
 		exit 1; \
 	fi
 	@echo "ce-purity: ok"

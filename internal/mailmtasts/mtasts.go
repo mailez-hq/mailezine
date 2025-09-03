@@ -102,7 +102,7 @@ func (f *Fetcher) WithClient(hc *http.Client) *Fetcher {
 // Lookup returns the current policy for domain, caching the result. A nil
 // policy with nil error means "no usable policy" (mode=none, fetch failure,
 // or malformed record) — callers fail open, per the engine's documented
-// policy (DECISIONS.md D11).
+// policy.
 func (f *Fetcher) Lookup(ctx context.Context, domain string) (*Policy, error) {
 	domain = strings.ToLower(strings.TrimSuffix(domain, "."))
 	f.mu.Lock()

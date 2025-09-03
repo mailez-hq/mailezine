@@ -1,5 +1,9 @@
-# docker-bake.hcl — build the mailezine engine images (CE + EE variants)
-# from the mailezine repo itself.
+# docker-bake.hcl — build the mailezine community engine image (CE) from
+# the mailezine repo itself.
+#
+# The EE variant lives in docker-bake.ee.hcl (private repo only); build it
+# with both files:
+#   docker buildx bake -f docker-bake.hcl -f docker-bake.ee.hcl ee
 #
 # The mailez control plane consumes these images as
 # ghcr.io/mailez-hq/mailez-mailezine[-ee] (REGISTRY below must stay aligned
@@ -7,9 +11,8 @@
 #
 # Examples:
 #   docker buildx bake                                  # CE, tag :local
-#   docker buildx bake ee                               # EE variant
 #   VERSION=v1.2.3 APK_MIRROR=dl-cdn.alpinelinux.org \
-#     PLATFORMS=linux/amd64,linux/arm64 docker buildx bake ce ee --push
+#     PLATFORMS=linux/amd64,linux/arm64 docker buildx bake ce --push
 
 variable "VERSION" {
   # Image tag and the -ldflags version baked into the binary.
@@ -30,15 +33,6 @@ variable "APK_MIRROR" {
   default = "mirrors.aliyun.com"
 }
 
-variable "MAILEZ_LICENSE_PUBKEY" {
-  # Base64 DER SubjectPublicKeyInfo of the vendor Ed25519 license key
-  # (`license genkey` in the mailez repo prints a pair). Same-name
-  # environment variables override it; official EE release builds MUST set
-  # it (repo secret in release CI). Empty keeps the source-default dev key,
-  # which refuses MAILEZINE_LICENSE_REQUIRED at startup.
-  default = ""
-}
-
 group "default" {
   targets = ["ce"]
 }
@@ -47,22 +41,10 @@ group "ce" {
   targets = ["mailezine-ce"]
 }
 
-group "ee" {
-  targets = ["mailezine-ee"]
-}
-
 target "mailezine-ce" {
   context = "."
   dockerfile = "Dockerfile"
   args = { MAILEZ_EDITION = "ce", VERSION = VERSION, APK_MIRROR = APK_MIRROR }
   tags = ["${REGISTRY}/mailez-mailezine:${VERSION}"]
-  platforms = split(",", PLATFORMS)
-}
-
-target "mailezine-ee" {
-  context = "."
-  dockerfile = "Dockerfile"
-  args = { MAILEZ_EDITION = "ee", VERSION = VERSION, APK_MIRROR = APK_MIRROR }
-  tags = ["${REGISTRY}/mailez-mailezine-ee:${VERSION}"]
   platforms = split(",", PLATFORMS)
 }

@@ -1,5 +1,5 @@
-// Dev is a standalone directory provider for development and tests
-// (PLAN.md §4.4). It is file-backed at startup and keeps quota updates in
+// Dev is a standalone directory provider for development and tests. It is
+// file-backed at startup and keeps quota updates in
 // memory; it is intentionally not durable and never used in production.
 package directory
 

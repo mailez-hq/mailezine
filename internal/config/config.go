@@ -19,7 +19,7 @@ import (
 	"mailezine/internal/limits"
 )
 
-// Default listener ports, aligned with PLAN.md §4.3.
+// Default listener ports.
 const (
 	DefaultHealthPort     = 11480
 	DefaultManagementPort = 8090
@@ -159,7 +159,7 @@ type HAConfig struct {
 	TTLSeconds int
 }
 
-// DirectoryConfig selects the directory provider (PLAN.md §4.4).
+// DirectoryConfig selects the directory provider.
 type DirectoryConfig struct {
 	Mode     string        // dev|mailez
 	File     string        // dev-mode JSON directory (required when Mode=dev)

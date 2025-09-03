@@ -1,4 +1,4 @@
-// Dev is a development-only credential validator (PLAN.md §4.4). Passwords
+// Dev is a development-only credential validator. Passwords
 // are plaintext test values loaded from a JSON file; never use in production.
 package auth
 

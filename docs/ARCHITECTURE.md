@@ -1,7 +1,6 @@
 # mailezine 架构设计
 
-> 状态：设计基线 v1 · 2026-08-24 · 配套文档：[`PLAN.md`](./PLAN.md)（里程碑与决策点）、
-> [`mailez/docs/engines/mailezine-recon.md`](../mailez/docs/engines/mailezine-recon.md)
+> 状态：设计基线 v1 · 2026-08-24
 
 ## 0. 设计立场
 
@@ -424,8 +423,8 @@ flush 队列元数据、关闭存储（RocksDB flush + close；maildir 释放文
 
 ### 10.3 功能开关
 
-POP3、junk、JMAP、全文搜索、远程 blob 等为显式开关，默认值按 PLAN.md 决策
-（POP3 on、junk off、JMAP off）。开关只影响"是否启动该组件"，不影响核心路径语义。
+POP3、junk、JMAP、全文搜索、远程 blob 等为显式开关（POP3 on、junk off、
+JMAP off）。开关只影响"是否启动该组件"，不影响核心路径语义。
 
 ## 11. 测试与质量门
 

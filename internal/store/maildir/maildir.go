@@ -13,7 +13,7 @@
 //     (.mailezine/keywords.json) — losing it loses keywords, never messages.
 //
 // Concurrency contract: single writer per account (in-process mutex + file
-// lock); multi-instance writes are not supported (D7 in DECISIONS.md).
+// lock); multi-instance writes are not supported.
 package maildir
 
 import (

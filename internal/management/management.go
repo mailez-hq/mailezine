@@ -1,5 +1,5 @@
-// Package management serves the internal management API (port 8090,
-// PLAN.md §4.3): status and queue operations. It is reachable only inside
+// Package management serves the internal management API (port 8090):
+// status and queue operations. It is reachable only inside
 // the compose network and is protected by a shared secret
 // (ARCHITECTURE.md §8.3).
 package management
@@ -31,8 +31,8 @@ type Info struct {
 	StartedAt     time.Time
 }
 
-// QueueManager is the outbound queue surface exposed by the management API
-// (PLAN.md §5.2). queue.Manager satisfies it.
+// QueueManager is the outbound queue surface exposed by the management API.
+// queue.Manager satisfies it.
 type QueueManager interface {
 	List(ctx context.Context) ([]queue.Message, error)
 	Retry(ctx context.Context, id uint64) error

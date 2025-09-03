@@ -2,7 +2,7 @@
 // (ARCHITECTURE.md §6.1), built on emersion/go-smtp (MIT) with RFC 5321
 // session semantics.
 //
-// Authentication model (DECISIONS.md ADR-002): external clients are
+// Authentication model: external clients are
 // authenticated by the gateway (nginx auth_http → mailez backend); mailezine
 // trusts the gateway subnet and skips its own auth. Direct deployments can
 // authenticate with AUTH PLAIN through the auth.Service. Recipients are

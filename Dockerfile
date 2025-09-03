@@ -4,8 +4,8 @@
 # (the mailez compose profile points here).
 #
 # The default image runs the pure-Go Pebble backend (no cgo). RocksDB
-# production builds need a separate cgo stage (librocksdb) — see
-# PLAN.md §10; the KV contract keeps both interchangeable.
+# production builds would need a separate cgo stage (librocksdb); the KV
+# contract keeps both interchangeable.
 FROM golang:1.26-alpine AS build
 ENV GOPROXY=https://goproxy.cn,direct CGO_ENABLED=0
 WORKDIR /src
@@ -14,13 +14,13 @@ RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 # MAILEZ_EDITION=ee compiles the enterprise features (TiDB KV, S3 blobs,
-# rspamd client, HA, compliance archive) via the mailez_ee build tag; the
+# HA, compliance archive) via the mailez_ee build tag; the
 # default community build excludes internal/ee entirely.
 ARG MAILEZ_EDITION=ce
 ARG VERSION=dev
 # Vendor verification key (base64 DER SubjectPublicKeyInfo; `license genkey`
 # in the mailez repo prints a pair). Official EE release builds MUST inject
-# it via docker-bake.hcl (repo secrets in release CI). Empty keeps the
+# it via docker-bake.ee.hcl (repo secrets in release CI). Empty keeps the
 # source-default dev key, which the engine refuses to enforce
 # MAILEZINE_LICENSE_REQUIRED on (see internal/license.Load).
 ARG MAILEZ_LICENSE_PUBKEY=""

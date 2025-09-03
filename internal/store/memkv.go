@@ -1,6 +1,6 @@
 // MemoryKV is an in-process KV used by tests and the standalone dev mode.
 // It preserves ordering and atomic-batch semantics so protocol code can run
-// against it before a real backend lands (PLAN.md §9.2 track B).
+// against it before a real backend lands.
 package store
 
 import (

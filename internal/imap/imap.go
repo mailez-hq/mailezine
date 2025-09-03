@@ -1,7 +1,7 @@
 // Package imap implements the IMAP4 server of mailezine on the go-imap/v2
-// imapserver base (decision D2). The session is backed by the persistent
-// mailstore (MailboxStore): KV+blob or maildir. Bounded subset (PLAN.md
-// §6.2): LIST/SELECT/FETCH/SEARCH/STORE/APPEND/COPY/MOVE/EXPUNGE/IDLE.
+// imapserver base. The session is backed by the persistent mailstore
+// (MailboxStore): KV+blob or maildir. Bounded subset:
+// LIST/SELECT/FETCH/SEARCH/STORE/APPEND/COPY/MOVE/EXPUNGE/IDLE.
 package imap
 
 import (

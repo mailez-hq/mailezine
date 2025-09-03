@@ -2,7 +2,7 @@
 // relay entry (transport "smtp:[host][:port]", the smarthost form) are
 // delivered to that fixed host; everyone else goes through the normal MX
 // deliverer. LMTP and "smtp:host" (MX-of-host) transports fall back to
-// normal delivery for v1 (documented in DECISIONS.md).
+// normal delivery for v1.
 package queue
 
 import (
