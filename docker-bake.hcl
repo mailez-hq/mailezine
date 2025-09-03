@@ -30,6 +30,15 @@ variable "APK_MIRROR" {
   default = "mirrors.aliyun.com"
 }
 
+variable "MAILEZ_LICENSE_PUBKEY" {
+  # Base64 DER SubjectPublicKeyInfo of the vendor Ed25519 license key
+  # (`license genkey` in the mailez repo prints a pair). Same-name
+  # environment variables override it; official EE release builds MUST set
+  # it (repo secret in release CI). Empty keeps the source-default dev key,
+  # which refuses MAILEZINE_LICENSE_REQUIRED at startup.
+  default = ""
+}
+
 group "default" {
   targets = ["ce"]
 }
