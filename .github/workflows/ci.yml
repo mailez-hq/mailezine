@@ -20,10 +20,6 @@ jobs:
           go-version: "1.26.x"
           cache: true
       - run: make verify
-      # Edition-split regression gate: the no-tag dependency graph must
-      # never reach internal/ee, and EE-tagged files must match the export
-      # strip contract. Catches a split violation on every push.
-      - run: make check-ce-purity
 
   # Windows: the dev platform (Pebble+FS backend). Race needs gcc, so tests
   # run without -race here; the Linux job covers race.

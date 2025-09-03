@@ -15,7 +15,6 @@ import (
 
 	"github.com/BurntSushi/toml"
 
-	"mailezine/internal/license"
 	"mailezine/internal/limits"
 )
 
@@ -91,11 +90,6 @@ type Config struct {
 	// DLP scans outbound submissions against control-plane rules
 	// (敏感词过滤 + 审批); failures fail open.
 	DLP DLPConfig
-	// License fields: the enterprise engine validates its license at startup.
-	LicenseFile     string
-	LicenseInline   string
-	LicenseRequired bool
-	License         license.License
 }
 
 // LogConfig controls the structured logger.
@@ -188,12 +182,10 @@ type RspamdConfig struct {
 	Password string
 }
 
-// JunkConfig configures the community baseline spam classifier (optional;
-// the enterprise rspamd client takes precedence when configured).
+// JunkConfig configures the built-in baseline spam classifier (optional).
 type JunkConfig struct {
-	// Enabled turns the baseline classifier on. Default true in community
-	// builds without rspamd; harmless in enterprise builds that configure
-	// rspamd (the rspamd client wins).
+	// Enabled turns the baseline classifier on. Default true; when rspamd
+	// is configured, the rspamd client wins and the baseline stays idle.
 	Enabled bool
 	// RejectScore / HeaderScore: scores at or above which messages are
 	// rejected / flagged. Defaults 12 / 4.5 — deliberately lenient.
@@ -546,14 +538,6 @@ func Load() (Config, error) {
 		cfg.Notify.URL = "http://" + cfg.BackendAddress + "/stack/notify/delivered"
 	}
 	cfg.SnoozeInterval = envInt("MAILEZINE_SNOOZE_INTERVAL", 60)
-	cfg.LicenseFile = getenv("MAILEZINE_LICENSE_FILE", "")
-	cfg.LicenseInline = getenv("MAILEZINE_LICENSE", "")
-	cfg.LicenseRequired = envBool("MAILEZINE_LICENSE_REQUIRED", false) && license.EnterpriseBuild
-	lic, err := license.Load(cfg.LicenseFile, cfg.LicenseInline, cfg.LicenseRequired)
-	if err != nil {
-		return Config{}, err
-	}
-	cfg.License = lic
 
 	if err := cfg.Validate(); err != nil {
 		return Config{}, err
@@ -670,13 +654,8 @@ func (c Config) Validate() error {
 
 // Summary is a one-line startup description for logs.
 func (c Config) Summary() string {
-	lic := c.License.Edition
-	if c.License.IsEnterprise() {
-		lic = fmt.Sprintf("enterprise(max=%d)", c.License.MaxMailboxes)
-	}
-	// Anti-spam tier actually in effect: rspamd (both editions; supervised
-	// learning is enterprise), basic (built-in Authentication-Results +
-	// DNSBL classifier) or off.
+	// Anti-spam tier actually in effect: rspamd, basic (built-in
+	// Authentication-Results + DNSBL classifier) or off.
 	junk := "off"
 	if c.Rspamd.URL != "" {
 		junk = "rspamd"
@@ -684,9 +663,9 @@ func (c Config) Summary() string {
 		junk = "basic"
 	}
 	return fmt.Sprintf(
-		"cluster=%s storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v outbound=%v license=%s health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%s jmap=%v maxMsg=%d",
+		"cluster=%s storage=%s directory=%s auth=%s backend=%s hostname=%s tls=%v outbound=%v health=%s listeners=[smtp:%s imap:%s submission:%s sieve:%s pop3:%s] pop3=%v junk=%s jmap=%v maxMsg=%d",
 		c.Cluster.Mode, c.Storage.Backend, c.Directory.Mode, c.Auth.Mode, c.BackendAddress, c.Hostname, c.TLS.CertFile != "", c.Outbound.Enabled,
-		lic, c.HealthAddr, c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
+		c.HealthAddr, c.Listeners.SMTP, c.Listeners.IMAP, c.Listeners.Submission, c.Listeners.ManageSieve, c.Listeners.POP3,
 		c.Features.POP3Enabled, junk, c.Features.JMAPEnabled,
 		c.Limits.MaxMessageSize,
 	)

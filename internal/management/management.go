@@ -15,19 +15,19 @@ import (
 	"strings"
 	"time"
 
-	"mailezine/internal/license"
 	"mailezine/internal/mailstore"
 	"mailezine/internal/queue"
 	"mailezine/internal/store"
 )
 
-// Info is the read-only state the management API reports.
+// Info is the read-only state the management API reports. Extra carries
+// build-specific entries merged verbatim into the /v1/status payload.
 type Info struct {
 	Version       string
 	Storage       string
 	DirectoryMode string
 	AuthMode      string
-	License       license.Status
+	Extra         map[string]any
 	StartedAt     time.Time
 }
 
@@ -58,8 +58,10 @@ func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accou
 			"storage":       info.Storage,
 			"directory":     info.DirectoryMode,
 			"auth":          info.AuthMode,
-			"license":       info.License,
 			"uptimeSeconds": int(time.Since(info.StartedAt).Seconds()),
+		}
+		for k, v := range info.Extra {
+			status[k] = v
 		}
 		if qm != nil {
 			if msgs, err := qm.List(context.Background()); err == nil {

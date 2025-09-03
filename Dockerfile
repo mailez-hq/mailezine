@@ -13,20 +13,8 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd ./cmd
 COPY internal ./internal
-# MAILEZ_EDITION=ee compiles the enterprise features (TiDB KV, S3 blobs,
-# HA, compliance archive) via the mailez_ee build tag; the
-# default community build excludes internal/ee entirely.
-ARG MAILEZ_EDITION=ce
 ARG VERSION=dev
-# Vendor verification key (base64 DER SubjectPublicKeyInfo; `license genkey`
-# in the mailez repo prints a pair). Official EE release builds MUST inject
-# it via docker-bake.ee.hcl (repo secrets in release CI). Empty keeps the
-# source-default dev key, which the engine refuses to enforce
-# MAILEZINE_LICENSE_REQUIRED on (see internal/license.Load).
-ARG MAILEZ_LICENSE_PUBKEY=""
-RUN [ "$MAILEZ_EDITION" = "ee" ] && TAGS="-tags mailez_ee" || TAGS=""; \
-    [ -n "$MAILEZ_LICENSE_PUBKEY" ] && LKEY="-X mailezine/internal/license.publicKeyB64=$MAILEZ_LICENSE_PUBKEY" || LKEY=""; \
-    go build -trimpath $TAGS -ldflags="-s -w -X mailezine/internal/version.Version=${VERSION} $LKEY" -o /out/mailezine ./cmd/mailezine
+RUN go build -trimpath -ldflags="-s -w -X mailezine/internal/version.Version=${VERSION}" -o /out/mailezine ./cmd/mailezine
 
 FROM alpine:3.21
 

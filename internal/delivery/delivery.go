@@ -45,8 +45,7 @@ type Verifier interface {
 }
 
 // Result is the classification of one message: the contract the pipeline
-// consumes. The community build has no classifier; the enterprise build
-// implements delivery.Classifier (e.g. the rspamd client) and produces
+// consumes. Classifier implementations (e.g. the rspamd client) produce
 // these.
 type Result struct {
 	Action        string // "no action", "greylist", "add header", "rewrite subject", "soft reject", "reject"
@@ -56,7 +55,7 @@ type Result struct {
 }
 
 // Classifier scans an inbound message and returns headers to prepend plus an
-// action. The enterprise rspamd client satisfies it.
+// action.
 type Classifier interface {
 	Classify(ctx context.Context, peer net.IP, from string, to []string, data []byte) (Result, error)
 }

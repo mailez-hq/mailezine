@@ -63,10 +63,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Open-core seams (edition split): the interfaces below are the complete
-// contract the app holds on enterprise subsystems. The community build
-// leaves every field nil; the enterprise build (build tag mailez_ee)
-// registers live implementations through the paired hook files.
+// Optional subsystem seams: the interfaces below are the complete contract
+// the app holds on add-on subsystems. The default wiring leaves every field
+// nil and degrades with a loud warning; a backend package linked at build
+// time registers live implementations through the wire files.
 
 // spamClassifier is the ML spam-scanning surface (rspamd): verdicts for the
 // inbound pipeline plus Junk-boundary learning for IMAP.
@@ -165,6 +165,9 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 	m := metrics.New()
 	logger.Info("starting", "version", version.Version, "summary", cfg.Summary())
 	a := &App{cfg: cfg, ctx: ctx, logger: logger, m: m, startedAt: time.Now()}
+	if err := a.startupChecks(); err != nil {
+		return nil, err
+	}
 
 	if cfg.HA.Enabled && haAvailable() {
 		if err := a.bootstrapHA(); err != nil {
@@ -173,12 +176,12 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		return a, nil
 	}
 	if cfg.HA.Enabled {
-		// HA (shared lease + standby/leader terms) is an enterprise
-		// capability; a copied config must never wedge community startup,
-		// so degrade to single-node with a loud warning. Mutate the App's
-		// copy too — Run() branches on a.cfg.HA.Enabled and would otherwise
-		// fall into the (CE-stub) HA supervisor and exit with an error.
-		a.logger.Warn("ha: requires the enterprise edition; continuing single-node")
+		// HA (shared lease + standby/leader terms) is not available in
+		// this build; a copied config must never wedge startup, so degrade
+		// to single-node with a loud warning. Mutate the App's copy too —
+		// Run() branches on a.cfg.HA.Enabled and would otherwise fall into
+		// the unavailable HA supervisor and exit with an error.
+		a.logger.Warn("ha: not available in this build; continuing single-node")
 		cfg.HA.Enabled = false
 		a.cfg.HA.Enabled = false
 	}
@@ -190,8 +193,8 @@ func New(ctx context.Context, cfg config.Config) (*App, error) {
 		// Multi-active fencing (queue claims, singleton leases) is only as
 		// strong as the KV's transactional guarantees: require a native
 		// TxnKV backend. The config layer already pinned the backend to
-		// "tidb"; this re-checks what actually opened (registry,
-		// edition), so a buffer-mode fallback can never run silently.
+		// "tidb"; this re-checks what actually opened (the backend
+		// registry), so a buffer-mode fallback can never run silently.
 		if _, ok := a.st.kv.(store.TxnKV); !ok {
 			a.Close()
 			return nil, fmt.Errorf("cluster: multi-active requires a transactional KV backend (tidb); got %T", a.st.kv)
@@ -368,10 +371,10 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 	var classifier spamClassifier
 	if a.cfg.Rspamd.URL != "" {
 		// rspamd tier: the client re-scans the whole message and takes
-		// precedence over the built-in baseline (learning is enterprise-only).
+		// precedence over the built-in baseline.
 		classifier = newSpamClassifier(a.cfg, a.logger)
 	} else if a.cfg.Junk.Enabled {
-		// Community baseline: score the verifier's authentication results
+		// Baseline classifier: score the verifier's authentication results
 		// plus DNSBL hits and sender lists. Lenient by design — flag more,
 		// reject only on hard signals.
 		classifier = junk.New(newSystemResolver(), junk.Config{
@@ -677,7 +680,7 @@ func (a *App) serveManagement(ctx context.Context) error {
 			Storage:       a.cfg.Storage.Backend,
 			DirectoryMode: a.cfg.Directory.Mode,
 			AuthMode:      a.cfg.Auth.Mode,
-			License:       a.cfg.License.Status(time.Now()),
+			Extra:         extraStatus(),
 			StartedAt:     a.startedAt,
 		}, a.qm, a.st.mailbox, a.st.facade, a.logger),
 		a.cfg.Management.Secret,

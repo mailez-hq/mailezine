@@ -1,6 +1,6 @@
 //go:build unix
 
-// maildir → KV migration (community → enterprise upgrade path). The maildir
+// maildir → KV migration. The maildir
 // side is POSIX-only, so this command compiles on unix; other platforms get
 // a stub that explains the constraint. Migration preserves per-mailbox
 // order, flags, keywords and internal dates; UIDs and UIDVALIDITY are

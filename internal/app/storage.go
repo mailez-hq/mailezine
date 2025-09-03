@@ -64,9 +64,8 @@ func NewStorage(cfg config.Config, logger *slog.Logger) (*Storage, error) {
 }
 
 // OpenKVBlob picks the KV and blob implementations from the config:
-// Pebble for KV and the local FS for blobs in the community build; the
-// enterprise build additionally registers TiDB (KV) and S3 (blob) openers
-// into the store registry.
+// the built-in pair is Pebble KV + local FS blobs; additional backends
+// register their openers into the store registry at init time.
 func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, error) {
 	kvPath, blobRoot := cfg.Storage.RocksPath, cfg.Storage.RocksPath+".blobs"
 
@@ -76,11 +75,11 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 	case "pebble":
 		kv, err = store.OpenPebble(kvPath)
 	case "tidb":
-		// Scale-out KV: registered by the enterprise build only.
+		// Scale-out KV: provided by a backend package linked at build time.
 		if op := store.LookupKVOpener("tidb"); op != nil {
 			kv, err = op(cfg.Storage.DSN, "mailezine_kv")
 		} else {
-			err = fmt.Errorf("storage: backend %q requires the enterprise edition", cfg.Storage.Backend)
+			err = fmt.Errorf("storage: backend %q is not available in this build", cfg.Storage.Backend)
 		}
 	default:
 		err = errors.New("storage: unknown backend (validated earlier)")
@@ -94,7 +93,7 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 		op := store.S3BlobOpenerFor()
 		if op == nil {
 			_ = kv.Close()
-			return nil, nil, fmt.Errorf("storage: s3 blob backend requires the enterprise edition")
+			return nil, nil, fmt.Errorf("storage: s3 blob backend is not available in this build")
 		}
 		b, berr := op(
 			cfg.Storage.S3Endpoint,

@@ -19,7 +19,7 @@ import (
 
 // submitHandler is the SMTP layer's Submit callback shape. It is a type
 // alias (not a definition) so every named use stays assignable to the raw
-// signature; the compliance seam wraps it per edition.
+// signature; the compliance seam wraps it when enabled.
 type submitHandler = func(ctx context.Context, peer net.IP, user, from string, to []string, data mailbuffer.Buffer) error
 
 // submitSigner signs locally delivered submissions (best effort). A nil

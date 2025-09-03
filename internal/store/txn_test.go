@@ -369,13 +369,13 @@ func runConcurrencySuite(t *testing.T, newStore func(*testing.T) *Store) {
 }
 
 // openTiDBContract opens a throwaway TiDB table for one contract case; the
-// whole group skips unless the enterprise build registered the TiDB opener
+// whole group skips unless the TiDB opener is registered
 // and MAILEZINE_TEST_TIDB_DSN points at a live server.
 func openTiDBContract(t *testing.T) KV {
 	t.Helper()
 	op := LookupKVOpener("tidb")
 	if op == nil {
-		t.Skip("TiDB backend not registered (enterprise build only)")
+		t.Skip("TiDB backend not registered in this build")
 	}
 	dsn := os.Getenv("MAILEZINE_TEST_TIDB_DSN")
 	if dsn == "" {

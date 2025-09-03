@@ -1,13 +1,12 @@
-// Package junk implements the community-edition baseline spam classifier:
-// a conservative scorer over SPF/DKIM/DMARC authentication results (RFC 8601
+// Package junk implements the built-in baseline spam classifier: a
+// conservative scorer over SPF/DKIM/DMARC authentication results (RFC 8601
 // Authentication-Results), DNSBL queries and sender allow/deny lists.
 //
 // It satisfies delivery.Classifier (plus the ClassifyAuthResults fast path so
 // the pipeline can hand over the verifier's header instead of forcing a
-// re-verification) and gives the community build usable baseline protection
-// with zero external dependencies. The enterprise rspamd client remains the
-// high-accuracy tier: when MAILEZINE_RSPAMD_URL is configured it takes
-// precedence and this classifier is not wired.
+// re-verification) and gives the default build usable baseline protection
+// with zero external dependencies. When MAILEZINE_RSPAMD_URL is configured,
+// the rspamd client takes precedence and this classifier is not wired.
 //
 // The scoring posture is deliberately lenient — a rejected legitimate message
 // costs far more than a delivered spam. Only hard signals (deny-listed
@@ -278,7 +277,7 @@ func (c *Classifier) greySeen(peer net.IP, from string, to []string) bool {
 // learner to feed, so this is an explicit no-op: marking mail as Junk in
 // the IMAP client still works (it is a mailbox move), it just does not
 // retrain anything. The rspamd classifier implements real supervised
-// learning, with learning itself gated to the enterprise edition.
+// learning when a learning-capable backend is wired.
 func (c *Classifier) LearnWithFuzzy(ctx context.Context, isSpam bool, data []byte) error {
 	return nil
 }

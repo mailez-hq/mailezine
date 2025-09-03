@@ -1,8 +1,7 @@
-// Backend opener registry (open-core seam). The community build ships the
-// single-node backends only (Pebble KV + FS blob); the enterprise build
-// registers the scale-out backends (TiDB KV, S3 blob) here. OpenKVBlob
-// consults this registry before erroring, so an unknown backend name
-// reports "requires the enterprise edition" instead of a generic failure.
+// Backend opener registry. The built-in backends are Pebble KV + local FS
+// blobs; add-on backend packages register their openers here from init, so
+// OpenKVBlob can report a precise "backend not available" error for an
+// unregistered name instead of a generic failure.
 package store
 
 // KVOpener opens a named KV backend. dsn/namespace carry the backend's
@@ -18,8 +17,8 @@ var (
 	s3BlobOpener S3BlobOpener
 )
 
-// RegisterKVOpener installs the opener for one backend name. Enterprise
-// builds call this from package init; the community build never does.
+// RegisterKVOpener installs the opener for one backend name; backend
+// packages call it from init.
 func RegisterKVOpener(name string, op KVOpener) { kvOpeners[name] = op }
 
 // LookupKVOpener returns the opener registered for name, or nil.

@@ -1,18 +1,14 @@
-# docker-bake.hcl — build the mailezine community engine image (CE) from
-# the mailezine repo itself.
-#
-# The EE variant lives in docker-bake.ee.hcl (private repo only); build it
-# with both files:
-#   docker buildx bake -f docker-bake.hcl -f docker-bake.ee.hcl ee
+# docker-bake.hcl — build the mailezine engine image from the mailezine
+# repo itself.
 #
 # The mailez control plane consumes these images as
-# ghcr.io/mailez-hq/mailez-mailezine[-ee] (REGISTRY below must stay aligned
+# ghcr.io/mailez-hq/mailez-mailezine (REGISTRY below must stay aligned
 # with the mailez repo's docker-bake.hcl).
 #
 # Examples:
-#   docker buildx bake                                  # CE, tag :local
+#   docker buildx bake                                  # tag :local
 #   VERSION=v1.2.3 APK_MIRROR=dl-cdn.alpinelinux.org \
-#     PLATFORMS=linux/amd64,linux/arm64 docker buildx bake ce --push
+#     PLATFORMS=linux/amd64,linux/arm64 docker buildx bake --push
 
 variable "VERSION" {
   # Image tag and the -ldflags version baked into the binary.
@@ -34,17 +30,13 @@ variable "APK_MIRROR" {
 }
 
 group "default" {
-  targets = ["ce"]
+  targets = ["mailezine"]
 }
 
-group "ce" {
-  targets = ["mailezine-ce"]
-}
-
-target "mailezine-ce" {
+target "mailezine" {
   context = "."
   dockerfile = "Dockerfile"
-  args = { MAILEZ_EDITION = "ce", VERSION = VERSION, APK_MIRROR = APK_MIRROR }
+  args = { VERSION = VERSION, APK_MIRROR = APK_MIRROR }
   tags = ["${REGISTRY}/mailez-mailezine:${VERSION}"]
   platforms = split(",", PLATFORMS)
 }

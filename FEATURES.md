@@ -1,55 +1,24 @@
-# Edition split: community (CE) / enterprise (EE)
+# mailezine capabilities
 
-mailezine ships in two editions from one repository. The community edition
-is the open-source, single-binary mail engine; the enterprise edition adds
-the compliance and scale-out capabilities (plus rspamd learning). The split is
-enforced by the compiler: EE code lives only under `internal/ee/` (plus
-paired `*_ee.go` assembly files), guarded by the `mailez_ee` build tag.
+mailezine is a single-binary mail engine: SMTP (inbound + submission),
+IMAP, POP3 and ManageSieve on top of an embedded KV+blob storage pair.
 
-| Capability | CE | EE |
-|---|---|---|
-| SMTP inbound/submission, IMAP, POP3, ManageSieve | ✓ | ✓ |
-| Sieve filtering engine | ✓ | ✓ |
-| FTS incl. CJK bigram analyzer | ✓ | ✓ |
-| Pebble KV + FS blob storage (single node) | ✓ | ✓ |
-| SPF/DKIM/DMARC verification | ✓ | ✓ |
-| Outbound queue with retry, DSNs, MTA-STS | ✓ | ✓ |
-| Delivery receipts, snooze wake-up sweeper | ✓ | ✓ |
-| Quotas / limits, backup export+import, migrate/reindex | ✓ | ✓ |
-| Health / metrics / management API | ✓ | ✓ |
-| Compliance archive capture (SMTP wrap → control plane) | | ✓ (`internal/ee/archive`) |
-| HA: shared lease, standby/leader terms | | ✓ (`internal/ee/ha`) |
-| Multi-active cluster: per-message queue claims + fenced outcomes, cross-node singleton leases, per-node FTS convergence via change-log tailing, advisory per-account write gate | | ✓ (`internal/queue`, `internal/kvlease`, `internal/ftssync`, `internal/accountgate`) |
-| TiDB KV (distributed) backend | | ✓ (`internal/ee/storeee`) |
-| S3/MinIO blob backend | | ✓ (`internal/ee/storeee`) |
-| rspamd inbound scanning (checkv2 verdicts, Junk headers/reject) | ✓ (`internal/rspamd`) | ✓ |
-| rspamd learning (IMAP learn-spam/ham + fuzzy) | | ✓ (app hook) |
-| DLP verdict client (outbound policy) | | ✓ (`internal/ee/dlp`) |
+| Capability | Notes |
+|---|---|
+| SMTP inbound/submission, IMAP, POP3, ManageSieve | protocol listeners per config |
+| Sieve filtering engine | full RFC 5228 core + extensions used by the UI |
+| Full-text search incl. CJK bigram analyzer | embedded bleve index; optional Apache Tika attachment extraction |
+| Pebble KV + local FS blob storage | single-node default pair |
+| Pluggable storage backends | opener registry (`store.RegisterKVOpener` / `SetS3BlobOpener`); add-on backend packages register themselves at init |
+| SPF/DKIM/DMARC verification | Authentication-Results headers on inbound mail |
+| Built-in baseline spam classifier | authentication-results + DNSBL + sender lists; lenient posture |
+| rspamd inbound scanning | `/checkv2` verdicts, Junk headers/reject when configured |
+| Outbound queue | retry with backoff, DSNs, MTA-STS |
+| Delivery receipts, snooze wake-up sweeper | control-plane push/webhook/SSE |
+| Quotas / limits, backup export+import, migrate/reindex | `mailezine` sub-commands |
+| Health / metrics / management API | `/health`, Prometheus, `/v1/status` + queue/account operations |
+| Multi-active cluster | per-message queue claims + fenced outcomes, cross-node singleton leases, per-node FTS convergence, advisory per-account write gate — requires a transactional KV backend and a shared blob store |
 
-Rules:
-
-- The CE dependency graph must never reach `internal/ee` — asserted by
-  `make check-ce-purity` and the CE build itself (tag-excluded files are
-  never compiled, so an accidental CE import of an ee package fails to
-  link).
-- EE may import CE freely; CE reaches EE only through the seams defined in
-  CE (`store.RegisterKVOpener`/`SetS3BlobOpener`, the `app`-level
-  `complianceSpool`/`spamClassifier`/`leaderLease` interfaces and their
-  paired hook files).
-- Degrade, never wedge: with EE config present, a CE binary logs a
-  "requires the enterprise edition" warning and runs the community path
-  (single-node, unscanned, uncaptured). A CE build ignores
-  `MAILEZINE_LICENSE_REQUIRED`.
-- The public CE source tree is generated from the private monorepo by an
-  export tool that lives outside the CE tree; it must not contain
-  `internal/ee/`, `*_ee.go`, or
-  `*_ee_test.go`, and must build and test standalone.
-- Every `//go:build mailez_ee` file must live under `internal/ee/` or be
-  named `*_ee.go`/`*_ee_test.go` — otherwise it survives the export strip
-  and leaks EE source into the public tree (`check-ce-purity` enforces
-  this). Conversely, some mechanism packages (`internal/queue` claim path,
-  `internal/kvlease`, `internal/ftssync`, `internal/accountgate`) are
-  deliberately shared and ship in CE, because community features depend on
-  them (single-node queue crash recovery, the snooze sweeper singleton);
-  the enterprise *capabilities* they enable are gated by `internal/ee`
-  (see the multi-active row above).
+Degrade, never wedge: features whose add-on backend is not linked in this
+build log a "not available in this build" warning and the engine keeps
+running on its default path.
