@@ -2,6 +2,8 @@
   <img src="branding/mailez-logo.svg" alt="mailezine" width="320">
 </p>
 
+<p align="center"><a href="README.md">English</a> | <b>简体中文</b></p>
+
 # mailezine
 
 mailez 官方邮件引擎（社区版）：单 Go 二进制邮件服务器，提供 SMTP 收发、
