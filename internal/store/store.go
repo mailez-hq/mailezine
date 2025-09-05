@@ -463,6 +463,7 @@ func orderedFieldOps(accountID AccountID, collection byte, docID uint64, fields 
 // delete transaction) do not carry it. No rows are written; the caller must
 // treat the message as not expunged.
 var ErrNotMarkedDeleted = errors.New("store: message not marked for deletion")
+
 // hasListToken reports whether the comma-joined system-flag list contains
 // want exactly (no substring matches across flag boundaries). IMAP flags are
 // case-insensitive, so the comparison folds case.

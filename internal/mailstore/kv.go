@@ -53,8 +53,8 @@ const (
 
 // KV implements Store on top of a store.Store facade.
 type KV struct {
-	s      *store.Store
-	batch  deliverBatcher
+	s          *store.Store
+	batch      deliverBatcher
 	batchLimit int
 }
 

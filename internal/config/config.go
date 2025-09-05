@@ -26,8 +26,8 @@ const (
 
 // Config is the validated process configuration.
 type Config struct {
-	Log            LogConfig
-	HealthAddr     string
+	Log        LogConfig
+	HealthAddr string
 	// Pprof exposes net/http/pprof under /debug/pprof on the health
 	// listener (MAILEZINE_PPROF). Off by default; profiling support for
 	// benchmark and production diagnosis.
