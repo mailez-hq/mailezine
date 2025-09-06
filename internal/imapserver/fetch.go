@@ -1,6 +1,7 @@
 package imapserver
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"mime"
@@ -517,6 +518,34 @@ func (w *FetchResponseWriter) WriteEnvelope(envelope *imap.Envelope) {
 	enc := w.enc.Encoder
 	enc.Atom("ENVELOPE").SP()
 	writeEnvelope(enc, envelope)
+}
+
+// WriteEnvelopeRaw replays a payload produced by EncodeEnvelope. It exists
+// for the memoized-envelope fast path: the bytes are already the complete
+// "ENVELOPE <...>" encoding, so a cache hit costs one buffer write instead
+// of walking the envelope structure again.
+func (w *FetchResponseWriter) WriteEnvelopeRaw(payload string) {
+	w.writeItemSep()
+	w.enc.Atom("ENVELOPE").SP().RawString(payload)
+}
+
+// EncodeEnvelope renders the parenthesized ENVELOPE payload for envelope as
+// raw IMAP bytes, ready for FetchResponseWriter.WriteEnvelopeRaw. The
+// scratch encoder keeps QuotedUTF8 off on purpose: the payload is memoized
+// across connections, so it must be valid for every client — including ones
+// that never enabled UTF8=ACCEPT (non-ASCII strings use literals, which are
+// universally legal).
+func EncodeEnvelope(envelope *imap.Envelope) string {
+	var sb strings.Builder
+	bw := bufio.NewWriter(&sb)
+	enc := imapwire.NewEncoder(bw, imapwire.ConnSideServer)
+	writeEnvelope(enc, envelope)
+	if err := bw.Flush(); err != nil {
+		// An in-memory writer cannot fail; fall back to empty and let the
+		// caller re-encode live rather than serve a truncated payload.
+		return ""
+	}
+	return sb.String()
 }
 
 // WriteBodyStructure writes the message's body structure (either BODYSTRUCTURE

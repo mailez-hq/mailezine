@@ -28,8 +28,8 @@ func TestLRUWeightEviction(t *testing.T) {
 func TestLRUOversizedEntry(t *testing.T) {
 	c := NewCache(70)
 	c.Put("big", "x", 100)
-	if c.weight > 70 {
-		t.Fatalf("oversized entry should be evicted immediately, weight=%d", c.weight)
+	if w := c.Weight(); w > 70 {
+		t.Fatalf("oversized entry should be evicted immediately, weight=%d", w)
 	}
 	if _, ok := c.Get("big"); ok {
 		t.Fatal("oversized entry should not be cached")
@@ -87,7 +87,7 @@ func TestRemoveAndClear(t *testing.T) {
 	if _, ok := c.Get("b"); ok {
 		t.Fatal("b should be cleared")
 	}
-	if c.weight != 0 {
-		t.Fatalf("weight after clear = %d", c.weight)
+	if w := c.Weight(); w != 0 {
+		t.Fatalf("weight after clear = %d", w)
 	}
 }

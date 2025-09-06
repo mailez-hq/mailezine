@@ -12,20 +12,33 @@ package mailcache
 
 import (
 	"container/list"
+	"hash/fnv"
+	"io"
 	"sync"
 	"time"
 )
 
+// shardCount is the LRU's lock striping. Reads (Get) move entries to the
+// front, so every cache touch takes its shard's mutex; at fifty concurrent
+// IMAP sessions a single lock was the remaining global serial point.
+const shardCount = 16
+
 // Cache is a fixed-weight least-recently-used cache with optional TTL and
-// negative caching.
+// negative caching. Entries are striped across shardCount locks when the
+// capacity is large enough to shard; the weight bound applies per shard
+// (total capacity = maxWeight).
 type Cache struct {
+	shards []cacheShard
+	ttl    time.Duration
+	negTTL time.Duration
+}
+
+type cacheShard struct {
 	mu     sync.Mutex
 	max    int64
 	weight int64
 	ll     *list.List
 	items  map[string]*list.Element
-	ttl    time.Duration
-	negTTL time.Duration
 }
 
 type entry struct {
@@ -59,56 +72,88 @@ func newCache(maxWeight int64, ttl time.Duration) *Cache {
 	if maxWeight <= 0 {
 		maxWeight = 8 << 20
 	}
-	return &Cache{
-		max:   maxWeight,
-		ll:    list.New(),
-		items: make(map[string]*list.Element),
-		ttl:   ttl,
+	n := shardsFor(maxWeight)
+	c := &Cache{ttl: ttl}
+	c.shards = make([]cacheShard, n)
+	per := maxWeight / int64(n)
+	for i := range c.shards {
+		c.shards[i].max = per
+		c.shards[i].ll = list.New()
+		c.shards[i].items = make(map[string]*list.Element)
 	}
+	return c
+}
+
+// shardsFor picks the lock striping for a capacity. Real memoizations are
+// MiB-scale and contend across dozens of connections, so they stripe; a
+// tiny cache stays single-shard — splitting 100 bytes across 16 locks
+// would make every entry oversized and break strict-LRU eviction.
+func shardsFor(maxWeight int64) int {
+	if maxWeight >= 1<<20 {
+		return shardCount
+	}
+	return 1
+}
+
+// shardOf stripes keys across shards. FNV-1a over short ASCII-ish keys
+// ("msgs\x00acct\x00mailbox", envelope keys) distributes well and the
+// 32-bit hash never allocates.
+func (c *Cache) shardOf(key string) *cacheShard {
+	h := fnv.New32a()
+	_, _ = io.WriteString(h, key)
+	return &c.shards[h.Sum32()&uint32(len(c.shards)-1)]
 }
 
 // Get returns the cached value for key, moving it to the front. A hit whose
 // value is nil means the key was negatively cached ("known absent").
 func (c *Cache) Get(key string) (any, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	el, ok := c.items[key]
+	return c.shardOf(key).get(key)
+}
+
+func (s *cacheShard) get(key string) (any, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	el, ok := s.items[key]
 	if !ok {
 		return nil, false
 	}
 	if e := el.Value.(*entry); !e.expires.IsZero() && time.Now().After(e.expires) {
-		c.removeLocked(el)
+		s.removeLocked(el)
 		return nil, false
 	}
-	c.ll.MoveToFront(el)
+	s.ll.MoveToFront(el)
 	return el.Value.(*entry).value, true
 }
 
 // Put stores value under key with the given weight, evicting the
-// least-recently-used entries until the cache is within capacity.
+// least-recently-used entries until the shard is within its capacity share.
 func (c *Cache) Put(key string, value any, weight int64) {
+	c.shardOf(key).put(key, value, weight, c.expiry(weight))
+}
+
+func (s *cacheShard) put(key string, value any, weight int64, expires time.Time) {
 	// Every entry carries a fixed footprint (map slot, list element, key
 	// storage) on top of the value. Account for it so callers passing tiny
 	// weights (e.g. 1 for a bool) cannot balloon memory.
 	weight += int64(64 + len(key))
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.items[key]; ok {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.items[key]; ok {
 		e := el.Value.(*entry)
-		c.weight += weight - e.weight
+		s.weight += weight - e.weight
 		e.value = value
 		e.weight = weight
-		e.expires = c.expiry(weight)
-		c.ll.MoveToFront(el)
+		e.expires = expires
+		s.ll.MoveToFront(el)
 	} else {
-		el := c.ll.PushFront(&entry{key: key, value: value, weight: weight, expires: c.expiry(weight)})
-		c.items[key] = el
-		c.weight += weight
+		el := s.ll.PushFront(&entry{key: key, value: value, weight: weight, expires: expires})
+		s.items[key] = el
+		s.weight += weight
 	}
-	for c.weight > c.max {
-		oldest := c.ll.Back()
+	for s.weight > s.max {
+		oldest := s.ll.Back()
 		if oldest != nil {
-			c.removeLocked(oldest)
+			s.removeLocked(oldest)
 		}
 	}
 }
@@ -117,37 +162,38 @@ func (c *Cache) Put(key string, value any, weight int64) {
 // negative TTL (or the regular TTL when no negative TTL was configured).
 func (c *Cache) PutNegative(key string) {
 	ttl := c.negTTL
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = c.ttl
 	}
 	if ttl <= 0 {
 		return
 	}
-	c.Put(key, nil, 1)
-	// Restore the negative TTL (Put used the regular expiry).
-	c.mu.Lock()
-	if el, ok := c.items[key]; ok {
-		el.Value.(*entry).expires = time.Now().Add(ttl)
-	}
-	c.mu.Unlock()
+	c.shardOf(key).put(key, nil, 1, time.Now().Add(ttl))
 }
 
 // Remove deletes a key from the cache.
 func (c *Cache) Remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if el, ok := c.items[key]; ok {
-		c.removeLocked(el)
+	c.shardOf(key).remove(key)
+}
+
+func (s *cacheShard) remove(key string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if el, ok := s.items[key]; ok {
+		s.removeLocked(el)
 	}
 }
 
 // Clear empties the cache.
 func (c *Cache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.ll.Init()
-	c.items = make(map[string]*list.Element)
-	c.weight = 0
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		s.ll.Init()
+		s.items = make(map[string]*list.Element)
+		s.weight = 0
+		s.mu.Unlock()
+	}
 }
 
 func (c *Cache) expiry(weight int64) time.Time {
@@ -157,9 +203,21 @@ func (c *Cache) expiry(weight int64) time.Time {
 	return time.Now().Add(c.ttl)
 }
 
-func (c *Cache) removeLocked(el *list.Element) {
-	c.ll.Remove(el)
+// Weight reports the current total cached weight across shards.
+func (c *Cache) Weight() int64 {
+	var total int64
+	for i := range c.shards {
+		s := &c.shards[i]
+		s.mu.Lock()
+		total += s.weight
+		s.mu.Unlock()
+	}
+	return total
+}
+
+func (s *cacheShard) removeLocked(el *list.Element) {
+	s.ll.Remove(el)
 	e := el.Value.(*entry)
-	delete(c.items, e.key)
-	c.weight -= e.weight
+	delete(s.items, e.key)
+	s.weight -= e.weight
 }

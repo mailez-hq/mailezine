@@ -98,7 +98,14 @@ type Pipeline struct {
 
 	vacationMu   sync.Mutex
 	vacationLast map[string]time.Time // "account\x00sender" -> last auto-reply
+
+	quotaMu       sync.Mutex
+	quotaReported map[string]time.Time // target -> last quota report
 }
+
+// quotaReportInterval is the minimum spacing between control-plane quota
+// reports for one account.
+const quotaReportInterval = 5 * time.Second
 
 // AccountGate serializes the per-account write section across nodes.
 // WithAccount returns once the account is locally owned (after a bounded
@@ -705,8 +712,23 @@ func (p *Pipeline) checkQuota(ctx context.Context, target string, size int64) er
 	return nil
 }
 
-// reportQuota writes the used quota back to the control plane (best effort).
+// reportQuota writes the used quota back to the control plane (best
+// effort). Reports are throttled per account: the value feeds the control
+// plane's display and near-full warnings, while enforcement reads the
+// store counter fresh in checkQuota — so a burst of deliveries to one
+// account collapses to one write per interval with no enforcement impact.
 func (p *Pipeline) reportQuota(ctx context.Context, target string) {
+	p.quotaMu.Lock()
+	if p.quotaReported == nil {
+		p.quotaReported = make(map[string]time.Time)
+	}
+	now := time.Now()
+	if last, ok := p.quotaReported[target]; ok && now.Sub(last) < quotaReportInterval {
+		p.quotaMu.Unlock()
+		return
+	}
+	p.quotaReported[target] = now
+	p.quotaMu.Unlock()
 	used, err := p.Store.QuotaUsedBytes(ctx, target)
 	if err != nil {
 		return

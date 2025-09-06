@@ -63,6 +63,13 @@ func (enc *Encoder) writeString(s string) *Encoder {
 	return enc
 }
 
+// RawString writes pre-encoded IMAP bytes verbatim. It exists for replaying
+// memoized encodings (FETCH ENVELOPE payloads); the caller owns the
+// byte-level validity of the content.
+func (enc *Encoder) RawString(s string) *Encoder {
+	return enc.writeString(s)
+}
+
 // CRLF writes a "\r\n" sequence and flushes the buffered writer.
 func (enc *Encoder) CRLF() error {
 	enc.writeString("\r\n")

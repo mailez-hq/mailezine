@@ -57,11 +57,20 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		// uidvalidity, UID); only body sections and cache misses need the
 		// blob. The uidvalidity dimension prevents a delete+recreate of the
 		// mailbox from serving stale cached envelopes under reused UIDs.
+		// The envelope memo holds the pre-encoded wire payload (see
+		// imapserver.EncodeEnvelope), so a hit is one raw write — no
+		// per-response re-walk of the envelope structure.
 		envKey := s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(s.uidvalidity), 10) + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
 		var env *imap.Envelope
+		var envRaw string
 		if options.Envelope {
 			if e, ok := s.srv.cache.Get(envKey); ok {
-				env = e.(*imap.Envelope)
+				switch v := e.(type) {
+				case string:
+					envRaw = v
+				case *imap.Envelope:
+					env = v
+				}
 			}
 		}
 		bsKey := "bs\x00" + envKey + "\x00" + strconv.FormatBool(options.BodyStructure != nil && options.BodyStructure.Extended)
@@ -73,7 +82,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		}
 		needBuf := len(options.BodySection) > 0 || len(options.BinarySection) > 0 ||
 			len(options.BinarySectionSize) > 0 ||
-			(options.Envelope && env == nil) ||
+			(options.Envelope && env == nil && envRaw == "") ||
 			(options.BodyStructure != nil && bs == nil)
 		var buf []byte
 		if needBuf {
@@ -122,11 +131,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			rw.WriteRFC822Size(msg.Size)
 		}
 		if options.Envelope {
-			if env == nil {
-				env = envelopeOf(buf)
-				s.srv.cache.Put(envKey, env, int64(envelopeWeight(env)))
+			if envRaw == "" {
+				if env == nil {
+					env = envelopeOf(buf)
+				}
+				envRaw = imapserver.EncodeEnvelope(env)
+				s.srv.cache.Put(envKey, envRaw, int64(len(envRaw)))
 			}
-			rw.WriteEnvelope(env)
+			rw.WriteEnvelopeRaw(envRaw)
 		}
 		if options.BodyStructure != nil {
 			if bs == nil {
@@ -236,12 +248,4 @@ func envelopeOf(buf []byte) *imap.Envelope {
 		return &imap.Envelope{}
 	}
 	return imapserver.ExtractEnvelope(header)
-}
-
-// envelopeWeight estimates the memory footprint of a parsed envelope so the
-// cache capacity tracks bytes rather than entry count.
-func envelopeWeight(e *imap.Envelope) int {
-	addr := func(l []imap.Address) int { return len(l) * 96 }
-	return 512 + len(e.Subject) + addr(e.From) + addr(e.Sender) +
-		addr(e.ReplyTo) + addr(e.To) + addr(e.Cc) + addr(e.Bcc)
 }
