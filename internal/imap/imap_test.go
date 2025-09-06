@@ -351,6 +351,108 @@ func TestIMAPIdlePush(t *testing.T) {
 	}
 }
 
+// TestIMAPPollGatePicksUpChanges verifies the modseq-gated per-command poll
+// still surfaces out-of-band deliveries and expunges on the next command.
+// The gate may only skip the listing diff when the mailbox version is
+// unchanged — a false skip would hide deliveries until the next real change.
+func TestIMAPPollGatePicksUpChanges(t *testing.T) {
+	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
+	ms := mailstore.NewKV(s)
+	if _, err := ms.Deliver(t.Context(), "alice@example.com", "INBOX", &mailstore.Message{
+		Data: []byte("From: a@x.test\r\nSubject: one\r\n\r\nbody\r\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	dir := directory.NewDev(directory.DevData{
+		Users: map[string]directory.User{
+			"alice@example.com": {Email: "alice@example.com", Enabled: true},
+		},
+		Domains: []string{"example.com"},
+	})
+	srv := New(&Server{
+		Store:     ms,
+		Auth:      auth.NewDev(map[string]string{"alice@example.com": "s3cret"}),
+		Directory: dir,
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() { _ = srv.Serve(ln) }()
+
+	exists := make(chan uint32, 8)
+	expunges := make(chan uint32, 8)
+	client, err := imapclient.DialInsecure(ln.Addr().String(), &imapclient.Options{
+		UnilateralDataHandler: &imapclient.UnilateralDataHandler{
+			Mailbox: func(d *imapclient.UnilateralDataMailbox) {
+				if d.NumMessages != nil {
+					exists <- *d.NumMessages
+				}
+			},
+			Expunge: func(seq uint32) { expunges <- seq },
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Logout().Wait() })
+	if err := client.Login("alice@example.com", "s3cret").Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	// An unchanged mailbox must produce nothing: the gate short-circuits.
+	if err := client.Noop().Wait(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-exists:
+		t.Fatalf("spurious EXISTS %d with unchanged mailbox", n)
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	// Out-of-band delivery must appear on the next command's poll.
+	if _, err := ms.Deliver(t.Context(), "alice@example.com", "INBOX", &mailstore.Message{
+		Data: []byte("From: b@x.test\r\nSubject: two\r\n\r\nbody\r\n"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Noop().Wait(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case n := <-exists:
+		if n != 2 {
+			t.Fatalf("EXISTS = %d, want 2", n)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("delivery not picked up by gated poll")
+	}
+
+	// Out-of-band expunge likewise.
+	if err := ms.SetFlags(t.Context(), "alice@example.com", "INBOX", 2, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Expunge(t.Context(), "alice@example.com", "INBOX", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Noop().Wait(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case seq := <-expunges:
+		if seq != 2 {
+			t.Fatalf("EXPUNGE seq = %d, want 2", seq)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expunge not picked up by gated poll")
+	}
+}
+
 // TestIMAPHeaderFieldsFetch verifies BODY.PEEK[HEADER.FIELDS (...)] and
 // partial body fetches (used by the webmail list pane).
 func TestIMAPHeaderFieldsFetch(t *testing.T) {

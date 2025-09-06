@@ -123,11 +123,11 @@ func (k *KV) EnsureDefaultMailboxes(ctx context.Context, account string) error {
 
 // MailboxStatus reports the metadata of one mailbox.
 func (k *KV) MailboxStatus(ctx context.Context, account, mailbox string) (Mailbox, error) {
-	acctID, err := k.s.AccountByEmail(ctx, account)
+	acctID, err := k.cachedAccountID(ctx, account)
 	if err != nil {
 		return Mailbox{}, err
 	}
-	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
+	mbID, err := k.cachedMailboxDocID(ctx, acctID, mailbox)
 	if err != nil {
 		return Mailbox{}, err
 	}
@@ -161,6 +161,30 @@ func (k *KV) MailboxStatus(ctx context.Context, account, mailbox string) (Mailbo
 		}
 	}
 	return mb, nil
+}
+
+// MailboxModSeq reports the mailbox's CONDSTORE modseq without listing its
+// messages: account id, mailbox doc id, then the mailbox document — point
+// lookups only, no email scan. The id resolutions go through the process
+// id cache; the mailbox document itself is read fresh every call — its
+// modseq is the change signal the Poll gate compares, caching it would
+// defeat the check. Any failure (unknown account, vanished mailbox,
+// transient store error) reports unsupported so callers fall back to the
+// listing path, which owns the proper error handling.
+func (k *KV) MailboxModSeq(ctx context.Context, account, mailbox string) (uint64, bool) {
+	acctID, err := k.cachedAccountID(ctx, account)
+	if err != nil {
+		return 0, false
+	}
+	mbID, err := k.cachedMailboxDocID(ctx, acctID, mailbox)
+	if err != nil {
+		return 0, false
+	}
+	fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionMailbox, mbID)
+	if err != nil {
+		return 0, false
+	}
+	return beUint64Value(fields[store.FieldMailboxModSeq]), true
 }
 
 // CreateMailbox creates a mailbox and returns its UIDVALIDITY (the mailbox
@@ -275,7 +299,13 @@ func (k *KV) DeleteAccount(ctx context.Context, account string) error {
 	if err := k.s.DeleteRaw(ctx, store.MetaEmailKey(account)); err != nil {
 		return err
 	}
-	return k.s.DeleteRaw(ctx, store.AccountKey(aid))
+	if err := k.s.DeleteRaw(ctx, store.AccountKey(aid)); err != nil {
+		return err
+	}
+	// A same-address re-creation must resolve to the NEW account: drop the
+	// id memo (DeleteAccount is the only event that can stale it).
+	k.invalidateAccountIDs(account, acctID)
+	return nil
 }
 
 func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
@@ -299,7 +329,13 @@ func (k *KV) DeleteMailbox(ctx context.Context, account, mailbox string) error {
 	if err := k.s.DeleteDocument(ctx, acctID, store.CollectionMailbox, mbID); err != nil {
 		return err
 	}
-	return k.s.DeleteRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox))
+	if err := k.s.DeleteRaw(ctx, store.IndexMailboxNameKey(uint32(acctID), mailbox)); err != nil {
+		return err
+	}
+	// Doc IDs are never reused: a same-name re-creation gets a new ID, so
+	// the memoized resolution must not survive the delete.
+	k.invalidateMailboxID(acctID, mailbox)
+	return nil
 }
 
 // RenameMailbox moves the mailbox (messages keep their UIDs; both the UID
@@ -337,6 +373,8 @@ func (k *KV) RenameMailbox(ctx context.Context, account, oldName, newName string
 			return err
 		}
 	}
+	// The old name no longer resolves to this doc ID.
+	k.invalidateMailboxID(acctID, oldName)
 	return nil
 }
 

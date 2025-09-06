@@ -120,6 +120,13 @@ func (c *Cached) MailboxStatus(ctx context.Context, account, mailbox string) (Ma
 	return st, nil
 }
 
+// MailboxModSeq reads through without caching: its single purpose is
+// freshness (Poll uses it to detect any change since a snapshot), so a
+// memoized value would defeat the check it exists for.
+func (c *Cached) MailboxModSeq(ctx context.Context, account, mailbox string) (uint64, bool) {
+	return c.inner.MailboxModSeq(ctx, account, mailbox)
+}
+
 func (c *Cached) CreateMailbox(ctx context.Context, account, mailbox string) (uint32, error) {
 	uidv, err := c.inner.CreateMailbox(ctx, account, mailbox)
 	if err == nil {

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +57,89 @@ type KV struct {
 	s          *store.Store
 	batch      deliverBatcher
 	batchLimit int
+	// idCache memoizes hot-path id resolutions: account email → account
+	// ID, and (account, mailbox name) → mailbox doc ID. Every delivery
+	// resolves both and every Poll version gate resolves the mailbox, so
+	// on single-node Pebble this saves a few point reads per operation
+	// and over TiDB a network round trip each. Doc IDs are stable and
+	// never reused, so entries are invalidated on the only events that
+	// can stale them — mailbox delete/rename and account purge; the TTL
+	// bounds the cross-node staleness window the same way the metadata
+	// cache's TTL does (process-local invalidation cannot observe another
+	// node's admin operations in multi-active mode). Positive entries
+	// only: a cached "not found" would delay recognition of freshly
+	// created accounts and mailboxes.
+	idCache sync.Map
+}
+
+// idCacheTTL bounds how long an id resolution is trusted. See the KV.idCache
+// note on invalidation and the cross-node staleness window.
+const idCacheTTL = time.Minute
+
+type idCacheEntry struct {
+	id      uint64
+	expires time.Time
+}
+
+func idCacheKeyAccount(email string) string {
+	return "a\x00" + email
+}
+
+func idCacheKeyMailbox(acctID store.AccountID, mailbox string) string {
+	return "m\x00" + strconv.FormatUint(uint64(acctID), 10) + "\x00" + mailbox
+}
+
+// cachedAccountID resolves an account email to its ID through idCache,
+// falling back to a fresh store read on miss. Only successful resolutions
+// are memoized.
+func (k *KV) cachedAccountID(ctx context.Context, email string) (store.AccountID, error) {
+	if v, ok := k.idCache.Load(idCacheKeyAccount(email)); ok {
+		if e := v.(*idCacheEntry); time.Now().Before(e.expires) {
+			return store.AccountID(e.id), nil
+		}
+	}
+	acctID, err := k.s.AccountByEmail(ctx, email)
+	if err != nil {
+		return 0, err
+	}
+	k.idCache.Store(idCacheKeyAccount(email), &idCacheEntry{id: uint64(acctID), expires: time.Now().Add(idCacheTTL)})
+	return acctID, nil
+}
+
+// cachedMailboxDocID resolves a mailbox name to its document ID through
+// idCache, falling back to mailboxDocID's index read (with its repair
+// fallback) on miss. Only successful resolutions are memoized.
+func (k *KV) cachedMailboxDocID(ctx context.Context, acctID store.AccountID, mailbox string) (uint64, error) {
+	key := idCacheKeyMailbox(acctID, mailbox)
+	if v, ok := k.idCache.Load(key); ok {
+		if e := v.(*idCacheEntry); time.Now().Before(e.expires) {
+			return e.id, nil
+		}
+	}
+	id, err := k.mailboxDocID(ctx, acctID, mailbox)
+	if err != nil {
+		return 0, err
+	}
+	k.idCache.Store(key, &idCacheEntry{id: id, expires: time.Now().Add(idCacheTTL)})
+	return id, nil
+}
+
+func (k *KV) invalidateMailboxID(acctID store.AccountID, mailbox string) {
+	k.idCache.Delete(idCacheKeyMailbox(acctID, mailbox))
+}
+
+// invalidateAccountIDs drops the account's own resolution plus every cached
+// mailbox resolution under its ID (prefix range over the small id cache —
+// account purge is a rare administrative operation).
+func (k *KV) invalidateAccountIDs(email string, acctID store.AccountID) {
+	k.idCache.Delete(idCacheKeyAccount(email))
+	prefix := "m\x00" + strconv.FormatUint(uint64(acctID), 10) + "\x00"
+	k.idCache.Range(func(key, _ any) bool {
+		if ks, ok := key.(string); ok && strings.HasPrefix(ks, prefix) {
+			k.idCache.Delete(ks)
+		}
+		return true
+	})
 }
 
 // NewKV wraps a store facade.
@@ -301,7 +385,7 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 	return uid, nil
 }
 func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID, error) {
-	acctID, err := k.s.AccountByEmail(ctx, account)
+	acctID, err := k.cachedAccountID(ctx, account)
 	if err == nil {
 		return acctID, nil
 	}
@@ -312,7 +396,7 @@ func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID
 	if errors.Is(err, store.ErrExists) {
 		// Lost a concurrent create: adopt the winner's registration instead
 		// of surfacing a spurious temporary failure.
-		return k.s.AccountByEmail(ctx, account)
+		return k.cachedAccountID(ctx, account)
 	}
 	return acctID, err
 }
@@ -323,7 +407,7 @@ func (k *KV) ensureAccount(ctx context.Context, account string) (store.AccountID
 // concurrent first deliveries to the same new mailbox resolve to exactly one
 // document (the loser adopts the winner via conflict replay).
 func (k *KV) ensureMailbox(ctx context.Context, acctID store.AccountID, mailbox string) (uint64, error) {
-	if id, err := k.mailboxDocID(ctx, acctID, mailbox); err == nil {
+	if id, err := k.cachedMailboxDocID(ctx, acctID, mailbox); err == nil {
 		return id, nil
 	} else if !errors.Is(err, store.ErrNotFound) {
 		return 0, err

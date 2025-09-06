@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -32,6 +33,11 @@ type session struct {
 	// cannot serve stale cached envelopes for reused UIDs.
 	uidvalidity uint32
 	snap        []*mailstore.Message // selected mailbox snapshot for IDLE/POLL diffs
+	// snapModSeq and modseqGated back Poll's cheap change check: the
+	// mailbox CONDSTORE modseq captured alongside the snapshot, and
+	// whether the store maintains one for this mailbox at all.
+	snapModSeq  uint64
+	modseqGated bool
 }
 
 var _ imapserver.Session = (*session)(nil)
@@ -88,12 +94,17 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		}
 		return nil, err
 	}
+	// Capture the version before the listing (read-order discipline, see
+	// Poll): the listing may then include changes newer than the captured
+	// value, which costs a spurious diff later — never a skipped one.
+	modSeq, gated := s.srv.Store.MailboxModSeq(ctx, s.user, mailbox)
 	msgs, err := s.srv.Store.ListMessages(ctx, s.user, mailbox)
 	if err != nil {
 		return nil, err
 	}
 	s.mbox = mailbox
 	s.snap = msgs
+	s.snapModSeq, s.modseqGated = modSeq, gated
 	s.readOnly = options != nil && options.ReadOnly
 	s.uidvalidity = st.UIDValidity
 	flags := []imap.Flag{
@@ -290,6 +301,27 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 	if s.mbox == "" {
 		return nil
 	}
+	// Version check first. The CONDSTORE modseq is the version of
+	// everything the diff below rebuilds — deliveries, flag changes and
+	// expunges all bump it — so "unchanged since the snapshot was
+	// captured" skips the full listing, the two maps and the O(mailbox)
+	// compare that every command's poll would otherwise pay. Backends
+	// without a modseq, and vanished mailboxes (reported unsupported),
+	// fall through to the listing path, which owns the error handling.
+	//
+	// Read-order discipline: the value captured here is committed with
+	// the snapshot taken from the listing below. Capturing it BEFORE the
+	// listing means the snapshot may include changes newer than the
+	// captured value — that only costs a spurious diff round, never a
+	// skipped change (a skipped one would need the gate to claim a
+	// version newer than the snapshot's content).
+	modSeq, gated := uint64(0), false
+	if s.modseqGated {
+		modSeq, gated = s.srv.Store.MailboxModSeq(context.Background(), s.user, s.mbox)
+		if gated && modSeq == s.snapModSeq {
+			return nil
+		}
+	}
 	current, err := s.srv.Store.ListMessages(context.Background(), s.user, s.mbox)
 	if err != nil {
 		if errors.Is(err, mailstore.ErrNotFound) {
@@ -355,6 +387,9 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 			}
 		}
 		s.snap = current
+		if gated {
+			s.snapModSeq = modSeq
+		}
 		return nil
 	}
 	// Expunges are not allowed in this round: keep the OLD snapshot. Adopting
@@ -368,6 +403,9 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 		}
 	}
 	s.snap = current
+	if gated {
+		s.snapModSeq = modSeq
+	}
 	return nil
 }
 
@@ -407,11 +445,19 @@ func (s *session) refreshSnapshot(ctx context.Context) error {
 	if s.mbox == "" {
 		return nil
 	}
+	// Version first, listing second (read-order discipline, see Poll).
+	modSeq, gated := uint64(0), false
+	if s.modseqGated {
+		modSeq, gated = s.srv.Store.MailboxModSeq(ctx, s.user, s.mbox)
+	}
 	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
 	if err != nil {
 		return err
 	}
 	s.snap = msgs
+	if gated {
+		s.snapModSeq = modSeq
+	}
 	return nil
 }
 
@@ -422,13 +468,16 @@ func sameFlags(a, b *mailstore.Message) bool {
 	return flagSetEqual(a.Flags, b.Flags) && flagSetEqual(a.Keywords, b.Keywords)
 }
 
+// flagSetEqual compares two flag sets without allocating: IMAP flag sets
+// are tiny (the five system flags plus a handful of keywords), so a
+// contains-scan beats a map in every case that reaches here — and Poll's
+// full-mailbox diff reaches here thousands of times per listing.
 func flagSetEqual(a, b []string) bool {
-	seen := map[string]bool{}
-	for _, f := range a {
-		seen[f] = true
+	if len(a) != len(b) {
+		return false
 	}
-	for _, f := range b {
-		if !seen[f] {
+	for _, f := range a {
+		if !slices.Contains(b, f) {
 			return false
 		}
 	}

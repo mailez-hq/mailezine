@@ -72,6 +72,16 @@ type MailboxStore interface {
 	// mailbox after the given CONDSTORE modseq (QRESYNC VANISHED (EARLIER)
 	// and UID FETCH ... (CHANGEDSINCE ... VANISHED)).
 	ExpungedSince(ctx context.Context, account, mailbox string, sinceModSeq uint64) ([]uint32, error)
+	// MailboxModSeq reports the mailbox's CONDSTORE modseq together with
+	// whether the backend maintains one for this mailbox. It is the cheap
+	// version check behind Poll: the modseq lives in the mailbox document,
+	// so this is a few point lookups instead of the full message listing
+	// MailboxStatus performs. Every visible change (delivery, flag change,
+	// expunge, move) bumps it, so "unchanged since a snapshot" implies the
+	// listing is unchanged too. (0, false) — unsupported backend, vanished
+	// mailbox, or transient lookup failure — tells callers to fall back to
+	// listing, which owns the proper error handling.
+	MailboxModSeq(ctx context.Context, account, mailbox string) (uint64, bool)
 	Copy(ctx context.Context, account, src, dst string, uids []uint32) (map[uint32]uint32, error)
 	Move(ctx context.Context, account, src, dst string, uids []uint32) (map[uint32]uint32, error)
 	OpenMessage(ctx context.Context, account, mailbox string, uid uint32) (io.ReadCloser, error)
