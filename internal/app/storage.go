@@ -67,7 +67,7 @@ func NewStorage(cfg config.Config, logger *slog.Logger) (*Storage, error) {
 // the built-in pair is Pebble KV + local FS blobs; additional backends
 // register their openers into the store registry at init time.
 func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, error) {
-	kvPath, blobRoot := cfg.Storage.RocksPath, cfg.Storage.RocksPath+".blobs"
+	kvPath, blobRoot := cfg.Storage.KVPath, cfg.Storage.KVPath+".blobs"
 
 	var kv store.KV
 	var err error
@@ -141,7 +141,7 @@ func ftsIndexPath(cfg config.Config) string {
 	if p := cfg.FTS.Path; p != "" {
 		return p
 	}
-	return cfg.Storage.RocksPath + ".fts"
+	return cfg.Storage.KVPath + ".fts"
 }
 
 // openFTS opens the embedded bleve index; a corrupt/unusable index disables

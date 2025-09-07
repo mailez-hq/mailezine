@@ -1,7 +1,6 @@
 // PebbleKV is a disk-backed KV implementation over Pebble, a pure-Go LSM
-// (CockroachDB production storage engine). It is the default disk backend in
-// builds without cgo and the development-time stand-in for RocksDB; both
-// satisfy the same KV contract (ARCHITECTURE.md §3.3).
+// (CockroachDB production storage engine). It is the default disk backend;
+// alternate backends satisfy the same KV contract (ARCHITECTURE.md §3.3).
 package store
 
 import (

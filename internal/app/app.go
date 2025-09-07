@@ -353,7 +353,7 @@ func (a *App) openServices(runCtx context.Context) error {
 	if a.cfg.FTS.Enabled {
 		a.fts = openFTS(a.cfg, a.logger)
 		if a.fts == nil && a.cfg.Cluster.Mode == "multi" {
-			return fmt.Errorf("fts: per-node index unavailable at %s (multi-active requires a writable index path; set MAILEZINE_FTS_PATH or MAILEZINE_ROCKS_PATH)", ftsIndexPath(a.cfg))
+			return fmt.Errorf("fts: per-node index unavailable at %s (multi-active requires a writable index path; set MAILEZINE_FTS_PATH or MAILEZINE_KV_PATH)", ftsIndexPath(a.cfg))
 		}
 	}
 	return nil

@@ -88,7 +88,7 @@ mailezine 不依赖 mailez 代码，开发期用本地桩替代目录契约与�
 
 ```powershell
 # 1. 准备数据目录与 dev 桩
-$env:MAILEZINE_ROCKS_PATH     = "data\kv"
+$env:MAILEZINE_KV_PATH     = "data\kv"
 $env:MAILEZINE_DIRECTORY_FILE = "internal/directory/testdata/dev-directory.json"
 $env:MAILEZINE_AUTH_DEV_FILE  = "internal/auth/testdata/dev-passwords.json"
 
@@ -111,7 +111,7 @@ go test ./cmd/mailezine -run TestEndToEnd -v
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MAILEZINE_STORAGE_BACKEND` | `pebble` | 存储后端（社区版：`pebble`） |
-| `MAILEZINE_ROCKS_PATH` | — | pebble 数据路径（必填） |
+| `MAILEZINE_KV_PATH` | — | pebble 数据路径（必填） |
 | `MAILEZINE_DIRECTORY_MODE` / `MAILEZINE_AUTH_MODE` | `dev` | 生产用 `mailez`（走控制面 API） |
 | `MAILEZINE_BACKEND_ADDRESS` | `127.0.0.1:8080` | mailez 控制面地址（目录/认证/DKIM vault） |
 | `MAILEZINE_DIRECTORY_FILE` / `MAILEZINE_AUTH_DEV_FILE` | — | dev 模式目录/口令桩 |

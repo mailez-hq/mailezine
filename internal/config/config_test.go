@@ -14,7 +14,7 @@ func base() Config {
 		Log:            LogConfig{Level: "info", Format: "text"},
 		HealthAddr:     ":11480",
 		Listeners:      ListenersConfig{SMTP: ":1025", Submission: ":1587", IMAP: ":1143", ManageSieve: ":11490", POP3: ":10110"},
-		Storage:        StorageConfig{Backend: "pebble", RocksPath: "./data/rocks"},
+		Storage:        StorageConfig{Backend: "pebble", KVPath: "./data/rocks"},
 		Directory:      DirectoryConfig{Mode: "dev", File: "testdata/directory.json", CacheTTL: 30 * time.Second},
 		Auth:           AuthConfig{Mode: "dev", DevPasswordsFile: "testdata/passwords.json"},
 		BackendAddress: "127.0.0.1:8080",
@@ -34,7 +34,7 @@ func TestValidate(t *testing.T) {
 	})
 	t.Run("pebble requires path", func(t *testing.T) {
 		c := base()
-		c.Storage.RocksPath = ""
+		c.Storage.KVPath = ""
 		if err := c.Validate(); err == nil {
 			t.Fatal("expected error for empty rocks path")
 		}
@@ -48,7 +48,7 @@ func TestValidate(t *testing.T) {
 	})
 	t.Run("implicit TLS addresses parsed", func(t *testing.T) {
 		t.Setenv("MAILEZINE_STORAGE_BACKEND", "pebble")
-		t.Setenv("MAILEZINE_ROCKS_PATH", "/data/rocks")
+		t.Setenv("MAILEZINE_KV_PATH", "/data/rocks")
 		t.Setenv("MAILEZINE_DIRECTORY_FILE", "/data/directory.json")
 		t.Setenv("MAILEZINE_AUTH_DEV_FILE", "/data/passwords.json")
 		t.Setenv("MAILEZINE_SMTPS_ADDR", ":465")
@@ -79,11 +79,11 @@ func TestValidate(t *testing.T) {
 	t.Run("pebble requires path", func(t *testing.T) {
 		c := base()
 		c.Storage.Backend = "pebble"
-		c.Storage.RocksPath = ""
+		c.Storage.KVPath = ""
 		if err := c.Validate(); err == nil {
 			t.Fatal("expected error for pebble without path")
 		}
-		c.Storage.RocksPath = "./data/rocks"
+		c.Storage.KVPath = "./data/rocks"
 		if err := c.Validate(); err != nil {
 			t.Fatalf("valid pebble config rejected: %v", err)
 		}
@@ -157,7 +157,7 @@ func TestValidate(t *testing.T) {
 
 func TestAuthCacheTTLDefaultAndOverride(t *testing.T) {
 	t.Setenv("MAILEZINE_STORAGE_BACKEND", "pebble")
-	t.Setenv("MAILEZINE_ROCKS_PATH", "/data/rocks")
+	t.Setenv("MAILEZINE_KV_PATH", "/data/rocks")
 	t.Setenv("MAILEZINE_DIRECTORY_FILE", "/data/directory.json")
 	t.Setenv("MAILEZINE_AUTH_DEV_FILE", "/data/passwords.json")
 	t.Setenv("MAILEZINE_AUTH_CACHE_TTL", "")
@@ -192,7 +192,7 @@ func TestLoadTOMLOverlay(t *testing.T) {
 	content := `
 MAILEZINE_LOG_LEVEL = "debug"
 MAILEZINE_STORAGE_BACKEND = "pebble"
-MAILEZINE_ROCKS_PATH = "/data/rocks"
+MAILEZINE_KV_PATH = "/data/rocks"
 MAILEZINE_POP3_ENABLED = false
 MAILEZINE_DIRECTORY_FILE = "/conf/directory.json"
 MAILEZINE_AUTH_DEV_FILE = "/conf/passwords.json"
@@ -206,7 +206,7 @@ MAILEZINE_AUTH_DEV_FILE = "/conf/passwords.json"
 		t.Fatal(err)
 	}
 	if cfg.Log.Level != "debug" || cfg.Storage.Backend != "pebble" ||
-		cfg.Storage.RocksPath != "/data/rocks" || cfg.Features.POP3Enabled {
+		cfg.Storage.KVPath != "/data/rocks" || cfg.Features.POP3Enabled {
 		t.Fatalf("toml overlay not applied: %+v", cfg)
 	}
 

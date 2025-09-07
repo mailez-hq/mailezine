@@ -116,7 +116,7 @@ type ListenersConfig struct {
 // StorageConfig selects the storage backend (ARCHITECTURE.md §3).
 type StorageConfig struct {
 	Backend   string // pebble|tidb
-	RocksPath string
+	KVPath string
 	// DSN is the TiDB/MySQL connection string used when Backend is "tidb".
 	DSN string
 	// S3 (MinIO/cloud) blob settings. Empty Endpoint ⇒ local FS blob
@@ -405,7 +405,7 @@ func Load() (Config, error) {
 		},
 		Storage: StorageConfig{
 			Backend:     getenv("MAILEZINE_STORAGE_BACKEND", "pebble"),
-			RocksPath:   getenv("MAILEZINE_ROCKS_PATH", ""),
+			KVPath:      getenv("MAILEZINE_KV_PATH", getenv("MAILEZINE_ROCKS_PATH", "")),
 			DSN:         getenv("MAILEZINE_STORAGE_DSN", ""),
 			S3Endpoint:  getenv("MAILEZINE_S3_ENDPOINT", ""),
 			S3AccessKey: getenv("MAILEZINE_S3_ACCESS_KEY", ""),
@@ -561,8 +561,8 @@ func (c Config) Validate() error {
 	}
 	switch c.Storage.Backend {
 	case "pebble":
-		if c.Storage.RocksPath == "" {
-			return fmt.Errorf("config: storage backend pebble requires MAILEZINE_ROCKS_PATH")
+		if c.Storage.KVPath == "" {
+			return fmt.Errorf("config: storage backend pebble requires MAILEZINE_KV_PATH (legacy MAILEZINE_ROCKS_PATH is still honored)")
 		}
 	case "tidb":
 		if c.Storage.DSN == "" {

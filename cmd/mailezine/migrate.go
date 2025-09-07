@@ -83,7 +83,7 @@ type s3Flags struct {
 func (f s3Flags) storageConfig(backend, path string) config.StorageConfig {
 	return config.StorageConfig{
 		Backend:     backend,
-		RocksPath:   path,
+		KVPath:   path,
 		S3Endpoint:  f.endpoint,
 		S3AccessKey: f.accessKey,
 		S3SecretKey: f.secretKey,
@@ -191,7 +191,7 @@ func targetLabel(c config.StorageConfig) string {
 	if c.Backend == "tidb" {
 		return "tidb (" + c.DSN + ")"
 	}
-	return "pebble (" + c.RocksPath + ")"
+	return "pebble (" + c.KVPath + ")"
 }
 
 func fail(format string, args ...any) int {

@@ -53,7 +53,7 @@ docker run -d --name mailezine-e2e \
 	-e MAILEZINE_AUTH_MODE=mailez \
 	-e MAILEZINE_BACKEND_ADDRESS=host.docker.internal:18081 \
 	-e MAILEZINE_STORAGE_BACKEND=pebble \
-	-e MAILEZINE_ROCKS_PATH=/data/rocks \
+	-e MAILEZINE_KV_PATH=/data/rocks \
 	-e MAILEZINE_OUTBOUND_ENABLED=false \
 	-e MAILEZINE_RSPAMD_URL=http://host.docker.internal:11333/checkv2 \
 	-e MAILEZINE_HEALTH_ADDR=:11480 \

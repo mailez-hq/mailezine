@@ -864,7 +864,7 @@ func writeDevFiles(t *testing.T, dirFile, authFile string) {
 func setTestEnv(t *testing.T, dirFile, authFile, rocksPath, healthAddr, smtpAddr, subAddr string, outbound bool, outboundPort string) {
 	t.Helper()
 	t.Setenv("MAILEZINE_STORAGE_BACKEND", "pebble")
-	t.Setenv("MAILEZINE_ROCKS_PATH", rocksPath)
+	t.Setenv("MAILEZINE_KV_PATH", rocksPath)
 	t.Setenv("MAILEZINE_DIRECTORY_MODE", "dev")
 	t.Setenv("MAILEZINE_DIRECTORY_FILE", dirFile)
 	t.Setenv("MAILEZINE_AUTH_MODE", "dev")

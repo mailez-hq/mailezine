@@ -110,7 +110,7 @@ substitutes for the directory contract and authentication:
 
 ```powershell
 # 1. Prepare the data directory and dev stubs
-$env:MAILEZINE_ROCKS_PATH     = "data\kv"
+$env:MAILEZINE_KV_PATH     = "data\kv"
 $env:MAILEZINE_DIRECTORY_FILE = "internal/directory/testdata/dev-directory.json"
 $env:MAILEZINE_AUTH_DEV_FILE  = "internal/auth/testdata/dev-passwords.json"
 
@@ -134,7 +134,7 @@ Everything can be overridden via environment variables (defaults in
 | Variable | Default | Description |
 |---|---|---|
 | `MAILEZINE_STORAGE_BACKEND` | `pebble` | storage backend (community edition: `pebble`) |
-| `MAILEZINE_ROCKS_PATH` | — | pebble data path (required) |
+| `MAILEZINE_KV_PATH` | — | pebble data path (required) |
 | `MAILEZINE_DIRECTORY_MODE` / `MAILEZINE_AUTH_MODE` | `dev` | use `mailez` in production (control-plane API) |
 | `MAILEZINE_BACKEND_ADDRESS` | `127.0.0.1:8080` | mailez control-plane address (directory/auth/DKIM vault) |
 | `MAILEZINE_DIRECTORY_FILE` / `MAILEZINE_AUTH_DEV_FILE` | — | dev-mode directory/password stubs |

@@ -39,7 +39,7 @@ docker run -d --name "$NAME" \
 	-e MAILEZINE_AUTH_MODE=dev \
 	-e MAILEZINE_AUTH_DEV_FILE=/devdata/dev-passwords.json \
 	-e MAILEZINE_STORAGE_BACKEND=pebble \
-	-e MAILEZINE_ROCKS_PATH=/data/rocks \
+	-e MAILEZINE_KV_PATH=/data/rocks \
 	-v "$devdata_win:/devdata:ro" \
 	"$IMAGE" >/dev/null
 

@@ -53,7 +53,7 @@ docker run -d --name "$ENGINE" \
 	-e MAILEZINE_AUTH_MODE=dev \
 	-e MAILEZINE_AUTH_DEV_FILE=/devdata/dev-passwords.json \
 	-e MAILEZINE_STORAGE_BACKEND=pebble \
-	-e MAILEZINE_ROCKS_PATH=/data/rocks \
+	-e MAILEZINE_KV_PATH=/data/rocks \
 	-e MAILEZINE_OUTBOUND_ENABLED=false \
 	-e MAILEZINE_POP3_ADDR=:10110 \
 	-e MAILEZINE_S3_ENDPOINT=host.docker.internal:19000 \
