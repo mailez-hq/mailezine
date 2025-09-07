@@ -502,10 +502,7 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 			}
 		}
 	}
-	if classifier != nil {
-		// Never assign a typed nil to the interface: an unconfigured
-		// classifier must leave the field nil (delivery fails open).		a.pipeline.Classifier = classifier
-	}
+
 	return a.wireQueue(runCtx)
 }
 

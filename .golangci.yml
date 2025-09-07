@@ -1,0 +1,16 @@
+# golangci-lint configuration (v1 schema).
+# CI runs: go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.64.8 run ./...
+run:
+  timeout: 6m
+  tests: false # test files are reviewed in review; keep the gate on source
+linters:
+  enable:
+    - govet
+    - errcheck
+    - ineffassign
+    - unused
+  disable:
+    - staticcheck # large pre-existing surface; enable after a cleanup pass
+issues:
+  exclude-use-default: false
+  exclude-generated: lax
