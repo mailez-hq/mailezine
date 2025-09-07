@@ -7,7 +7,7 @@
 # production builds would need a separate cgo stage (librocksdb); the KV
 # contract keeps both interchangeable.
 FROM golang:1.26-alpine AS build
-ENV GOPROXY=https://goproxy.cn,direct CGO_ENABLED=0
+ENV GOPROXY=https://goproxy.io,https://proxy.golang.com.cn,direct CGO_ENABLED=0
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
