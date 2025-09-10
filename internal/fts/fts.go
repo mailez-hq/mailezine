@@ -295,9 +295,27 @@ func (ix *Indexer) SearchText(ctx context.Context, account, mailbox string, term
 		}
 		// Latin words keep word/prefix semantics; a single CJK character
 		// prefixes its bigrams (发* matches 发票).
-		pq := bleve.NewPrefixQuery(t)
-		pq.SetField("text")
-		qs = append(qs, pq)
+		//
+		// The term has to be split into index tokens by hand: the unicode
+		// tokenizer the analyzer composes cuts on every non-alphanumeric rune,
+		// and a PrefixQuery built from a term that itself analyzes into
+		// several tokens resolves to no postings at all (silently matching
+		// nothing — "QA-attach" never found "QA-attach-57880"). One prefix
+		// query per token keeps the index a superset of the raw-byte check
+		// the IMAP layer runs afterwards, so a word still matches on a prefix
+		// (attach → attachment) without dropping punctuation-bearing queries.
+		tokens := analyzeCJKQuery(t)
+		if len(tokens) == 0 {
+			// Punctuation-only term: the index holds no token to narrow it
+			// down, so report "unavailable" and let the caller exact-scan
+			// instead of claiming the mailbox has no match.
+			return nil, nil
+		}
+		for _, tok := range tokens {
+			pq := bleve.NewPrefixQuery(tok)
+			pq.SetField("text")
+			qs = append(qs, pq)
+		}
 	}
 	if len(qs) == 1 {
 		return map[uint32]struct{}{}, nil

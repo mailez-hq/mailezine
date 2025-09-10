@@ -105,6 +105,36 @@ func TestPrefixSemantics(t *testing.T) {
 	}
 }
 
+// TestPunctuationTermMatchesIndexedWords: a term the tokenizer splits on
+// punctuation ("QA-attach") must still reach the words of
+// "QA-attach-57880". Building one prefix query from the raw term matched no
+// postings at all, so the IMAP layer's index filter dropped every hit and the
+// search answered "no matches" for text that is literally in the mailbox.
+func TestPunctuationTermMatchesIndexedWords(t *testing.T) {
+	ix := newTestIndex(t)
+	ctx := context.Background()
+	msg := "From: admin@example.com\r\nSubject: QA-attach-57880\r\n\r\nsee attachment\r\n"
+	if err := ix.IndexMessage(ctx, "admin@example.com", "INBOX", 1, []byte(msg)); err != nil {
+		t.Fatal(err)
+	}
+	for _, term := range []string{"QA-attach", "QA-attach-57880", "qa-attach", "attach", "attachment"} {
+		got := searchEventually(t, ix, "admin@example.com", "INBOX", []string{term}, 1)
+		if !mapContains(got, 1) {
+			t.Fatalf("term %q missed the indexed message: %v", term, got)
+		}
+	}
+	// A term holding no indexable token must report "index unavailable" (nil)
+	// so the caller exact-scans the mailbox; an empty candidate set would
+	// instead be read as "definitely no match".
+	got, err := ix.SearchText(ctx, "admin@example.com", "INBOX", []string{"---"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != nil {
+		t.Fatalf("punctuation-only term = %v, want nil so the caller falls back to a scan", got)
+	}
+}
+
 // TestExtractHTMLAndMultipart: HTML markup and attachments must not pollute
 // the index; the visible text is searchable.
 func TestExtractHTMLAndMultipart(t *testing.T) {

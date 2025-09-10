@@ -516,6 +516,40 @@ func TestIMAPEnvelopeUnparseableHeaders(t *testing.T) {
 	}
 }
 
+// TestIMAPEnvelopeMissingDateUsesInternalDate: a message with no Date header
+// must not report the zero time in ENVELOPE. Clients render that literally as
+// year 1 — the webmail list showed "1年1月1日" for such mail — so the arrival
+// time (INTERNALDATE) is reported instead.
+func TestIMAPEnvelopeMissingDateUsesInternalDate(t *testing.T) {
+	c, _ := startTestServer(t)
+	body := "From: sender@remote.test\r\nSubject: no date header\r\n\r\nhello\r\n"
+	arrived := time.Date(2026, 9, 2, 5, 14, 0, 0, time.UTC)
+	cmd := c.Append("INBOX", int64(len(body)), &imap.AppendOptions{Time: arrived})
+	if _, err := cmd.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Close(); err != nil {
+		t.Fatal(err)
+	}
+	appended, err := cmd.Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	fetched, err := c.Fetch(imap.UIDSetNum(appended.UID), &imap.FetchOptions{Envelope: true}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fetched) != 1 || fetched[0].Envelope == nil {
+		t.Fatalf("fetch: %+v", fetched)
+	}
+	if got := fetched[0].Envelope.Date; !got.Equal(arrived) {
+		t.Fatalf("envelope date = %v, want INTERNALDATE %v", got, arrived)
+	}
+}
+
 // TestIMAPBodyStructureFetch verifies ENVELOPE + extended BODYSTRUCTURE on a
 // cache-miss path. Regression: short-variable shadowing left the outer
 // envelope/structure nil and WriteBodyStructure panicked, dropping the

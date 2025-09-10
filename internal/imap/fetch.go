@@ -135,6 +135,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				if env == nil {
 					env = envelopeOf(buf)
 				}
+				// A message whose Date header is missing or unparseable
+				// yields the zero time, which clients render literally as
+				// year 1 (the webmail list showed "1年1月1日"). Fall back to
+				// INTERNALDATE — the arrival time every other client shows
+				// for such mail — so ENVELOPE never carries a bogus date.
+				if env.Date.IsZero() && !msg.InternalDate.IsZero() {
+					env.Date = msg.InternalDate
+				}
 				envRaw = imapserver.EncodeEnvelope(env)
 				s.srv.cache.Put(envKey, envRaw, int64(len(envRaw)))
 			}
