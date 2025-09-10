@@ -776,24 +776,21 @@ func (k *KV) deleteEmail(ctx context.Context, acctID store.AccountID, docID, mbI
 }
 
 // emailsOf lists every Email document of an account, optionally filtered by
-// mailbox, ordered by UID. The unfiltered form is only used for account-wide
-// statistics; per-mailbox callers use mailboxEmails.
+// mailbox, ordered by UID. One range scan over the account's email collection
+// replaces the former per-document read (a full-account listing used to cost
+// one backend query PER message on remote KV backends).
 func (k *KV) emailsOf(ctx context.Context, acctID store.AccountID, mailbox string) ([]*Email, error) {
-	ids, err := k.s.ListDocumentIDs(ctx, acctID, store.CollectionEmail)
-	if err != nil {
-		return nil, err
-	}
 	var out []*Email
-	for _, id := range ids {
-		fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, id)
-		if err != nil {
-			return nil, err
-		}
-		e := emailFromFields(id, fields)
+	err := k.s.ScanDocumentRange(ctx, acctID, store.CollectionEmail, 0, ^uint64(0), func(docID uint64, fields map[byte][]byte) error {
+		e := emailFromFields(docID, fields)
 		if mailbox != "" && e.Mailbox != mailbox {
-			continue
+			return nil
 		}
 		out = append(out, e)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].UID < out[j].UID })
 	return out, nil
@@ -871,28 +868,59 @@ func (k *KV) Reindex(ctx context.Context) (int, error) {
 }
 
 // mailboxEmails lists the messages of one mailbox via the (mbID, UID) →
-// docID secondary index: a bounded prefix scan (the mailbox's own messages,
-// in ascending UID order) plus one document read per message. Stale entries
-// pointing at deleted documents are skipped.
+// docID secondary index. The per-mailbox index scan is one backend query;
+// the documents are then fetched with chunked range scans (ScanDocumentRange)
+// instead of one query per document — on remote KV backends (TiDB) the old
+// per-document loop was the dominant cost of every SELECT/STATUS/folder
+// listing. Stale index entries pointing at deleted documents are skipped.
 func (k *KV) mailboxEmails(ctx context.Context, acctID store.AccountID, mbID uint64) ([]*Email, error) {
-	var out []*Email
+	var docIDs []uint64
 	err := k.s.ScanRaw(ctx, store.IndexEmailPrefix(uint32(acctID), mbID), func(_ []byte, val []byte) error {
 		if len(val) != 8 {
 			return nil
 		}
-		docID := binary.BigEndian.Uint64(val)
-		fields, err := k.s.GetDocumentFields(ctx, acctID, store.CollectionEmail, docID)
-		if errors.Is(err, store.ErrNotFound) {
-			return nil // stale index entry; deletion path cleans it up
-		}
-		if err != nil {
-			return err
-		}
-		out = append(out, emailFromFields(docID, fields))
+		docIDs = append(docIDs, binary.BigEndian.Uint64(val))
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	if len(docIDs) == 0 {
+		return nil, nil
+	}
+	sort.Slice(docIDs, func(i, j int) bool { return docIDs[i] < docIDs[j] })
+
+	byID := make(map[uint64]*Email, len(docIDs))
+	// One range scan per run of docIDs whose ID span is bounded; the extra
+	// non-member documents a span touches are filtered by index membership.
+	const maxSpan = 512
+	for i := 0; i < len(docIDs); {
+		j := i
+		for j+1 < len(docIDs) && docIDs[j+1] <= docIDs[i]+maxSpan {
+			j++
+		}
+		want := make(map[uint64]struct{}, j-i+1)
+		for _, id := range docIDs[i : j+1] {
+			want[id] = struct{}{}
+		}
+		err := k.s.ScanDocumentRange(ctx, acctID, store.CollectionEmail, docIDs[i], docIDs[j], func(docID uint64, fields map[byte][]byte) error {
+			if _, ok := want[docID]; !ok {
+				return nil // another mailbox's email inside the ID range
+			}
+			byID[docID] = emailFromFields(docID, fields)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		i = j + 1
+	}
+
+	out := make([]*Email, 0, len(docIDs))
+	for _, id := range docIDs {
+		if e, ok := byID[id]; ok {
+			out = append(out, e)
+		}
 	}
 	return out, nil
 }

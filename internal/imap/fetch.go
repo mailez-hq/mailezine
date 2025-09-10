@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 
 	"github.com/emersion/go-imap/v2"
 	"github.com/emersion/go-message/textproto"
@@ -48,11 +49,30 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 	if maxSeq > 0 {
 		maxUID = msgs[maxSeq-1].UID
 	}
+	// Collect the matched messages first so their body buffers can be
+	// prefetched in parallel: a cold-cache FETCH burst (mailbox open, list
+	// refresh) otherwise pays one sequential blob round-trip per message —
+	// 50 messages × a blob GET is seconds of wall clock and dominated
+	// mailbox-open latency. Response processing below stays sequential.
+	type fetchItem struct {
+		seq     uint32
+		msg     *mailstore.Message
+		envKey  string
+		bsKey   string
+		env     *imap.Envelope
+		envRaw  string
+		bs      imap.BodyStructure
+		needBuf bool
+		buf     []byte
+		err     error
+	}
+	var items []fetchItem
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
 		if !numMatches(numSet, seq, msg.UID, maxSeq, maxUID) {
 			continue
 		}
+		it := fetchItem{seq: seq, msg: msg}
 		// Envelope and body structure are memoised per (account, mailbox,
 		// uidvalidity, UID); only body sections and cache misses need the
 		// blob. The uidvalidity dimension prevents a delete+recreate of the
@@ -60,49 +80,75 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		// The envelope memo holds the pre-encoded wire payload (see
 		// imapserver.EncodeEnvelope), so a hit is one raw write — no
 		// per-response re-walk of the envelope structure.
-		envKey := s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(s.uidvalidity), 10) + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
-		var env *imap.Envelope
-		var envRaw string
+		it.envKey = s.user + "\x00" + s.mbox + "\x00" + strconv.FormatUint(uint64(s.uidvalidity), 10) + "\x00" + strconv.FormatUint(uint64(msg.UID), 10)
+		it.bsKey = "bs\x00" + it.envKey + "\x00" + strconv.FormatBool(options.BodyStructure != nil && options.BodyStructure.Extended)
 		if options.Envelope {
-			if e, ok := s.srv.cache.Get(envKey); ok {
+			if e, ok := s.srv.cache.Get(it.envKey); ok {
 				switch v := e.(type) {
 				case string:
-					envRaw = v
+					it.envRaw = v
 				case *imap.Envelope:
-					env = v
+					it.env = v
 				}
 			}
 		}
-		bsKey := "bs\x00" + envKey + "\x00" + strconv.FormatBool(options.BodyStructure != nil && options.BodyStructure.Extended)
-		var bs imap.BodyStructure
 		if options.BodyStructure != nil {
-			if b, ok := s.srv.cache.Get(bsKey); ok {
-				bs = b.(imap.BodyStructure)
+			if b, ok := s.srv.cache.Get(it.bsKey); ok {
+				it.bs = b.(imap.BodyStructure)
 			}
 		}
-		needBuf := len(options.BodySection) > 0 || len(options.BinarySection) > 0 ||
+		it.needBuf = len(options.BodySection) > 0 || len(options.BinarySection) > 0 ||
 			len(options.BinarySectionSize) > 0 ||
-			(options.Envelope && env == nil && envRaw == "") ||
-			(options.BodyStructure != nil && bs == nil)
-		var buf []byte
-		if needBuf {
-			rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, msg.UID)
-			if err != nil {
-				// The message vanished between the snapshot and this fetch
-				// (concurrent expunge, or a dangling index entry): RFC 3501
-				// §6.4.8 — omit it from the response instead of failing the
-				// whole command and locking the client out of the mailbox.
-				if errors.Is(err, mailstore.ErrNotFound) {
-					continue
+			(options.Envelope && it.env == nil && it.envRaw == "") ||
+			(options.BodyStructure != nil && it.bs == nil)
+		items = append(items, it)
+	}
+	// Bounded parallel blob prefetch. Buffers are read-only once loaded, so
+	// the sequential processing loop can consume them without extra locks.
+	{
+		const prefetchWorkers = 8
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, prefetchWorkers)
+		for idx := range items {
+			if !items[idx].needBuf {
+				continue
+			}
+			wg.Add(1)
+			go func(it *fetchItem) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, it.msg.UID)
+				if err != nil {
+					it.err = err
+					return
 				}
-				return err
-			}
-			buf, err = io.ReadAll(rc)
-			_ = rc.Close()
-			if err != nil {
-				return err
-			}
+				buf, err := io.ReadAll(rc)
+				_ = rc.Close()
+				it.buf, it.err = buf, err
+			}(&items[idx])
 		}
+		wg.Wait()
+	}
+	for _, it := range items {
+		seq := it.seq
+		msg := it.msg
+		if it.needBuf && it.err != nil {
+			// The message vanished between the snapshot and this fetch
+			// (concurrent expunge, or a dangling index entry): RFC 3501
+			// §6.4.8 — omit it from the response instead of failing the
+			// whole command and locking the client out of the mailbox.
+			if errors.Is(it.err, mailstore.ErrNotFound) {
+				continue
+			}
+			return it.err
+		}
+		envKey := it.envKey
+		bsKey := it.bsKey
+		var env *imap.Envelope = it.env
+		var envRaw string = it.envRaw
+		var bs imap.BodyStructure = it.bs
+		buf := it.buf
 		if markSeen && !mailstore.HasFlag(msg.Flags, "\\Seen") {
 			flags := append([]string(nil), msg.Flags...)
 			flags = append(flags, "\\Seen")
