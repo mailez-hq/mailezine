@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/mail"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emersion/go-imap/v2"
@@ -54,6 +56,28 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 	data := &imap.SearchData{}
 	var allSeq imap.SeqSet
 	var allUID imap.UIDSet
+	// A SEARCH that needs the raw message reads one blob per candidate: on a
+	// 500-message mailbox that measured ~90ms each (45s total). Prefetch the
+	// candidates in parallel under a byte budget; the sequential pass below
+	// stays the only place that decides matches, and anything over budget is
+	// still read lazily, so results are unchanged and only wall-clock drops.
+	var prefetched map[uint32][]byte
+	if len(criteria.Header) > 0 || len(criteria.Text) > 0 || len(criteria.Body) > 0 ||
+		!criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero() {
+		cands := make([]uint32, 0, len(msgs))
+		for _, msg := range msgs {
+			if modSeqAtLeast != 0 && msg.ModSeq < modSeqAtLeast {
+				continue
+			}
+			if ftsCandidates != nil {
+				if _, ok := ftsCandidates[msg.UID]; !ok {
+					continue
+				}
+			}
+			cands = append(cands, msg.UID)
+		}
+		prefetched = s.prefetchBodies(ctx, cands)
+	}
 	maxSeq := uint32(len(msgs))
 	maxUID := maxSeq
 	if maxSeq > 0 {
@@ -70,6 +94,9 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 			}
 		}
 		var bodyCache []byte
+		if prefetched != nil {
+			bodyCache = prefetched[msg.UID]
+		}
 		body := func() ([]byte, error) {
 			if bodyCache != nil {
 				return bodyCache, nil
@@ -123,6 +150,50 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 		data.All = allUID
 	}
 	return data, nil
+}
+
+// prefetchBodies loads candidate message bodies concurrently, bounded by a
+// worker count and a total byte budget. A message that fails to load is simply
+// absent from the map and is read lazily during evaluation.
+func (s *session) prefetchBodies(ctx context.Context, uids []uint32) map[uint32][]byte {
+	const workers = 8
+	const byteBudget = 64 << 20
+	out := make(map[uint32][]byte, len(uids))
+	if len(uids) == 0 {
+		return out
+	}
+	var (
+		wg     sync.WaitGroup
+		mu     sync.Mutex
+		budget atomic.Int64
+		sem    = make(chan struct{}, workers)
+	)
+	for _, uid := range uids {
+		wg.Add(1)
+		go func(uid uint32) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			if budget.Load() > byteBudget {
+				return
+			}
+			rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, uid)
+			if err != nil {
+				return
+			}
+			defer rc.Close()
+			b, err := io.ReadAll(rc)
+			if err != nil {
+				return
+			}
+			budget.Add(int64(len(b)))
+			mu.Lock()
+			out[uid] = b
+			mu.Unlock()
+		}(uid)
+	}
+	wg.Wait()
+	return out
 }
 
 // matchSearch evaluates c against one message. maxSeq/maxUID carry the
