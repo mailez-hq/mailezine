@@ -26,6 +26,15 @@ import (
 // left out so they cannot evict the envelope memo this shares a budget with.
 const maxCachedSectionBytes = 64 << 10
 
+// maxCachedRawBytes caps what the whole-message memo stores. Below it, the
+// buffer answers every later envelope, body-structure and section request for
+// that message; above it the message is large enough that pinning it would
+// crowd out the messages a page actually revisits.
+const maxCachedRawBytes = 256 << 10
+
+// rawKey identifies one message's buffer (immutable, like the sections).
+func rawKey(envKey string) string { return "raw\x00" + envKey }
+
 // sectionsAllCached reports whether every requested body section came from
 // the memo, so none of them needs the message blob.
 func sectionsAllCached(hit []bool) bool {
@@ -175,6 +184,10 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				defer wg.Done()
 				sem <- struct{}{}
 				defer func() { <-sem }()
+				if v, ok := s.srv.raw.Get(rawKey(it.envKey)); ok {
+					it.buf = v.([]byte)
+					return
+				}
 				rc, err := s.srv.Store.OpenMessage(ctx, s.user, s.mbox, it.msg.UID)
 				if err != nil {
 					it.err = err
@@ -183,6 +196,9 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				buf, err := io.ReadAll(rc)
 				_ = rc.Close()
 				it.buf, it.err = buf, err
+				if err == nil && len(buf) > 0 && len(buf) <= maxCachedRawBytes {
+					s.srv.raw.Put(rawKey(it.envKey), buf, int64(len(buf)))
+				}
 			}(&items[idx])
 		}
 		wg.Wait()

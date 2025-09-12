@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
@@ -8,6 +9,55 @@ import (
 	"mailezine/internal/mailstore"
 	"mailezine/internal/store"
 )
+
+// The list path reads every row for its body structure and then reads the same
+// rows again for their preview fragments. The second pass must come from the
+// buffer memo: that duplicate blob read is ~440ms of a cold 50-row page.
+func TestFetchReusesRawBufferForLaterSections(t *testing.T) {
+	cs := &countingStore{MailboxStore: mailstore.NewKV(store.New(store.NewMemoryKV(), store.NewMemoryBlob()))}
+	c := startTestServerWith(t, cs)
+	body := "From: a@example.com\r\nSubject: preview reuse\r\n\r\nhello preview body\r\n"
+	appendMessage(t, c, "INBOX", body, nil)
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	set := imap.SeqSet{imap.SeqRange{Start: 1, Stop: 1}}
+
+	rows, err := c.Fetch(set, &imap.FetchOptions{
+		Envelope:      true,
+		UID:           true,
+		BodyStructure: &imap.FetchItemBodyStructure{},
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierHeader, Peek: true},
+		},
+	}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("row fetch returned %d messages", len(rows))
+	}
+	opens := cs.opened
+	if opens == 0 {
+		t.Fatal("the row fetch must read the message once (body structure needs it)")
+	}
+
+	preview, err := c.Fetch(set, &imap.FetchOptions{
+		UID: true,
+		BodySection: []*imap.FetchItemBodySection{
+			{Specifier: imap.PartSpecifierText, Partial: &imap.SectionPartial{Offset: 0, Size: 64}, Peek: true},
+		},
+	}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cs.opened != opens {
+		t.Fatalf("the preview fetch re-read the blob: %d extra open(s)", cs.opened-opens)
+	}
+	if len(preview) != 1 || !strings.Contains(string(preview[0].BodySection[0].Bytes), "hello preview body") {
+		t.Fatalf("preview fetch returned %d messages: %+v", len(preview), preview)
+	}
+}
 
 // An envelope-only FETCH (exactly what the list's thread scan issues, 300
 // messages at a time) must be answered from the cached header block instead of

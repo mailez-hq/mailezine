@@ -51,6 +51,13 @@ type Server struct {
 	// cache memoizes message-derived data (envelope, body structure) across
 	// sessions. nil disables caching.
 	cache *mailcache.Cache
+	// raw memoizes whole message buffers, so the second read of a message
+	// within (or soon after) one page load does not hit the blob store again:
+	// the list path reads each row for its body structure and then reads the
+	// same rows again for their preview fragments. Separate from cache on
+	// purpose — bodies are orders of magnitude larger than the metadata
+	// entries, and sharing one budget would let a burst of mail evict them.
+	raw *mailcache.Cache
 }
 
 // New builds the go-imap server. TLS is terminated by the mailez gateway,
@@ -66,6 +73,9 @@ func New(s *Server) *imapserver.Server {
 	}
 	if s.cache == nil {
 		s.cache = mailcache.NewCache(s.CacheSizeBytes)
+	}
+	if s.raw == nil {
+		s.raw = mailcache.NewCache(s.CacheSizeBytes)
 	}
 	caps := imap.CapSet{
 		imap.CapIMAP4rev1: {},
