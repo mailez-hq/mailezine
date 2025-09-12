@@ -33,6 +33,7 @@ import (
 
 	"mailezine/internal/accountgate"
 	"mailezine/internal/auth"
+	"mailezine/internal/burn"
 	"mailezine/internal/config"
 	"mailezine/internal/delivery"
 	"mailezine/internal/directory"
@@ -482,6 +483,31 @@ func (a *App) wirePipeline(runCtx context.Context) error {
 		} else {
 			go sw.Run(runCtx, interval)
 			a.logger.Info("snooze sweeper", "interval", a.cfg.SnoozeInterval)
+		}
+		// Burn-after-read sweeper: withholding the body from API clients is not
+		// destruction, so once the reveal window has passed the message is
+		// replaced by a stub and the original deleted (the blob GC then
+		// reclaims the content). Same cadence and leasing rules as snooze:
+		// exactly one node sweeps in multi mode.
+		bw := &burn.Sweeper{
+			Accounts: func(ctx context.Context) ([]string, error) { return a.st.Facade().ListAccounts(ctx) },
+			Store:    a.st.mailbox,
+			Notify:   a.notifyClient,
+			Logger:   a.logger,
+		}
+		if a.cfg.Cluster.Mode == "multi" {
+			// Same lease-length rule as the snooze sweeper (it must cover at
+			// least two sweep intervals, or the lease flaps between sweeps).
+			burnTTL := 2 * interval
+			if burnTTL < 90*time.Second {
+				burnTTL = 90 * time.Second
+			}
+			l := kvlease.New(a.st.kv, "burn-sweeper", a.nodeID(), burnTTL)
+			go l.Run(runCtx, interval, func(ctx context.Context) { bw.SweepOnce(ctx) })
+			a.logger.Info("burn sweeper", "interval", a.cfg.SnoozeInterval, "leased", true)
+		} else {
+			go bw.Run(runCtx, interval)
+			a.logger.Info("burn sweeper", "interval", a.cfg.SnoozeInterval)
 		}
 	}
 	{
