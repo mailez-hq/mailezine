@@ -894,23 +894,34 @@ func (k *KV) Reindex(ctx context.Context) (int, error) {
 				}
 				fixed++
 			}
-			// Header block → envelope fetches skip the blob (see headerBlock).
-			// Only documents that predate the field are touched, and an empty
-			// value records "no usable header block" so a message is never read
-			// twice. Oversized messages are deliberately left on the blob path:
-			// pulling a 20MB body back to cache 2KB of headers costs more than
-			// the one read its envelope needs.
-			if _, ok := fields[fieldHead]; !ok {
-				head := []byte(nil)
-				if e.Size <= 1<<20 {
+			// The payloads a list row needs — the header block (envelopes) and
+			// the non-extended body structure — are computed at delivery and
+			// cached in the document. Documents written before them get one
+			// read of their blob here to fill whichever is missing; an empty
+			// value records "not usable", so no message is read twice.
+			// Oversized messages are deliberately left on the blob path:
+			// pulling a 20MB body back to cache a couple of KB costs more than
+			// the reads it would save.
+			_, haveHead := fields[fieldHead]
+			_, haveBody := fields[fieldBody]
+			if !haveHead || !haveBody {
+				var raw []byte
+				if e.Size <= maxStructuredMessageBytes {
 					var buf bytes.Buffer
 					if err := k.s.GetBlob(ctx, e.BlobID, &buf); err == nil {
-						head = headerBlock(buf.Bytes())
+						raw = buf.Bytes()
 					} else if !errors.Is(err, store.ErrNotFound) {
 						return fixed, err
 					}
 				}
-				if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionEmail, id, map[byte][]byte{fieldHead: head}); err != nil {
+				fill := map[byte][]byte{}
+				if !haveHead {
+					fill[fieldHead] = headerBlock(raw)
+				}
+				if !haveBody {
+					fill[fieldBody] = bodyStructure(raw)
+				}
+				if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionEmail, id, fill); err != nil {
 					return fixed, err
 				}
 				fixed++
@@ -983,6 +994,7 @@ func messageFromEmail(e *Email) *Message {
 		UID:  e.UID,
 		From: e.From,
 		Head: e.Head,
+		Body: e.Body,
 		// Match the maildir backend: keywords are exposed through Flags so
 		// FETCH and SEARCH (KEYWORD) see them; SetFlags re-splits them.
 		Flags:        append(append([]string(nil), e.Flags...), e.Keywords...),

@@ -41,6 +41,15 @@ const (
 	// read the whole message blob. Absent on documents written before it
 	// existed; empty means "no usable header block" (see mailstore).
 	EmailFieldHeader byte = 10
+	// 11 is reserved: an unreleased build cached the non-extended BODY form
+	// there. The cached form is the extended BODYSTRUCTURE one, and reusing the
+	// id would let a stale payload be replayed as an extended structure.
+	//
+	// EmailFieldBodyStructureExt is the message's body structure in its
+	// extended BODYSTRUCTURE form, cached at delivery so callers can report it
+	// without reading the whole message blob. Absent on documents written
+	// before it existed; empty means "not cached" (see mailstore).
+	EmailFieldBodyStructureExt byte = 12
 )
 
 // Store is a KV+Blob facade exposing account-scoped operations. It is safe

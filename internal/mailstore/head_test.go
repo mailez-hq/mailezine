@@ -64,6 +64,50 @@ func TestHeaderBlockShapes(t *testing.T) {
 	}
 }
 
+// Delivery also caches the non-extended body structure, which is what a list
+// row reports instead of reading the message.
+func TestDeliverCachesBodyStructure(t *testing.T) {
+	ctx := t.Context()
+	kv := NewKV(store.New(store.NewMemoryKV(), store.NewMemoryBlob()))
+	raw := "From: a@example.com\r\nSubject: bs\r\nMIME-Version: 1.0\r\n" +
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n" +
+		"--b\r\nContent-Type: text/plain\r\n\r\nbody\r\n" +
+		"--b\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nAAEC\r\n" +
+		"--b--\r\n"
+	if _, err := kv.Deliver(ctx, "alice@example.com", "INBOX", &Message{Data: []byte(raw)}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := kv.ListMessages(ctx, "alice@example.com", "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("messages = %d", len(msgs))
+	}
+	got := string(msgs[0].Body)
+	if !strings.HasPrefix(got, `(("text" "plain"`) || !strings.Contains(got, `"mixed"`) {
+		t.Fatalf("cached body structure = %q", got)
+	}
+	if !strings.Contains(got, `"octet-stream"`) {
+		t.Fatalf("cached body structure lost the attachment part: %q", got)
+	}
+	// A message too large to parse on the delivery path stays on the blob.
+	big := make([]byte, maxStructuredMessageBytes+1)
+	copy(big, []byte("Subject: big\r\n\r\n"))
+	if _, err := kv.Deliver(ctx, "alice@example.com", "INBOX", &Message{Data: big}); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err = kv.ListMessages(ctx, "alice@example.com", "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range msgs {
+		if m.UID == 2 && len(m.Body) != 0 {
+			t.Fatalf("oversized message must not cache a structure: %q", m.Body)
+		}
+	}
+}
+
 // Reindex is the migration path for messages written before the header block
 // existed: it fills the field once, from the blob, and leaves it alone after.
 func TestReindexBackfillsHeaderBlock(t *testing.T) {
@@ -118,6 +162,9 @@ func TestReindexBackfillsHeaderBlock(t *testing.T) {
 	}
 	if string(msgs[0].Head) != headWant {
 		t.Fatalf("backfilled head = %q, want %q", msgs[0].Head, headWant)
+	}
+	if len(msgs[0].Body) == 0 || !strings.HasPrefix(string(msgs[0].Body), `("text" "plain"`) {
+		t.Fatalf("backfilled body structure = %q", msgs[0].Body)
 	}
 	if n, err := kv.Reindex(ctx); err != nil {
 		t.Fatal(err)

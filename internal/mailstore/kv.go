@@ -16,6 +16,11 @@ import (
 	"sync"
 	"time"
 
+	// imapserver renders the wire forms cached below. The store is the one
+	// place every message write passes through (delivery, APPEND, copy/move),
+	// so the metadata a list row needs is computed here rather than at each of
+	// those call sites.
+	"mailezine/internal/imapserver"
 	"mailezine/internal/store"
 )
 
@@ -42,6 +47,7 @@ const (
 	fieldKeywords = store.EmailFieldKeywords
 	fieldModSeq   = store.EmailFieldModSeq
 	fieldHead     = store.EmailFieldHeader
+	fieldBody     = store.EmailFieldBodyStructureExt
 )
 
 // Mailbox document fields (CollectionMailbox).
@@ -360,6 +366,7 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 		fieldSize:     beUint64(uint64(size)),
 		fieldKeywords: []byte(strings.Join(keywords, ",")),
 		fieldHead:     headerBlock(data),
+		fieldBody:     bodyStructure(data),
 	}
 	// Delivery micro-batch: join (or lead) a per-account batch so a burst
 	// of arrivals commits in ONE transaction/fsync. Idle traffic keeps the
@@ -522,6 +529,7 @@ type Email struct {
 	Size     int64
 	BlobID   string
 	Head     []byte // cached header block; nil when not usable (see headerBlock)
+	Body     []byte // cached non-extended body structure; nil when not cached
 	ModSeq   uint64 // CONDSTORE: last change sequence of this message
 }
 
@@ -580,6 +588,7 @@ func emailFromFields(docID uint64, fields map[byte][]byte) *Email {
 		e.ModSeq = binary.BigEndian.Uint64(fields[fieldModSeq])
 	}
 	e.Head = fields[fieldHead]
+	e.Body = fields[fieldBody]
 	return e
 }
 
@@ -607,6 +616,32 @@ func headerBlock(data []byte) []byte {
 		return head[:i+2]
 	}
 	return nil
+}
+
+// maxStructuredMessageBytes bounds what delivery will parse for its cached
+// body structure. A bigger message (attachments in the tens of MB) is left on
+// the blob path: the parse would walk the whole body on the delivery critical
+// path to save one read on a page that shows it once.
+const maxStructuredMessageBytes = 1 << 20
+
+// bodyStructure returns the message's IMAP body structure — the BODYSTRUCTURE
+// (extended) form, which is what go-imap clients ask for and what carries the
+// disposition/params a caller needs to spot attachments — in the exact bytes a
+// FETCH would put on the wire, or nil when it is not worth caching. It spares
+// the whole-message walk a structure costs in the engine: the webmail list
+// hydrates every row with one, and a search result hydrates one per hit (a
+// 479-hit search measured ~6s of them). The store is the one place every
+// writer passes through (delivery, APPEND, copy/move), which is why it is
+// computed here.
+func bodyStructure(data []byte) []byte {
+	if len(data) == 0 || len(data) > maxStructuredMessageBytes {
+		return nil
+	}
+	payload := imapserver.EncodeBodyStructure(imapserver.ExtractBodyStructure(bytes.NewReader(data)), true)
+	if payload == "" {
+		return nil
+	}
+	return []byte(payload)
 }
 
 func splitCSV(b []byte) []string {

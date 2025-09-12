@@ -19,7 +19,11 @@ type Message struct {
 	// it), filled by the store on delivery and on read when it is cached.
 	// Fetchers build envelopes from it instead of reading the whole blob; nil
 	// means the caller must fall back to Data/the blob.
-	Head         []byte
+	Head []byte
+	// Body is the message's non-extended body structure in IMAP wire form,
+	// cached alongside Head. Fetchers replay it for a row's BODY item; nil
+	// means the structure has to come from the blob.
+	Body         []byte
 	UID          uint32 // 0 = allocate the next UID
 	Seen         bool
 	Flags        []string // canonical IMAP flags (\Seen, \Answered, …)

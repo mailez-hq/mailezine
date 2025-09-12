@@ -106,6 +106,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		env     *imap.Envelope
 		envRaw  string
 		bs      imap.BodyStructure
+		bsRaw   string
 		secHit  []bool
 		secBuf  [][]byte
 		needBuf bool
@@ -142,6 +143,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			if b, ok := s.srv.cache.Get(it.bsKey); ok {
 				it.bs = b.(imap.BodyStructure)
 			}
+			// The store caches the BODYSTRUCTURE (extended) form at delivery,
+			// which is the shape go-imap clients ask for. Replaying it spares
+			// the whole-message walk: a search hydrates one per hit, so a
+			// 479-hit query was ~6s of structure reads. A client asking for
+			// the non-extended BODY still walks the message.
+			if options.BodyStructure.Extended && len(it.msg.Body) > 0 {
+				it.bsRaw = string(it.msg.Body)
+			}
 		}
 		// Body sections are memoised as well: their bytes are content, and
 		// content is immutable for a given (account, mailbox, uidvalidity,
@@ -166,7 +175,7 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			// what keeps the list's thread scan (300 envelopes, no sections)
 			// off the blob store entirely.
 			(options.Envelope && it.env == nil && it.envRaw == "" && len(it.msg.Head) == 0) ||
-			(options.BodyStructure != nil && it.bs == nil)
+			(options.BodyStructure != nil && it.bs == nil && it.bsRaw == "")
 		items = append(items, it)
 	}
 	// Bounded parallel blob prefetch. Buffers are read-only once loaded, so
@@ -272,11 +281,16 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			rw.WriteEnvelopeRaw(envRaw)
 		}
 		if options.BodyStructure != nil {
-			if bs == nil {
+			switch {
+			case bs != nil:
+				rw.WriteBodyStructure(bs)
+			case it.bsRaw != "":
+				rw.WriteBodyStructureRaw(it.bsRaw, true)
+			default:
 				bs = imapserver.ExtractBodyStructure(bytes.NewReader(buf))
 				s.srv.cache.Put(bsKey, bs, 2048)
+				rw.WriteBodyStructure(bs)
 			}
-			rw.WriteBodyStructure(bs)
 		}
 		for i, bs := range options.BodySection {
 			section := it.secBuf[i]

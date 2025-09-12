@@ -551,10 +551,52 @@ func EncodeEnvelope(envelope *imap.Envelope) string {
 // WriteBodyStructure writes the message's body structure (either BODYSTRUCTURE
 // or BODY).
 func (w *FetchResponseWriter) WriteBodyStructure(bs imap.BodyStructure) {
-	// Defensive normalization: the extended metadata must always be present
-	// when BODYSTRUCTURE is written. A nil Extended (e.g. a structure that
-	// came from a non-extended parse) must not panic and drop the connection;
-	// synthesize empty extended fields instead.
+	bs = normalizeBodyStructure(bs)
+	if w.options.bodyStructure.nonExtended {
+		w.writeBodyStructure(bs, false)
+	}
+
+	if w.options.bodyStructure.extended {
+		w.writeBodyStructure(bs, true)
+	}
+}
+
+// WriteBodyStructureRaw replays a payload produced by EncodeBodyStructure,
+// sparing the server a re-walk of the structure per message (the list path
+// asks for it for every row of every page). extended picks the item name, and
+// must be the one the payload was encoded for.
+func (w *FetchResponseWriter) WriteBodyStructureRaw(payload string, extended bool) {
+	item := "BODY"
+	if extended {
+		item = "BODYSTRUCTURE"
+	}
+	w.writeItemSep()
+	w.enc.Atom(item).SP().RawString(payload)
+}
+
+// EncodeBodyStructure renders the parenthesized BODY/BODYSTRUCTURE payload for
+// bs as raw IMAP bytes, ready for WriteBodyStructureRaw. It shares the writer
+// the live path uses, so the two cannot drift apart, and it keeps UTF8 off
+// like EncodeEnvelope: the payload is memoized across connections, so it must
+// stay valid for clients that never enabled UTF8=ACCEPT.
+func EncodeBodyStructure(bs imap.BodyStructure, extended bool) string {
+	bs = normalizeBodyStructure(bs)
+	var sb strings.Builder
+	bw := bufio.NewWriter(&sb)
+	enc := imapwire.NewEncoder(bw, imapwire.ConnSideServer)
+	writeBodyStructure(enc, bs, extended)
+	if err := bw.Flush(); err != nil {
+		// An in-memory writer cannot fail; fall back to empty and let the
+		// caller re-encode live rather than serve a truncated payload.
+		return ""
+	}
+	return sb.String()
+}
+
+// normalizeBodyStructure guarantees the extended metadata exists before a
+// BODYSTRUCTURE is written: a structure that came from a non-extended parse
+// has nil Extended, which must not panic and drop the connection.
+func normalizeBodyStructure(bs imap.BodyStructure) imap.BodyStructure {
 	switch b := bs.(type) {
 	case *imap.BodyStructureSinglePart:
 		if b.Extended == nil {
@@ -565,14 +607,7 @@ func (w *FetchResponseWriter) WriteBodyStructure(bs imap.BodyStructure) {
 			b.Extended = &imap.BodyStructureMultiPartExt{}
 		}
 	}
-
-	if w.options.bodyStructure.nonExtended {
-		w.writeBodyStructure(bs, false)
-	}
-
-	if w.options.bodyStructure.extended {
-		w.writeBodyStructure(bs, true)
-	}
+	return bs
 }
 
 func (w *FetchResponseWriter) writeBodyStructure(bs imap.BodyStructure, extended bool) {
