@@ -274,7 +274,18 @@ func (s *session) List(w *imapserver.ListWriter, ref string, patterns []string, 
 }
 
 func (s *session) Status(mailbox string, options *imap.StatusOptions) (*imap.StatusData, error) {
-	mb, err := s.srv.Store.MailboxStatus(context.Background(), s.user, mailbox)
+	ctx := context.Background()
+	// Counters (MESSAGES/UNSEEN/DELETED/SIZE) are the only items that need the
+	// mailbox-wide walk MailboxStatus performs. A caller asking for identity or
+	// the CONDSTORE version — the push watcher asks for HIGHESTMODSEQ once per
+	// watched folder per tick — gets the point-lookup path instead.
+	var mb mailstore.Mailbox
+	var err error
+	if options.NumMessages || options.NumUnseen || options.NumDeleted || options.Size {
+		mb, err = s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
+	} else {
+		mb, err = s.mailboxMeta(ctx, mailbox)
+	}
 	if err != nil {
 		if errors.Is(err, mailstore.ErrNotFound) {
 			return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeNonExistent, Text: "No such mailbox"}
@@ -316,7 +327,9 @@ func (s *session) Append(mailbox string, r imap.LiteralReader, options *imap.App
 			s.srv.Logger.Error("imap: fts index", "mailbox", mailbox, "uid", uid, "err", err)
 		}
 	}
-	st, err := s.srv.Store.MailboxStatus(context.Background(), s.user, mailbox)
+	// Only UIDVALIDITY is reported back, so the metadata path is enough — no
+	// reason to walk the mailbox just to append to it.
+	st, err := s.mailboxMeta(context.Background(), mailbox)
 	if err != nil {
 		return nil, err
 	}
@@ -708,6 +721,9 @@ func statusData(mb *mailstore.Mailbox, options *imap.StatusOptions) *imap.Status
 	if options.NumRecent {
 		n := uint32(0)
 		data.NumRecent = &n
+	}
+	if options.HighestModSeq {
+		data.HighestModSeq = mb.HighestModSeq
 	}
 	return &data
 }
