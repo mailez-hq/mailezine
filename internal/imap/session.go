@@ -126,7 +126,7 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	// Poll): the listing may then include changes newer than the captured
 	// value, which costs a spurious diff later — never a skipped one.
 	modSeq, gated := s.srv.Store.MailboxModSeq(ctx, s.user, mailbox)
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, mailbox)
+	msgs, err := s.mailboxListAt(ctx, mailbox, st.UIDValidity, modSeq, gated)
 	if err != nil {
 		return nil, err
 	}
@@ -352,7 +352,7 @@ func (s *session) Poll(w *imapserver.UpdateWriter, allowExpunge bool) error {
 			return nil
 		}
 	}
-	current, err := s.srv.Store.ListMessages(context.Background(), s.user, s.mbox)
+	current, err := s.mailboxListAt(context.Background(), s.mbox, s.uidvalidity, modSeq, gated)
 	if err != nil {
 		if errors.Is(err, mailstore.ErrNotFound) {
 			// The selected mailbox vanished from under this session — most
@@ -480,7 +480,7 @@ func (s *session) refreshSnapshot(ctx context.Context) error {
 	if s.modseqGated {
 		modSeq, gated = s.srv.Store.MailboxModSeq(ctx, s.user, s.mbox)
 	}
-	msgs, err := s.srv.Store.ListMessages(ctx, s.user, s.mbox)
+	msgs, err := s.mailboxListAt(ctx, s.mbox, s.uidvalidity, modSeq, gated)
 	if err != nil {
 		return err
 	}
