@@ -61,9 +61,15 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 	// candidates in parallel under a byte budget; the sequential pass below
 	// stays the only place that decides matches, and anything over budget is
 	// still read lazily, so results are unchanged and only wall-clock drops.
+	//
+	// Header conditions (SUBJECT/FROM/HEADER/…, and the sent-date range) need
+	// only the header block, which the store caches at delivery — those
+	// searches read no candidate bodies at all, and only fall back to the
+	// blob for the messages that have no cached block.
+	needsBody := len(criteria.Text) > 0 || len(criteria.Body) > 0
+	needsHeader := len(criteria.Header) > 0 || !criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero()
 	var prefetched map[uint32][]byte
-	if len(criteria.Header) > 0 || len(criteria.Text) > 0 || len(criteria.Body) > 0 ||
-		!criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero() {
+	if needsBody || needsHeader {
 		cands := make([]uint32, 0, len(msgs))
 		for _, msg := range msgs {
 			if modSeqAtLeast != 0 && msg.ModSeq < modSeqAtLeast {
@@ -74,9 +80,16 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 					continue
 				}
 			}
+			// Header-only searches have nothing to read for a message whose
+			// header block is already cached.
+			if !needsBody && len(msg.Head) > 0 {
+				continue
+			}
 			cands = append(cands, msg.UID)
 		}
-		prefetched = s.prefetchBodies(ctx, cands)
+		if len(cands) > 0 {
+			prefetched = s.prefetchBodies(ctx, cands)
+		}
 	}
 	maxSeq := uint32(len(msgs))
 	maxUID := maxSeq
@@ -230,11 +243,23 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, max
 		return false, nil
 	}
 	if len(c.Header) > 0 || len(c.Text) > 0 || len(c.Body) > 0 || !c.SentSince.IsZero() || !c.SentBefore.IsZero() {
-		buf, err := body()
-		if err != nil {
-			return false, err
+		needsBody := len(c.Text) > 0 || len(c.Body) > 0
+		// The header block the store cached at delivery answers every header
+		// condition (and the sent-date range) without a blob read; TEXT/BODY
+		// still need the raw message, and so does a message with no cached
+		// block.
+		hdr := msg.Head
+		var buf []byte
+		if needsBody || len(hdr) == 0 {
+			b, err := body()
+			if err != nil {
+				return false, err
+			}
+			buf = b
+			if len(hdr) == 0 {
+				hdr = headerBlock(buf)
+			}
 		}
-		hdr := headerBlock(buf)
 		for _, h := range c.Header {
 			if !matchHeader(hdr, h.Key, h.Value) {
 				return false, nil
@@ -249,16 +274,20 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, max
 				return false, nil
 			}
 		}
-		raw := string(buf)
-		for _, text := range c.Text {
-			if !strings.Contains(strings.ToLower(raw), strings.ToLower(text)) {
-				return false, nil
+		if len(c.Text) > 0 {
+			raw := strings.ToLower(string(buf))
+			for _, text := range c.Text {
+				if !strings.Contains(raw, strings.ToLower(text)) {
+					return false, nil
+				}
 			}
 		}
-		bp := bodyPart(buf)
-		for _, pat := range c.Body {
-			if !strings.Contains(strings.ToLower(bp), strings.ToLower(pat)) {
-				return false, nil
+		if len(c.Body) > 0 {
+			bp := strings.ToLower(string(bodyPart(buf)))
+			for _, pat := range c.Body {
+				if !strings.Contains(bp, strings.ToLower(pat)) {
+					return false, nil
+				}
 			}
 		}
 	}
