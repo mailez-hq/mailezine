@@ -100,7 +100,13 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 				continue
 			}
 			for _, msg := range msgs {
-				until, ok := UntilFromKeywords(msg.Keywords)
+				// The control plane writes the burn keywords over IMAP; depending
+				// on the store path they land in Flags or Keywords (the API
+				// reports them as $burnread / $burnreaduntil-…), so match both.
+				keys := make([]string, 0, len(msg.Flags)+len(msg.Keywords))
+				keys = append(keys, msg.Flags...)
+				keys = append(keys, msg.Keywords...)
+				until, ok := UntilFromKeywords(keys)
 				if !ok || until.After(now) {
 					continue
 				}
