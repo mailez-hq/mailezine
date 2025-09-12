@@ -89,6 +89,30 @@ func TestSearchHeaderReadsNoBlobs(t *testing.T) {
 	if !sameUIDs(allUIDs(data), []uint32{1, 2}) {
 		t.Fatalf("TEXT search uids = %v, want [1 2]", allUIDs(data))
 	}
+
+	// TEXT that hits inside the header block (the common keyword case: a
+	// subject or sender word) is conclusive without reading that message's
+	// body. Only message 2 — whose header does not carry the word — has to be
+	// read to rule it out, so exactly one blob is opened instead of three.
+	before = cs.opened
+	data, err = cached.UIDSearch(&imap.SearchCriteria{Text: []string{"quarterly"}}, nil).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cs.opened - before; got != 1 {
+		t.Fatalf("a header-hit TEXT search opened %d blob(s), want 1 (only the message whose header lacks the word)", got)
+	}
+	if !sameUIDs(allUIDs(data), []uint32{1, 3}) {
+		t.Fatalf("header-hit TEXT search uids = %v, want [1 3]", allUIDs(data))
+	}
+	// The same query against a store with no cached blocks must agree.
+	walkedData, err := walked.UIDSearch(&imap.SearchCriteria{Text: []string{"quarterly"}}, nil).Wait()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameUIDs(allUIDs(walkedData), []uint32{1, 3}) {
+		t.Fatalf("walked header-hit TEXT search uids = %v, want [1 3]", allUIDs(walkedData))
+	}
 }
 
 // allUIDs flattens a UID SEARCH result into ascending UIDs (the server sends

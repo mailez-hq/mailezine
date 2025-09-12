@@ -65,8 +65,12 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 	// Header conditions (SUBJECT/FROM/HEADER/…, and the sent-date range) need
 	// only the header block, which the store caches at delivery — those
 	// searches read no candidate bodies at all, and only fall back to the
-	// blob for the messages that have no cached block.
-	needsBody := len(criteria.Text) > 0 || len(criteria.Body) > 0
+	// blob for the messages that have no cached block. TEXT is answered by
+	// the block too whenever it hits inside it (see matchSearch), which is the
+	// usual case for a keyword search: without that, every hit's body is read
+	// just to confirm a subject match.
+	bodyOnly := len(criteria.Body) > 0
+	needsBody := len(criteria.Text) > 0 || bodyOnly
 	needsHeader := len(criteria.Header) > 0 || !criteria.SentSince.IsZero() || !criteria.SentBefore.IsZero()
 	var prefetched map[uint32][]byte
 	if needsBody || needsHeader {
@@ -80,9 +84,10 @@ func (s *session) searchImpl(kind imapserver.NumKind, criteria *imap.SearchCrite
 					continue
 				}
 			}
-			// Header-only searches have nothing to read for a message whose
-			// header block is already cached.
-			if !needsBody && len(msg.Head) > 0 {
+			// Nothing to read when the cached header block already answers
+			// everything this search needs from the message.
+			headerAnswers := len(criteria.Text) == 0 || textInHeaderBlock(msg.Head, criteria.Text)
+			if !bodyOnly && len(msg.Head) > 0 && headerAnswers {
 				continue
 			}
 			cands = append(cands, msg.UID)
@@ -243,22 +248,15 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, max
 		return false, nil
 	}
 	if len(c.Header) > 0 || len(c.Text) > 0 || len(c.Body) > 0 || !c.SentSince.IsZero() || !c.SentBefore.IsZero() {
-		needsBody := len(c.Text) > 0 || len(c.Body) > 0
 		// The header block the store cached at delivery answers every header
-		// condition (and the sent-date range) without a blob read; TEXT/BODY
-		// still need the raw message, and so does a message with no cached
-		// block.
+		// condition (and the sent-date range) without a blob read.
 		hdr := msg.Head
-		var buf []byte
-		if needsBody || len(hdr) == 0 {
+		if len(hdr) == 0 {
 			b, err := body()
 			if err != nil {
 				return false, err
 			}
-			buf = b
-			if len(hdr) == 0 {
-				hdr = headerBlock(buf)
-			}
+			hdr = headerBlock(b)
 		}
 		for _, h := range c.Header {
 			if !matchHeader(hdr, h.Key, h.Value) {
@@ -274,19 +272,30 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, max
 				return false, nil
 			}
 		}
-		if len(c.Text) > 0 {
-			raw := strings.ToLower(string(buf))
-			for _, text := range c.Text {
-				if !strings.Contains(raw, strings.ToLower(text)) {
-					return false, nil
+		// TEXT matches anywhere in the message and the header block is a
+		// prefix of it, so a hit inside the block is conclusive: the body is
+		// read only when some pattern is not already in the header. BODY
+		// always needs the raw message.
+		needRaw := len(c.Body) > 0 || (len(c.Text) > 0 && !textInHeaderBlock(hdr, c.Text))
+		if needRaw {
+			b, err := body()
+			if err != nil {
+				return false, err
+			}
+			if len(c.Text) > 0 {
+				raw := strings.ToLower(string(b))
+				for _, text := range c.Text {
+					if !strings.Contains(raw, strings.ToLower(text)) {
+						return false, nil
+					}
 				}
 			}
-		}
-		if len(c.Body) > 0 {
-			bp := strings.ToLower(string(bodyPart(buf)))
-			for _, pat := range c.Body {
-				if !strings.Contains(bp, strings.ToLower(pat)) {
-					return false, nil
+			if len(c.Body) > 0 {
+				bp := strings.ToLower(string(bodyPart(b)))
+				for _, pat := range c.Body {
+					if !strings.Contains(bp, strings.ToLower(pat)) {
+						return false, nil
+					}
 				}
 			}
 		}
@@ -337,6 +346,23 @@ func bodyPart(buf []byte) string {
 		return string(buf[i+4:])
 	}
 	return ""
+}
+
+// textInHeaderBlock reports whether every TEXT pattern already appears in the
+// cached header block. A hit there is conclusive for TEXT (which matches
+// anywhere in the message, and the block is a prefix of it), so the caller can
+// skip reading the body. An absent block means "unknown", never "no match".
+func textInHeaderBlock(head []byte, texts []string) bool {
+	if len(head) == 0 || len(texts) == 0 {
+		return false
+	}
+	lower := strings.ToLower(string(head))
+	for _, t := range texts {
+		if !strings.Contains(lower, strings.ToLower(t)) {
+			return false
+		}
+	}
+	return true
 }
 
 func matchHeader(block []byte, key, pattern string) bool {
