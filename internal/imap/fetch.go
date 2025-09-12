@@ -153,7 +153,10 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		it.needBuf = len(options.BinarySection) > 0 ||
 			len(options.BinarySectionSize) > 0 ||
 			!sectionsAllCached(it.secHit) ||
-			(options.Envelope && it.env == nil && it.envRaw == "") ||
+			// A cached header block answers the envelope on its own, which is
+			// what keeps the list's thread scan (300 envelopes, no sections)
+			// off the blob store entirely.
+			(options.Envelope && it.env == nil && it.envRaw == "" && len(it.msg.Head) == 0) ||
 			(options.BodyStructure != nil && it.bs == nil)
 		items = append(items, it)
 	}
@@ -233,7 +236,11 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		if options.Envelope {
 			if envRaw == "" {
 				if env == nil {
-					env = envelopeOf(buf)
+					src := buf
+					if len(it.msg.Head) > 0 {
+						src = it.msg.Head
+					}
+					env = envelopeOf(src)
 				}
 				// A message whose Date header is missing or unparseable
 				// yields the zero time, which clients render literally as

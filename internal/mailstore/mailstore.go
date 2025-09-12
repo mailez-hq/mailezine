@@ -12,9 +12,14 @@ import (
 
 // Message is one copy of a delivered message.
 type Message struct {
-	From         string
-	To           []string
-	Data         []byte
+	From string
+	To   []string
+	Data []byte
+	// Head is the message's header block (through the blank line that ends
+	// it), filled by the store on delivery and on read when it is cached.
+	// Fetchers build envelopes from it instead of reading the whole blob; nil
+	// means the caller must fall back to Data/the blob.
+	Head         []byte
 	UID          uint32 // 0 = allocate the next UID
 	Seen         bool
 	Flags        []string // canonical IMAP flags (\Seen, \Answered, …)

@@ -41,6 +41,7 @@ const (
 	fieldSize     = store.EmailFieldSize
 	fieldKeywords = store.EmailFieldKeywords
 	fieldModSeq   = store.EmailFieldModSeq
+	fieldHead     = store.EmailFieldHeader
 )
 
 // Mailbox document fields (CollectionMailbox).
@@ -358,6 +359,7 @@ func (k *KV) Deliver(ctx context.Context, account, mailbox string, msg *Message)
 		fieldFrom:     []byte(msg.From),
 		fieldSize:     beUint64(uint64(size)),
 		fieldKeywords: []byte(strings.Join(keywords, ",")),
+		fieldHead:     headerBlock(data),
 	}
 	// Delivery micro-batch: join (or lead) a per-account batch so a burst
 	// of arrivals commits in ONE transaction/fsync. Idle traffic keeps the
@@ -519,6 +521,7 @@ type Email struct {
 	From     string
 	Size     int64
 	BlobID   string
+	Head     []byte // cached header block; nil when not usable (see headerBlock)
 	ModSeq   uint64 // CONDSTORE: last change sequence of this message
 }
 
@@ -576,7 +579,34 @@ func emailFromFields(docID uint64, fields map[byte][]byte) *Email {
 	if len(fields[fieldModSeq]) == 8 {
 		e.ModSeq = binary.BigEndian.Uint64(fields[fieldModSeq])
 	}
+	e.Head = fields[fieldHead]
 	return e
+}
+
+// maxStoredHeaderBytes caps the cached header block. Headers longer than this
+// (pathological, and a parse risk if truncated) are left uncached so fetchers
+// fall back to the raw message; the cap keeps a message document's header copy
+// a few KB while the blob already holds the full text.
+const maxStoredHeaderBytes = 64 << 10
+
+// headerBlock returns the message's header section — everything through the
+// blank line that ends it — or nil when there is no usable one inside the cap
+// (no blank line, or headers past it). An envelope needs only these bytes, so
+// caching them spares a whole-blob read per message on every list page's
+// thread scan.
+func headerBlock(data []byte) []byte {
+	limit := len(data)
+	if limit > maxStoredHeaderBytes {
+		limit = maxStoredHeaderBytes
+	}
+	head := data[:limit]
+	if i := bytes.Index(head, []byte("\r\n\r\n")); i >= 0 {
+		return head[:i+4]
+	}
+	if i := bytes.Index(head, []byte("\n\n")); i >= 0 {
+		return head[:i+2]
+	}
+	return nil
 }
 
 func splitCSV(b []byte) []string {

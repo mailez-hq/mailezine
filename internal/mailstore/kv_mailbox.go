@@ -894,6 +894,27 @@ func (k *KV) Reindex(ctx context.Context) (int, error) {
 				}
 				fixed++
 			}
+			// Header block → envelope fetches skip the blob (see headerBlock).
+			// Only documents that predate the field are touched, and an empty
+			// value records "no usable header block" so a message is never read
+			// twice. Oversized messages are deliberately left on the blob path:
+			// pulling a 20MB body back to cache 2KB of headers costs more than
+			// the one read its envelope needs.
+			if _, ok := fields[fieldHead]; !ok {
+				head := []byte(nil)
+				if e.Size <= 1<<20 {
+					var buf bytes.Buffer
+					if err := k.s.GetBlob(ctx, e.BlobID, &buf); err == nil {
+						head = headerBlock(buf.Bytes())
+					} else if !errors.Is(err, store.ErrNotFound) {
+						return fixed, err
+					}
+				}
+				if err := k.s.PutDocumentFields(ctx, acctID, store.CollectionEmail, id, map[byte][]byte{fieldHead: head}); err != nil {
+					return fixed, err
+				}
+				fixed++
+			}
 		}
 	}
 	return fixed, nil
@@ -961,6 +982,7 @@ func messageFromEmail(e *Email) *Message {
 	return &Message{
 		UID:  e.UID,
 		From: e.From,
+		Head: e.Head,
 		// Match the maildir backend: keywords are exposed through Flags so
 		// FETCH and SEARCH (KEYWORD) see them; SetFlags re-splits them.
 		Flags:        append(append([]string(nil), e.Flags...), e.Keywords...),

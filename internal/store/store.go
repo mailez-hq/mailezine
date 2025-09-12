@@ -36,6 +36,11 @@ const (
 	EmailFieldSize     byte = 7
 	EmailFieldKeywords byte = 8
 	EmailFieldModSeq   byte = 9
+	// EmailFieldHeader is the message's header block (through the blank line
+	// that ends it), cached at delivery so envelope fetches do not have to
+	// read the whole message blob. Absent on documents written before it
+	// existed; empty means "no usable header block" (see mailstore).
+	EmailFieldHeader byte = 10
 )
 
 // Store is a KV+Blob facade exposing account-scoped operations. It is safe
