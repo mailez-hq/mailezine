@@ -7,8 +7,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/emersion/go-imap/v2"
@@ -17,6 +19,39 @@ import (
 
 	"mailezine/internal/mailstore"
 )
+
+// maxCachedSectionBytes caps what the body-section memo stores. The list path
+// fetches BODY.PEEK[HEADER] for every row (a couple of KB) and the preview
+// path a 4KB text fragment, both on every page load; whole-body sections are
+// left out so they cannot evict the envelope memo this shares a budget with.
+const maxCachedSectionBytes = 64 << 10
+
+// sectionsAllCached reports whether every requested body section came from
+// the memo, so none of them needs the message blob.
+func sectionsAllCached(hit []bool) bool {
+	for _, ok := range hit {
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// sectionKey identifies one body section of one immutable message: the
+// message identity (account, mailbox, uidvalidity, UID) plus every field that
+// shapes the extracted bytes. Partial must be spelled out — %v on the pointer
+// would key on its address and never hit.
+func sectionKey(envKey string, bs *imap.FetchItemBodySection) string {
+	var b strings.Builder
+	b.WriteString("sec\x00")
+	b.WriteString(envKey)
+	fmt.Fprintf(&b, "\x00%q\x00%v\x00%q\x00%q\x00%t\x00",
+		bs.Specifier, bs.Part, bs.HeaderFields, bs.HeaderFieldsNot, bs.Peek)
+	if bs.Partial != nil {
+		fmt.Fprintf(&b, "%d:%d", bs.Partial.Offset, bs.Partial.Size)
+	}
+	return b.String()
+}
 
 func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *imap.FetchOptions) error {
 	ctx := context.Background()
@@ -62,6 +97,8 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 		env     *imap.Envelope
 		envRaw  string
 		bs      imap.BodyStructure
+		secHit  []bool
+		secBuf  [][]byte
 		needBuf bool
 		buf     []byte
 		err     error
@@ -97,8 +134,25 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				it.bs = b.(imap.BodyStructure)
 			}
 		}
-		it.needBuf = len(options.BodySection) > 0 || len(options.BinarySection) > 0 ||
+		// Body sections are memoised as well: their bytes are content, and
+		// content is immutable for a given (account, mailbox, uidvalidity,
+		// UID) — flags live outside every section — so the memo needs no
+		// invalidation and stays correct on multi-active nodes, where the
+		// mailbox-metadata cache cannot be used at all. Without it a 50-row
+		// list page re-reads 50 blobs for its headers (~620ms, measured
+		// 2026-09-12) and the same again for its previews.
+		if n := len(options.BodySection); n > 0 {
+			it.secHit = make([]bool, n)
+			it.secBuf = make([][]byte, n)
+			for i, bs := range options.BodySection {
+				if v, ok := s.srv.cache.Get(sectionKey(it.envKey, bs)); ok {
+					it.secBuf[i], it.secHit[i] = v.([]byte), true
+				}
+			}
+		}
+		it.needBuf = len(options.BinarySection) > 0 ||
 			len(options.BinarySectionSize) > 0 ||
+			!sectionsAllCached(it.secHit) ||
 			(options.Envelope && it.env == nil && it.envRaw == "") ||
 			(options.BodyStructure != nil && it.bs == nil)
 		items = append(items, it)
@@ -201,8 +255,14 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			}
 			rw.WriteBodyStructure(bs)
 		}
-		for _, bs := range options.BodySection {
-			section := imapserver.ExtractBodySection(bytes.NewReader(buf), bs)
+		for i, bs := range options.BodySection {
+			section := it.secBuf[i]
+			if !it.secHit[i] {
+				section = imapserver.ExtractBodySection(bytes.NewReader(buf), bs)
+				if n := len(section); n > 0 && int64(n) <= maxCachedSectionBytes {
+					s.srv.cache.Put(sectionKey(it.envKey, bs), section, int64(n))
+				}
+			}
 			wc := rw.WriteBodySection(bs, int64(len(section)))
 			if _, err := wc.Write(section); err != nil {
 				_ = rw.Close()
