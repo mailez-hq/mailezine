@@ -86,6 +86,8 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 	}
 	now := time.Now()
 	burned := 0
+	scanned, due := 0, 0
+	var sample []string
 	for _, account := range accounts {
 		boxes, err := s.Store.ListMailboxes(ctx, account)
 		if err != nil {
@@ -100,6 +102,10 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 				continue
 			}
 			for _, msg := range msgs {
+				scanned++
+				if len(sample) < 6 {
+					sample = append(sample, strings.Join(append(append([]string{}, msg.Flags...), msg.Keywords...), "|"))
+				}
 				// The control plane writes the burn keywords over IMAP; depending
 				// on the store path they land in Flags or Keywords (the API
 				// reports them as $burnread / $burnreaduntil-…), so match both.
@@ -110,6 +116,7 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 				if !ok || until.After(now) {
 					continue
 				}
+				due++
 				stub := burnStub(msg)
 				if _, err := s.Store.Append(ctx, account, box.Name, stub); err != nil {
 					s.Logger.Warn("burn: append stub", "account", account, "mailbox", box.Name, "uid", msg.UID, "err", err)
@@ -131,22 +138,40 @@ func (s *Sweeper) SweepOnce(ctx context.Context) int {
 	if burned > 0 {
 		s.Logger.Info("burn: destroyed", "count", burned)
 	}
+	// Temporary diagnosis: distinguishes "the leased callback never runs" from
+	// "the keyword is not visible in the listing".
+	s.Logger.Info("burn: sweep pass", "accounts", len(accounts), "scanned", scanned, "due", due, "sample", sample)
 	return burned
 }
 
 // UntilFromKeywords extracts the reveal deadline from a message's keywords.
 func UntilFromKeywords(keywords []string) (time.Time, bool) {
 	prefix := strings.ToLower(UntilPrefix)
+	var earliest time.Time
+	found := false
 	for _, kw := range keywords {
-		lower := strings.ToLower(kw)
-		if !strings.HasPrefix(lower, prefix) {
-			continue
-		}
-		if n, err := strconv.ParseInt(lower[len(prefix):], 10, 64); err == nil {
-			return time.Unix(n, 0), true
+		// A store entry can carry several flags glued into one string
+		// ("\Seen \Seen $BurnRead"), so match per whitespace-separated token
+		// instead of assuming one flag per element.
+		for _, tok := range strings.Fields(kw) {
+			lower := strings.ToLower(tok)
+			if !strings.HasPrefix(lower, prefix) {
+				continue
+			}
+			n, err := strconv.ParseInt(lower[len(prefix):], 10, 64)
+			if err != nil {
+				continue
+			}
+			t := time.Unix(n, 0)
+			// Several windows can linger on one message (a reveal plus an
+			// older value). The message must not outlive the EARLIEST
+			// deadline: burning late leaks content, burning early does not.
+			if !found || t.Before(earliest) {
+				earliest, found = t, true
+			}
 		}
 	}
-	return time.Time{}, false
+	return earliest, found
 }
 
 // burnStub builds the replacement message: the burned notice keeps the thread
