@@ -48,6 +48,23 @@ var _ imapserver.SessionExtension = (*session)(nil)
 var _ imapserver.SessionSort = (*session)(nil)
 var _ imapserver.SessionSortUID = (*session)(nil)
 
+// mailboxMetaReader is the optional metadata-only read behind Select. A store
+// that has one skips the mailbox-wide message walk MailboxStatus does to fill
+// its counters (sizes, unseen, deleted) — SELECT only needs identity fields,
+// and it lists the messages anyway to build its snapshot.
+type mailboxMetaReader interface {
+	MailboxMeta(ctx context.Context, account, mailbox string) (mailstore.Mailbox, error)
+}
+
+// mailboxMeta prefers the metadata-only read, falling back to MailboxStatus
+// (and its counters) for stores that do not offer one.
+func (s *session) mailboxMeta(ctx context.Context, mailbox string) (mailstore.Mailbox, error) {
+	if mr, ok := s.srv.Store.(mailboxMetaReader); ok {
+		return mr.MailboxMeta(ctx, s.user, mailbox)
+	}
+	return s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
+}
+
 func (s *session) Close() error {
 	// Only authenticated sessions were counted on login.
 	if s.user != "" {
@@ -80,7 +97,7 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "empty mailbox name"}
 	}
 	ctx := context.Background()
-	st, err := s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
+	st, err := s.mailboxMeta(ctx, mailbox)
 	if errors.Is(err, mailstore.ErrNotFound) || errors.Is(err, directory.ErrNotFound) {
 		// Lazily provision on first use: a fresh account has no mailbox
 		// documents until something lists them, and INBOX must always exist
@@ -93,7 +110,7 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 		if _, lerr := s.srv.Store.ListMailboxes(ctx, s.user); lerr != nil {
 			return nil, lerr
 		}
-		st, err = s.srv.Store.MailboxStatus(ctx, s.user, mailbox)
+		st, err = s.mailboxMeta(ctx, mailbox)
 	}
 	if err != nil {
 		if errors.Is(err, mailstore.ErrNotFound) || errors.Is(err, directory.ErrNotFound) {
@@ -131,10 +148,12 @@ func (s *session) Select(mailbox string, options *imap.SelectOptions) (*imap.Sel
 	data := &imap.SelectData{
 		Flags:          flags,
 		PermanentFlags: permanent,
-		NumMessages:    st.NumMessages,
-		UIDNext:        imap.UID(st.UIDNext),
-		UIDValidity:    st.UIDValidity,
-		HighestModSeq:  st.HighestModSeq,
+		// The counters come from the listing above, not from the status: the
+		// two must agree, and the listing is what this session will use.
+		NumMessages:   uint32(len(msgs)),
+		UIDNext:       imap.UID(st.UIDNext),
+		UIDValidity:   st.UIDValidity,
+		HighestModSeq: st.HighestModSeq,
 	}
 	for i, msg := range msgs {
 		if !mailstore.HasFlag(msg.Flags, "\\Seen") {
