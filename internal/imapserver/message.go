@@ -10,10 +10,10 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/emersion/go-imap/v2"
 	gomessage "github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-message/textproto"
-	"github.com/emersion/go-imap/v2"
 	"golang.org/x/text/encoding/simplifiedchinese"
 	"golang.org/x/text/encoding/traditionalchinese"
 )
@@ -215,7 +215,7 @@ func ExtractBinarySectionSize(r io.Reader, item *imap.FetchItemBinarySectionSize
 func ExtractEnvelope(h textproto.Header) *imap.Envelope {
 	mh := mail.Header{Header: gomessage.Header{Header: h}}
 	date, _ := mh.Date()
-	subject, _ := mh.Subject()
+	subject := decodeHeaderText(mh.Get("Subject"))
 	inReplyTo, _ := mh.MsgIDList("In-Reply-To")
 	messageID, _ := mh.MessageID()
 	return &imap.Envelope{
@@ -237,20 +237,42 @@ func ExtractEnvelope(h textproto.Header) *imap.Envelope {
 // whole From (blank sender in the client) is not.
 var addrEmailRe = regexp.MustCompile(`[^\s<>,;"']+@[^\s<>,;"']+`)
 
-// addressDecoder decodes RFC 2047 display names in the charsets Chinese
-// mail providers actually send (GBK/GB18030/Big5 on top of the stdlib's
-// UTF-8/ASCII), so a =?GBK?B?...?= From no longer blanks the address list.
-var addressDecoder = &mime.WordDecoder{
-	CharsetReader: func(charset string, input io.Reader) (io.Reader, error) {
-		switch strings.ToLower(charset) {
-		case "gbk", "gb2312", "gb18030", "cp936", "ms936":
-			return simplifiedchinese.GB18030.NewDecoder().Reader(input), nil
-		case "big5", "big5-hkscs", "cp950":
-			return traditionalchinese.Big5.NewDecoder().Reader(input), nil
-		default:
-			return nil, fmt.Errorf("unhandled charset %q", charset)
-		}
-	},
+// charsetReader decodes the charsets Chinese mail providers actually send
+// (GBK/GB18030/Big5) on top of the stdlib's UTF-8/ASCII, so a =?GBK?B?...?=
+// word decodes instead of coming through raw.
+func charsetReader(charset string, input io.Reader) (io.Reader, error) {
+	switch strings.ToLower(charset) {
+	case "gbk", "gb2312", "gb18030", "cp936", "ms936":
+		return simplifiedchinese.GB18030.NewDecoder().Reader(input), nil
+	case "big5", "big5-hkscs", "cp950":
+		return traditionalchinese.Big5.NewDecoder().Reader(input), nil
+	default:
+		return nil, fmt.Errorf("unhandled charset %q", charset)
+	}
+}
+
+// addressDecoder decodes RFC 2047 display names, so a =?GBK?B?...?= From
+// does not blank the address list.
+var addressDecoder = &mime.WordDecoder{CharsetReader: charsetReader}
+
+// headerTextDecoder decodes RFC 2047 words in header values. The stdlib
+// decoder only knows UTF-8/ISO-8859-1, so a GBK subject (every mail from
+// 126.com/163.com) came through as the raw "=?GBK?B?...?=" — in the list row,
+// the reading pane title and every thread key derived from it.
+var headerTextDecoder = &mime.WordDecoder{CharsetReader: charsetReader}
+
+// decodeHeaderText decodes an RFC 2047 header value, falling back to the raw
+// value when a word cannot be decoded: showing the encoded form beats showing
+// nothing.
+func decodeHeaderText(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	decoded, err := headerTextDecoder.DecodeHeader(raw)
+	if err != nil {
+		return raw
+	}
+	return decoded
 }
 
 var addressParser = nmail.AddressParser{}
