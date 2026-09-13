@@ -8,8 +8,7 @@
 
 The official mail engine of mailez: a single Go binary
 mail server providing SMTP send/receive, IMAP/POP3 access, and Sieve
-filtering. The protocol stack is built in-house or on MIT-licensed third-
-party libraries (go-msgauth/go-imap).
+filtering.
 
 ## Features
 

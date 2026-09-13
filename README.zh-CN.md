@@ -7,8 +7,7 @@
 # mailezine
 
 mailez 官方邮件引擎：单 Go 二进制邮件服务器，提供 SMTP 收发、
-IMAP/POP3 存取与 Sieve 过滤。协议栈自研或采用 MIT 许可的第三方库
-（go-msgauth/go-imap）。
+IMAP/POP3 存取与 Sieve 过滤。
 
 ## 功能特性
 
