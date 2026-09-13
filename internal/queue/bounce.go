@@ -55,7 +55,9 @@ func ComposeBounceDSN(from string, msg *Message, failures []BounceFailure, hostn
 	text := "Your message could not be delivered to one or more recipients.\n\n" +
 		strings.Join(lines, "\n") + "\n"
 	d := &maildsn.Message{
-		From:         "postmaster@" + hostname,
+		// RFC 5321 postmaster addresses live at the MAIL domain, not the
+		// MTA hostname (see ComposeDelayDSN).
+		From:         postmasterAddress(from, hostname),
 		To:           from,
 		Subject:      "Delivery Status Notification (Failure)",
 		ReportingMTA: hostname,

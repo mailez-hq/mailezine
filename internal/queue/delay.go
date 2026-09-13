@@ -7,6 +7,7 @@ package queue
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"mailezine/internal/maildsn"
@@ -51,7 +52,10 @@ delivered to all recipients after %s.
 No action is required on your part; delivery attempts will continue.
 `, waited.Round(waited).String())
 	d := &maildsn.Message{
-		From:         "postmaster@" + hostname,
+		// RFC 5321 postmaster addresses live at the MAIL domain, not the
+		// MTA hostname: the sender admin@mailez.cn must hear from
+		// postmaster@mailez.cn, never postmaster@mail.mailez.cn.
+		From:         postmasterAddress(from, hostname),
 		To:           from,
 		Subject:      "Delayed Mail Notification",
 		ReportingMTA: hostname,
@@ -61,6 +65,16 @@ No action is required on your part; delivery attempts will continue.
 		MessageID:    fmt.Sprintf("<mailezine-dsn-%d@%s>", msg.ID, hostname),
 	}
 	return d.Compose()
+}
+
+// postmasterAddress derives the RFC 5321 postmaster address for the
+// recipient's own mail domain, falling back to the MTA hostname when the
+// address is unusable.
+func postmasterAddress(rcpt, hostname string) string {
+	if _, domain, ok := strings.Cut(rcpt, "@"); ok && domain != "" {
+		return "postmaster@" + domain
+	}
+	return "postmaster@" + hostname
 }
 
 // maybeDelayWarning fires the delay warning when the message has been queued
