@@ -3,14 +3,19 @@ package imapserver
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"io"
+	"mime"
+	nmail "net/mail"
+	"regexp"
 	"strings"
 
 	gomessage "github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-message/textproto"
-
 	"github.com/emersion/go-imap/v2"
+	"golang.org/x/text/encoding/simplifiedchinese"
+	"golang.org/x/text/encoding/traditionalchinese"
 )
 
 // ExtractBodySection extracts a section of a message body.
@@ -227,9 +232,55 @@ func ExtractEnvelope(h textproto.Header) *imap.Envelope {
 	}
 }
 
+// addrEmailRe is the last-resort extraction used when the RFC 5322 address
+// parser rejects a header: losing the display name is cosmetic, losing the
+// whole From (blank sender in the client) is not.
+var addrEmailRe = regexp.MustCompile(`[^\s<>,;"']+@[^\s<>,;"']+`)
+
+// addressDecoder decodes RFC 2047 display names in the charsets Chinese
+// mail providers actually send (GBK/GB18030/Big5 on top of the stdlib's
+// UTF-8/ASCII), so a =?GBK?B?...?= From no longer blanks the address list.
+var addressDecoder = &mime.WordDecoder{
+	CharsetReader: func(charset string, input io.Reader) (io.Reader, error) {
+		switch strings.ToLower(charset) {
+		case "gbk", "gb2312", "gb18030", "cp936", "ms936":
+			return simplifiedchinese.GB18030.NewDecoder().Reader(input), nil
+		case "big5", "big5-hkscs", "cp950":
+			return traditionalchinese.Big5.NewDecoder().Reader(input), nil
+		default:
+			return nil, fmt.Errorf("unhandled charset %q", charset)
+		}
+	},
+}
+
+var addressParser = nmail.AddressParser{}
+
 func parseAddressList(mh mail.Header, k string) []imap.Address {
 	// TODO: handle groups
-	addrs, _ := mh.AddressList(k)
+	raw := strings.TrimSpace(mh.Get(k))
+	if raw == "" {
+		return nil
+	}
+	// Decode RFC 2047 words first (GBK/Big5-aware): DecodeHeader keeps
+	// unknown words verbatim, then the stdlib address parser sees plain
+	// UTF-8 display names instead of encoded tokens it would reject.
+	decoded, derr := addressDecoder.DecodeHeader(raw)
+	if derr != nil || decoded == "" {
+		decoded = raw
+	}
+	addrs, err := addressParser.ParseList(decoded)
+	if err != nil || len(addrs) == 0 {
+		// Fall back to plain address extraction: the strict parser rejects
+		// odd-but-real-world headers (encoded names it cannot decode,
+		// stray tokens), and an email-only entry beats an empty From.
+		out := make([]imap.Address, 0, 1)
+		for _, m := range addrEmailRe.FindAllString(raw, -1) {
+			if mailbox, host, ok := strings.Cut(m, "@"); ok {
+				out = append(out, imap.Address{Mailbox: mailbox, Host: host})
+			}
+		}
+		return out
+	}
 	var l []imap.Address
 	for _, addr := range addrs {
 		mailbox, host, ok := strings.Cut(addr.Address, "@")
