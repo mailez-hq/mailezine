@@ -6,7 +6,7 @@
 
 # mailezine
 
-The official mail engine of mailez (community edition): a single Go binary
+The official mail engine of mailez: a single Go binary
 mail server providing SMTP send/receive, IMAP/POP3 access, and Sieve
 filtering. The protocol stack is built in-house or on MIT-licensed third-
 party libraries (go-msgauth/go-imap).
@@ -133,7 +133,7 @@ Everything can be overridden via environment variables (defaults in
 
 | Variable | Default | Description |
 |---|---|---|
-| `MAILEZINE_STORAGE_BACKEND` | `pebble` | storage backend (community edition: `pebble`) |
+| `MAILEZINE_STORAGE_BACKEND` | `pebble` | storage backend |
 | `MAILEZINE_KV_PATH` | — | pebble data path (required) |
 | `MAILEZINE_DIRECTORY_MODE` / `MAILEZINE_AUTH_MODE` | `dev` | use `mailez` in production (control-plane API) |
 | `MAILEZINE_BACKEND_ADDRESS` | `127.0.0.1:8080` | mailez control-plane address (directory/auth/DKIM vault) |
@@ -173,8 +173,8 @@ Everything can be overridden via environment variables (defaults in
 make verify   # gofmt / tidy / vet / go test -race / build
 ```
 
-CI: three GitHub Actions jobs — ubuntu full (`make verify`, including -race
-and the community-purity check), windows (gofmt/vet/test/build), and a real
+CI: three GitHub Actions jobs — ubuntu full (`make verify`, including
+-race), windows (gofmt/vet/test/build), and a real
 rspamd container e2e (`-tags docker`, SMTP→classification→storage chain).
 `deploy/scripts/ci-env` provides a local Linux container environment for the
 full verification suite.

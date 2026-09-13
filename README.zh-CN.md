@@ -6,7 +6,7 @@
 
 # mailezine
 
-mailez 官方邮件引擎（社区版）：单 Go 二进制邮件服务器，提供 SMTP 收发、
+mailez 官方邮件引擎：单 Go 二进制邮件服务器，提供 SMTP 收发、
 IMAP/POP3 存取与 Sieve 过滤。协议栈自研或采用 MIT 许可的第三方库
 （go-msgauth/go-imap）。
 
@@ -110,7 +110,7 @@ go test ./cmd/mailezine -run TestEndToEnd -v
 
 | 变量 | 默认 | 说明 |
 |---|---|---|
-| `MAILEZINE_STORAGE_BACKEND` | `pebble` | 存储后端（社区版：`pebble`） |
+| `MAILEZINE_STORAGE_BACKEND` | `pebble` | 存储后端 |
 | `MAILEZINE_KV_PATH` | — | pebble 数据路径（必填） |
 | `MAILEZINE_DIRECTORY_MODE` / `MAILEZINE_AUTH_MODE` | `dev` | 生产用 `mailez`（走控制面 API） |
 | `MAILEZINE_BACKEND_ADDRESS` | `127.0.0.1:8080` | mailez 控制面地址（目录/认证/DKIM vault） |
@@ -150,8 +150,8 @@ go test ./cmd/mailezine -run TestEndToEnd -v
 make verify   # gofmt / tidy / vet / go test -race / build
 ```
 
-CI：GitHub Actions 三作业——ubuntu 全量（`make verify`，含 -race 与社区
-纯净检查）、windows（gofmt/vet/test/build）、真实 rspamd 容器 e2e
+CI：GitHub Actions 三作业——ubuntu 全量（`make verify`，含
+-race）、windows（gofmt/vet/test/build）、真实 rspamd 容器 e2e
 （`-tags docker`，SMTP→分类→存储全链路）。
 `deploy/scripts/ci-env` 提供本地 Linux 容器全量验证环境。
 
