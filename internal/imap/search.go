@@ -282,18 +282,23 @@ func matchSearch(msg *mailstore.Message, seq uint32, c *imap.SearchCriteria, max
 			if err != nil {
 				return false, err
 			}
+			// A message sent in GBK, Big5 or Shift_JIS carries the query in
+			// its own bytes, and a base64 part carries no readable text at
+			// all: matching the raw buffer alone misses both. Match the
+			// message decoded to UTF-8 instead. (A header hit already returned
+			// above; this is the body's turn.)
 			if len(c.Text) > 0 {
-				raw := strings.ToLower(string(b))
-				for _, text := range c.Text {
-					if !strings.Contains(raw, strings.ToLower(text)) {
+				text := strings.ToLower(imapserver.MessageText(b))
+				for _, want := range c.Text {
+					if !strings.Contains(text, strings.ToLower(want)) {
 						return false, nil
 					}
 				}
 			}
 			if len(c.Body) > 0 {
-				bp := strings.ToLower(string(bodyPart(b)))
+				bodyText := strings.ToLower(imapserver.MessageBodyText(b))
 				for _, pat := range c.Body {
-					if !strings.Contains(bp, strings.ToLower(pat)) {
+					if !strings.Contains(bodyText, strings.ToLower(pat)) {
 						return false, nil
 					}
 				}
@@ -339,13 +344,6 @@ func headerBlock(buf []byte) []byte {
 		return buf[:i]
 	}
 	return buf
-}
-
-func bodyPart(buf []byte) string {
-	if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
-		return string(buf[i+4:])
-	}
-	return ""
 }
 
 // textInHeaderBlock reports whether every TEXT pattern already appears in the

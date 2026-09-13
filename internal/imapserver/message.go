@@ -14,8 +14,8 @@ import (
 	gomessage "github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/emersion/go-message/textproto"
-	"golang.org/x/text/encoding/simplifiedchinese"
-	"golang.org/x/text/encoding/traditionalchinese"
+	"golang.org/x/text/encoding/htmlindex"
+	"golang.org/x/text/encoding/ianaindex"
 )
 
 // ExtractBodySection extracts a section of a message body.
@@ -237,29 +237,40 @@ func ExtractEnvelope(h textproto.Header) *imap.Envelope {
 // whole From (blank sender in the client) is not.
 var addrEmailRe = regexp.MustCompile(`[^\s<>,;"']+@[^\s<>,;"']+`)
 
-// charsetReader decodes the charsets Chinese mail providers actually send
-// (GBK/GB18030/Big5) on top of the stdlib's UTF-8/ASCII, so a =?GBK?B?...?=
-// word decodes instead of coming through raw.
-func charsetReader(charset string, input io.Reader) (io.Reader, error) {
-	switch strings.ToLower(charset) {
-	case "gbk", "gb2312", "gb18030", "cp936", "ms936":
-		return simplifiedchinese.GB18030.NewDecoder().Reader(input), nil
-	case "big5", "big5-hkscs", "cp950":
-		return traditionalchinese.Big5.NewDecoder().Reader(input), nil
-	default:
-		return nil, fmt.Errorf("unhandled charset %q", charset)
+// charsetReader resolves charset labels through both registries that matter:
+// IANA (what mail senders quote, via ianaindex) and WHATWG (the alias set
+// browsers accept, via htmlindex), so "=?GBK?B?...?=", "=?Big5?B?...?=",
+// "=?Shift_JIS?B?...?=", "=?ks_c_5601-1987?B?...?=" and
+// "=?windows-1251?B?...?=" all decode. The stdlib decoder behind
+// mail.Header.Subject() knows only UTF-8 and ISO-8859-1, which is how one
+// encoded word reached the list row and the reading-pane title untouched; a
+// hand-written switch would just move the same gap to the next charset.
+func CharsetReader(charset string, input io.Reader) (io.Reader, error) {
+	if enc, err := ianaindex.MIME.Encoding(charset); err == nil && enc != nil {
+		return enc.NewDecoder().Reader(input), nil
 	}
+	if enc, err := htmlindex.Get(charset); err == nil {
+		return enc.NewDecoder().Reader(input), nil
+	}
+	return nil, fmt.Errorf("unknown charset %q", charset)
+}
+
+// message.CharsetReader is go-message's process-wide hook for MIME parts: with
+// it set, every parse (IMAP body sections, the searchable text below) decodes
+// declared charsets instead of failing them.
+func init() {
+	gomessage.CharsetReader = CharsetReader
 }
 
 // addressDecoder decodes RFC 2047 display names, so a =?GBK?B?...?= From
 // does not blank the address list.
-var addressDecoder = &mime.WordDecoder{CharsetReader: charsetReader}
+var addressDecoder = &mime.WordDecoder{CharsetReader: CharsetReader}
 
 // headerTextDecoder decodes RFC 2047 words in header values. The stdlib
 // decoder only knows UTF-8/ISO-8859-1, so a GBK subject (every mail from
 // 126.com/163.com) came through as the raw "=?GBK?B?...?=" — in the list row,
 // the reading pane title and every thread key derived from it.
-var headerTextDecoder = &mime.WordDecoder{CharsetReader: charsetReader}
+var headerTextDecoder = &mime.WordDecoder{CharsetReader: CharsetReader}
 
 // decodeHeaderText decodes an RFC 2047 header value, falling back to the raw
 // value when a word cannot be decoded: showing the encoded form beats showing
@@ -273,6 +284,70 @@ func decodeHeaderText(raw string) string {
 		return raw
 	}
 	return decoded
+}
+
+// maxMessageTextPart bounds how much of one text part goes into the searchable
+// rendering; a message with a multi-megabyte text body is indexed only up to
+// here, which is far past anything a query can distinguish.
+const maxMessageTextPart = 1 << 20
+
+// MessageText renders a message as UTF-8 text for searching and indexing:
+// every header value (RFC 2047 words and their charsets decoded) followed by
+// each text part, transfer- and charset-decoded.
+//
+// SEARCH and the full-text index match against this instead of the raw bytes,
+// which is what lets a UTF-8 query find a message sent in GBK, Big5 or
+// Shift_JIS — and what makes the text of a base64-encoded part searchable at
+// all, since the raw bytes hold only the base64.
+func MessageText(raw []byte) string {
+	var sb strings.Builder
+	if h, err := textproto.ReadHeader(bufio.NewReader(bytes.NewReader(raw))); err == nil {
+		appendHeaderText(&sb, &h)
+	}
+	sb.WriteString(MessageBodyText(raw))
+	return sb.String()
+}
+
+// MessageBodyText is MessageText without the headers: what BODY criteria match.
+func MessageBodyText(raw []byte) string {
+	var sb strings.Builder
+	mr, err := mail.CreateReader(bytes.NewReader(raw))
+	if err != nil {
+		return sb.String()
+	}
+	for {
+		p, err := mr.NextPart()
+		if err != nil {
+			break
+		}
+		ct, _, _ := mime.ParseMediaType(p.Header.Get("Content-Type"))
+		// An absent Content-Type means text/plain (RFC 2045 §5.2), which is
+		// also how a single-part message reaches this loop: go-message wraps
+		// it as a one-part multipart.
+		if ct != "" && !strings.HasPrefix(ct, "text/") {
+			continue
+		}
+		b, _ := io.ReadAll(io.LimitReader(p.Body, maxMessageTextPart))
+		sb.Write(b)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+// appendHeaderText adds the header values a query can meaningfully match,
+// decoding encoded words. Header names are included too: SEARCH matches them
+// the same way a raw-byte scan used to.
+func appendHeaderText(sb *strings.Builder, h *textproto.Header) {
+	for it := h.Fields(); it.Next(); {
+		value := it.Value()
+		if len(value) > 8<<10 {
+			value = value[:8<<10]
+		}
+		sb.WriteString(it.Key())
+		sb.WriteString(": ")
+		sb.WriteString(decodeHeaderText(value))
+		sb.WriteByte('\n')
+	}
 }
 
 var addressParser = nmail.AddressParser{}

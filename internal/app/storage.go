@@ -137,11 +137,18 @@ func OpenKVBlob(cfg config.Config, logger *slog.Logger) (store.KV, store.Blob, e
 // ftsIndexPath resolves the bleve index directory: MAILEZINE_FTS_PATH or
 // "<rocks path>.fts". Shared by openFTS and the change-log tailer's
 // watermark file ("<fts path>.sync.json").
+//
+// The ".v2" suffix marks the point where the index started holding a message's
+// *decoded* text instead of its raw bytes: entries written before that (and the
+// watermark that says how far they were built) describe the wrong thing, so the
+// versioned path makes every node build a fresh index by replaying the change
+// log from the beginning. The old directory is left in place; it is derived
+// data, and a deployment can delete it once the new one has caught up.
 func ftsIndexPath(cfg config.Config) string {
 	if p := cfg.FTS.Path; p != "" {
 		return p
 	}
-	return cfg.Storage.KVPath + ".fts"
+	return cfg.Storage.KVPath + ".fts.v2"
 }
 
 // openFTS opens the embedded bleve index; a corrupt/unusable index disables

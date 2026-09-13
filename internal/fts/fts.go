@@ -21,6 +21,7 @@ import (
 	"github.com/blevesearch/bleve/v2/mapping"
 	"github.com/blevesearch/bleve/v2/search/query"
 	"github.com/emersion/go-message"
+	"github.com/emersion/go-message/mail"
 )
 
 // doc is the bleve document for one message copy.
@@ -137,11 +138,24 @@ func (ix *Indexer) searchableText(ctx context.Context, data []byte) string {
 	if err != nil {
 		return string(data)
 	}
-	for _, key := range []string{"From", "To", "Subject"} {
-		if v := msg.Header.Get(key); v != "" {
+	// Decode the header values the same way the reader does: an encoded word
+	// ("=?GBK?B?...?=") is what Chinese and Japanese senders put in Subject,
+	// and indexing the raw form would hide the subject's words from search.
+	mh := mail.Header{Header: msg.Header}
+	if subject, err := mh.Subject(); err == nil && subject != "" {
+		out.WriteString("Subject: ")
+		out.WriteString(subject)
+		out.WriteByte('\n')
+	}
+	for _, key := range []string{"From", "To"} {
+		list, err := mh.AddressList(key)
+		if err != nil {
+			continue
+		}
+		for _, addr := range list {
 			out.WriteString(key)
 			out.WriteString(": ")
-			out.WriteString(v)
+			out.WriteString(addr.String())
 			out.WriteByte('\n')
 		}
 	}
