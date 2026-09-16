@@ -647,6 +647,49 @@ func (s *Store) UpdateDocumentAtomically(
 	})
 }
 
+// DocUpdate is one document's field replacement inside a batched write.
+type DocUpdate struct {
+	DocID  uint64
+	Fields map[byte][]byte
+}
+
+// UpdateDocumentsAtomically stages several documents' fields and their
+// changelog entries in one transaction: the change counter is read once and
+// the batch shares a single commit. Each document still gets its own
+// changelog row, exactly as UpdateDocumentAtomically would write it.
+func (s *Store) UpdateDocumentsAtomically(
+	ctx context.Context,
+	accountID AccountID,
+	collection byte,
+	docs []DocUpdate,
+	extra ...Op,
+) error {
+	if len(docs) == 0 {
+		return nil
+	}
+	unlock := s.lockAccount(accountID)
+	defer unlock()
+
+	changeCounter := CounterKey(uint32(accountID), CounterKindChange, nil)
+
+	return s.txn.WithTxn(ctx, func(t TxnOps) error {
+		nextChange, err := readCounter(t.Get, changeCounter)
+		if err != nil {
+			return err
+		}
+		for _, d := range docs {
+			t.Append(orderedFieldOps(accountID, collection, d.DocID, d.Fields)...)
+			nextChange++
+			t.Append(
+				Op{Key: changeCounter, Value: beUint64(nextChange)},
+				Op{Key: ChangeLogKey(uint32(accountID), collection, nextChange), Value: encodeChangeValue(collection, d.DocID, OpUpdate)},
+			)
+		}
+		t.Append(extra...)
+		return nil
+	})
+}
+
 // blobRefValue decodes a blob link count through get.
 func blobRefValue(get func([]byte) ([]byte, error), key []byte) (int64, error) {
 	v, err := get(key)

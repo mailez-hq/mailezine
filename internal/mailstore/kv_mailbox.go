@@ -519,6 +519,68 @@ func (k *KV) Append(ctx context.Context, account, mailbox string, msg *Message) 
 	return k.Deliver(ctx, account, mailbox, msg)
 }
 
+// SetFlagsBatch replaces the flags of many messages of one mailbox: the
+// account, the uid→document mapping (one scan) and the modseq bump are
+// resolved once, and every message's fields commit in a single transaction.
+// UIDs that no longer exist are skipped — the caller's snapshot can be older
+// than the mailbox.
+func (k *KV) SetFlagsBatch(ctx context.Context, account, mailbox string, updates []FlagUpdate) error {
+	if len(updates) == 0 {
+		return nil
+	}
+	acctID, err := k.s.AccountByEmail(ctx, account)
+	if err != nil {
+		return err
+	}
+	mbID, err := k.mailboxDocID(ctx, acctID, mailbox)
+	if err != nil {
+		return err
+	}
+	docs, err := k.emailDocIDs(ctx, acctID, mbID)
+	if err != nil {
+		return err
+	}
+	modseq, err := k.s.BumpMailboxModSeq(ctx, acctID, mbID)
+	if err != nil {
+		return err
+	}
+	changes := make([]store.DocUpdate, 0, len(updates))
+	for _, u := range updates {
+		docID, ok := docs[uint64(u.UID)]
+		if !ok {
+			continue
+		}
+		system, keywords := splitFlags(u.Flags)
+		changes = append(changes, store.DocUpdate{
+			DocID: docID,
+			Fields: map[byte][]byte{
+				fieldFlags:    []byte(strings.Join(system, ",")),
+				fieldKeywords: []byte(strings.Join(keywords, ",")),
+				fieldModSeq:   beUint64(modseq),
+			},
+		})
+	}
+	return k.s.UpdateDocumentsAtomically(ctx, acctID, store.CollectionEmail, changes)
+}
+
+// emailDocIDs maps UID to document ID for one mailbox in a single index scan.
+func (k *KV) emailDocIDs(ctx context.Context, acctID store.AccountID, mbID uint64) (map[uint64]uint64, error) {
+	out := make(map[uint64]uint64)
+	err := k.s.ScanRaw(ctx, store.IndexEmailPrefix(uint32(acctID), mbID), func(key, val []byte) error {
+		if len(val) != 8 || len(key) < 8 {
+			return nil
+		}
+		// The index key ends with the message's UID (see IndexEmailKey).
+		uid := binary.BigEndian.Uint64(key[len(key)-8:])
+		out[uid] = binary.BigEndian.Uint64(val)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // Expunge removes \Deleted messages — for UID EXPUNGE (uids non-empty),
 // only the given UIDs that are still \Deleted. The \Deleted premise is
 // re-verified inside each delete's transaction: a session's snapshot of the

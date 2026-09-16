@@ -12,6 +12,10 @@ import (
 	"mailezine/internal/mailstore"
 )
 
+// flagBatchSize bounds one SetFlagsBatch call: the batch holds every changed
+// message's fields in memory and commits them in a single transaction.
+const flagBatchSize = 1000
+
 func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *imap.StoreFlags, options *imap.StoreOptions) error {
 	ctx := context.Background()
 	// Sequence numbers resolve against the session snapshot (see
@@ -34,6 +38,17 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 	if maxSeq > 0 {
 		maxUID = msgs[maxSeq-1].UID
 	}
+	updates := make([]mailstore.FlagUpdate, 0, 16)
+	flush := func() error {
+		if len(updates) == 0 {
+			return nil
+		}
+		if err := s.srv.Store.SetFlagsBatch(ctx, s.user, s.mbox, updates); err != nil {
+			return err
+		}
+		updates = updates[:0]
+		return nil
+	}
 	for i, msg := range msgs {
 		seq := uint32(i) + 1
 		if !numMatches(numSet, seq, msg.UID, maxSeq, maxUID) {
@@ -52,8 +67,11 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 			continue
 		}
 		next := applyStoreOp(msg.Flags, flags)
-		if err := s.srv.Store.SetFlags(ctx, s.user, s.mbox, msg.UID, next); err != nil {
-			return err
+		updates = append(updates, mailstore.FlagUpdate{UID: msg.UID, Flags: next})
+		if len(updates) >= flagBatchSize {
+			if err := flush(); err != nil {
+				return err
+			}
 		}
 		if !flags.Silent {
 			rw := w.CreateMessage(seq)
@@ -63,6 +81,9 @@ func (s *session) Store(w *imapserver.FetchWriter, numSet imap.NumSet, flags *im
 				return err
 			}
 		}
+	}
+	if err := flush(); err != nil {
+		return err
 	}
 	if err := s.refreshSnapshot(ctx); err != nil {
 		return err

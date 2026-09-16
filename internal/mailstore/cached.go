@@ -201,6 +201,14 @@ func (c *Cached) SetFlags(ctx context.Context, account, mailbox string, uid uint
 	return err
 }
 
+func (c *Cached) SetFlagsBatch(ctx context.Context, account, mailbox string, updates []FlagUpdate) error {
+	err := c.inner.SetFlagsBatch(ctx, account, mailbox, updates)
+	if err == nil {
+		c.invalidate(account, mailbox)
+	}
+	return err
+}
+
 func (c *Cached) Append(ctx context.Context, account, mailbox string, msg *Message) (uint32, error) {
 	uid, err := c.inner.Append(ctx, account, mailbox, msg)
 	if err == nil {

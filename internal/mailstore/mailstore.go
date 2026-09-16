@@ -47,6 +47,12 @@ type Mailbox struct {
 	HighestModSeq uint64 // CONDSTORE HIGHESTMODSEQ of the mailbox
 }
 
+// FlagUpdate is one message's replacement flag set in a batch.
+type FlagUpdate struct {
+	UID   uint32
+	Flags []string
+}
+
 // Store is the mailbox surface used by delivery.
 type Store interface {
 	// Deliver appends one message copy to a mailbox and returns its UID.
@@ -71,6 +77,9 @@ type MailboxStore interface {
 	ListMessages(ctx context.Context, account, mailbox string) ([]*Message, error)
 	MessageByUID(ctx context.Context, account, mailbox string, uid uint32) (*Message, error)
 	SetFlags(ctx context.Context, account, mailbox string, uid uint32, flags []string) error
+	// SetFlagsBatch replaces the flags of many messages of one mailbox,
+	// resolving the account/mailbox and bumping HIGHESTMODSEQ once.
+	SetFlagsBatch(ctx context.Context, account, mailbox string, updates []FlagUpdate) error
 	Append(ctx context.Context, account, mailbox string, msg *Message) (uint32, error)
 	Expunge(ctx context.Context, account, mailbox string, uids []uint32) ([]uint32, error)
 	// DeleteUIDs removes the given UIDs unconditionally (no \Deleted
