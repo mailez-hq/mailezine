@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"mailezine/internal/store"
@@ -41,6 +42,20 @@ type Lease struct {
 	ttl    time.Duration
 	now    func() time.Time
 	logger *slog.Logger
+}
+
+// keyLocks serializes the read-modify-write of one lease key inside this
+// process. The AsTxn buffer used by the non-transactional backends commits
+// the write only after the closure has read the key, with no conflict
+// detection between the two, so two goroutines sharing a KV can both see a
+// free lease and both claim it. Keys are locked individually: unrelated
+// leases never contend, and backends with native transactions (TiDB) are
+// unaffected — they serialize across processes as well.
+var keyLocks sync.Map // string → *sync.Mutex
+
+func lockKey(key []byte) *sync.Mutex {
+	m, _ := keyLocks.LoadOrStore(string(key), &sync.Mutex{})
+	return m.(*sync.Mutex)
 }
 
 // New builds a lease. owner must uniquely identify this process within the
@@ -73,6 +88,10 @@ func (l *Lease) SetLogger(log *slog.Logger) { l.logger = log }
 // still live. Acquire doubles as Renew: callers need not track which of
 // the two applies.
 func (l *Lease) Acquire(ctx context.Context) (bool, error) {
+	mu := lockKey(l.key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	held := false
 	err := l.txn.WithTxn(ctx, func(t store.TxnOps) error {
 		held = false
@@ -102,6 +121,10 @@ func (l *Lease) Acquire(ctx context.Context) (bool, error) {
 // Release drops the lease when this process holds it; a foreign holder's
 // record is never touched.
 func (l *Lease) Release(ctx context.Context) error {
+	mu := lockKey(l.key)
+	mu.Lock()
+	defer mu.Unlock()
+
 	return l.txn.WithTxn(ctx, func(t store.TxnOps) error {
 		v, err := t.Get(l.key)
 		if errors.Is(err, store.ErrNotFound) {
