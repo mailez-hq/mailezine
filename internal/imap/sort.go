@@ -35,6 +35,9 @@ type sortItem struct {
 	msg *mailstore.Message
 	// raw is set only when the SEARCH criteria required body access.
 	raw []byte
+	// head is the message's cached header block, used for header sort keys so
+	// the blob is not opened per message.
+	head []byte
 	// keys are pre-extracted RFC 5256 sort keys.
 	keys sortKeys
 }
@@ -93,7 +96,7 @@ func (s *session) sortMessages(criteria []imapserver.SortCriterion, search *imap
 			return nil, err
 		}
 		if ok {
-			matched = append(matched, sortItem{seq: seq, uid: msg.UID, msg: msg, raw: raw})
+			matched = append(matched, sortItem{seq: seq, uid: msg.UID, msg: msg, raw: raw, head: msg.Head})
 		}
 	}
 
@@ -101,7 +104,13 @@ func (s *session) sortMessages(criteria []imapserver.SortCriterion, search *imap
 	for i := range matched {
 		hdr := matched[i].raw
 		if hdr == nil {
-			hdr = s.readMessageHeader(ctx, matched[i].uid)
+			// The listing carries the header block the store cached on
+			// delivery (see EmailFieldHeader); only messages whose header was
+			// past the cache cap still need the blob.
+			hdr = matched[i].head
+			if hdr == nil {
+				hdr = s.readMessageHeader(ctx, matched[i].uid)
+			}
 		}
 		matched[i].keys = extractSortKeys(hdr)
 	}
