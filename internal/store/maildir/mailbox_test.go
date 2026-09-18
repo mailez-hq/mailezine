@@ -189,9 +189,19 @@ func TestReindexWhenUIDListMissing(t *testing.T) {
 	if len(msgs) != 2 {
 		t.Fatalf("after reindex: %d messages, want 2", len(msgs))
 	}
-	// UIDs reassigned deterministically (sorted filenames).
-	if msgs[0].UID != 1 || msgs[1].UID != 2 {
-		t.Fatalf("reindexed uids: %d,%d", msgs[0].UID, msgs[1].UID)
+	// A lost uidlist must not renumber messages a client may already hold by
+	// UID: the sidecar carries UIDNext across the rebuild, so the reindex
+	// keeps handing out fresh, ascending UIDs.
+	if msgs[0].UID >= msgs[1].UID {
+		t.Fatalf("reindexed uids not ascending: %d,%d", msgs[0].UID, msgs[1].UID)
+	}
+	first := []uint32{msgs[0].UID, msgs[1].UID}
+	again, err := inbox.Messages()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(again) != 2 || again[0].UID != first[0] || again[1].UID != first[1] {
+		t.Fatalf("uids changed on a second read: %v -> %d,%d", first, again[0].UID, again[1].UID)
 	}
 	if _, err := os.Stat(filepath.Join(inbox.dir, "dovecot-uidlist")); err != nil {
 		t.Fatalf("uidlist not rewritten: %v", err)

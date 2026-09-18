@@ -57,13 +57,13 @@ func TestSearchHeaderReadsNoBlobs(t *testing.T) {
 		{"from", &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "From", Value: "bob@"}}}, []uint32{2}},
 	}
 	for _, tc := range cases {
-		before := cs.opened
+		before := int(cs.opened.Load())
 		data, err := cached.UIDSearch(tc.criteria, nil).Wait()
 		if err != nil {
 			t.Fatalf("%s: %v", tc.name, err)
 		}
-		if cs.opened != before {
-			t.Fatalf("%s: header search opened %d blob(s), want 0", tc.name, cs.opened-before)
+		if int(cs.opened.Load()) != before {
+			t.Fatalf("%s: header search opened %d blob(s), want 0", tc.name, int(cs.opened.Load())-before)
 		}
 		if !sameUIDs(allUIDs(data), tc.want) {
 			t.Fatalf("%s: uids = %v, want %v", tc.name, allUIDs(data), tc.want)
@@ -78,12 +78,12 @@ func TestSearchHeaderReadsNoBlobs(t *testing.T) {
 	}
 
 	// TEXT still needs the message body, and only matches the body.
-	before := cs.opened
+	before := int(cs.opened.Load())
 	data, err := cached.UIDSearch(&imap.SearchCriteria{Text: []string{"zebra"}}, nil).Wait()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cs.opened == before {
+	if int(cs.opened.Load()) == before {
 		t.Fatal("a TEXT search must read the message bodies")
 	}
 	if !sameUIDs(allUIDs(data), []uint32{1, 2}) {
@@ -94,12 +94,12 @@ func TestSearchHeaderReadsNoBlobs(t *testing.T) {
 	// subject or sender word) is conclusive without reading that message's
 	// body. Only message 2 — whose header does not carry the word — has to be
 	// read to rule it out, so exactly one blob is opened instead of three.
-	before = cs.opened
+	before = int(cs.opened.Load())
 	data, err = cached.UIDSearch(&imap.SearchCriteria{Text: []string{"quarterly"}}, nil).Wait()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := cs.opened - before; got != 1 {
+	if got := int(cs.opened.Load()) - before; got != 1 {
 		t.Fatalf("a header-hit TEXT search opened %d blob(s), want 1 (only the message whose header lacks the word)", got)
 	}
 	if !sameUIDs(allUIDs(data), []uint32{1, 3}) {

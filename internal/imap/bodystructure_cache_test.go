@@ -81,13 +81,13 @@ func TestStoredBodyStructureMatchesTheWalk(t *testing.T) {
 	}
 	set := imap.SeqSet{imap.SeqRange{Start: 1, Stop: uint32(len(order))}}
 
-	before := cs.opened
+	before := int(cs.opened.Load())
 	fromStore, err := cached.Fetch(set, opts).Collect()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cs.opened != before {
-		t.Fatalf("body structure from the store opened %d blob(s), want 0", cs.opened-before)
+	if int(cs.opened.Load()) != before {
+		t.Fatalf("body structure from the store opened %d blob(s), want 0", int(cs.opened.Load())-before)
 	}
 	fromWalk, err := walked.Fetch(set, opts).Collect()
 	if err != nil {

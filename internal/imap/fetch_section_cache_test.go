@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/emersion/go-imap/v2"
@@ -15,11 +16,13 @@ import (
 // observed from outside: a cache hit must not open the message again.
 type countingStore struct {
 	mailstore.MailboxStore
-	opened int
+	// opened is hit from every prefetch goroutine a search or fetch spawns,
+	// so the counter has to be atomic even though it only exists for tests.
+	opened atomic.Int64
 }
 
 func (c *countingStore) OpenMessage(ctx context.Context, account, mailbox string, uid uint32) (io.ReadCloser, error) {
-	c.opened++
+	c.opened.Add(1)
 	return c.MailboxStore.OpenMessage(ctx, account, mailbox, uid)
 }
 
@@ -58,13 +61,13 @@ func TestFetchServesBodySectionsFromMemo(t *testing.T) {
 	}
 
 	header1, preview1 := listShaped()
-	afterFirst := cs.opened
+	afterFirst := int(cs.opened.Load())
 	if afterFirst == 0 {
 		t.Fatal("first fetch must read the message blob")
 	}
 	header2, preview2 := listShaped()
-	if cs.opened != afterFirst {
-		t.Fatalf("second fetch reopened the blob: %d -> %d opens", afterFirst, cs.opened)
+	if int(cs.opened.Load()) != afterFirst {
+		t.Fatalf("second fetch reopened the blob: %d -> %d opens", afterFirst, int(cs.opened.Load()))
 	}
 	if string(header1) != string(header2) {
 		t.Fatalf("header bytes differ across fetches:\n%q\n%q", header1, header2)

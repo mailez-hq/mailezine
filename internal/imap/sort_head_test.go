@@ -70,10 +70,10 @@ func TestSortReadsNoBlobs(t *testing.T) {
 		{"reverse subject", imapclient.SortCriterion{Key: imapclient.SortKeySubject, Reverse: true}, []uint32{2, 3, 1}},
 	}
 	for _, tc := range cases {
-		before := cs.opened
+		before := int(cs.opened.Load())
 		got := sortBy(cached, tc.key)
-		if cs.opened != before {
-			t.Fatalf("%s: sort opened %d blob(s), want 0", tc.name, cs.opened-before)
+		if int(cs.opened.Load()) != before {
+			t.Fatalf("%s: sort opened %d blob(s), want 0", tc.name, int(cs.opened.Load())-before)
 		}
 		if len(got) != len(tc.want) {
 			t.Fatalf("%s: seqs = %v, want %v", tc.name, got, tc.want)

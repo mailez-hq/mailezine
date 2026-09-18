@@ -37,7 +37,7 @@ func TestFetchReusesRawBufferForLaterSections(t *testing.T) {
 	if len(rows) != 1 {
 		t.Fatalf("row fetch returned %d messages", len(rows))
 	}
-	opens := cs.opened
+	opens := int(cs.opened.Load())
 	if opens == 0 {
 		t.Fatal("the row fetch must read the message once (body structure needs it)")
 	}
@@ -51,8 +51,8 @@ func TestFetchReusesRawBufferForLaterSections(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cs.opened != opens {
-		t.Fatalf("the preview fetch re-read the blob: %d extra open(s)", cs.opened-opens)
+	if int(cs.opened.Load()) != opens {
+		t.Fatalf("the preview fetch re-read the blob: %d extra open(s)", int(cs.opened.Load())-opens)
 	}
 	if len(preview) != 1 || !strings.Contains(string(preview[0].BodySection[0].Bytes), "hello preview body") {
 		t.Fatalf("preview fetch returned %d messages: %+v", len(preview), preview)
@@ -92,10 +92,10 @@ func TestFetchEnvelopeUsesCachedHeaderBlock(t *testing.T) {
 		}
 		return msgs
 	}
-	before := cs.opened
+	before := int(cs.opened.Load())
 	msgs := fetch()
-	if cs.opened != before {
-		t.Fatalf("envelope fetch opened %d message blob(s), want 0", cs.opened-before)
+	if int(cs.opened.Load()) != before {
+		t.Fatalf("envelope fetch opened %d message blob(s), want 0", int(cs.opened.Load())-before)
 	}
 	if len(msgs) != 1 || msgs[0].Envelope == nil {
 		t.Fatalf("envelope = %+v", msgs)
