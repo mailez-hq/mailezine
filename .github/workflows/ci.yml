@@ -48,7 +48,8 @@ jobs:
           cache: true
       - name: Start rspamd
         run: |
-          docker run -d --name rspamd -p 11333:11333 rspamd/rspamd:stable
+          # Upstream dropped the :stable tag; pin a major.minor that exists.
+          docker run -d --name rspamd -p 11333:11333 rspamd/rspamd:4.1
           # First startup compiles hyperscan patterns; poll until /checkv2 answers.
           for i in $(seq 1 120); do
             if curl -sf -m 3 -X POST http://127.0.0.1:11333/checkv2 \
