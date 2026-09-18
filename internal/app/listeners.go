@@ -28,6 +28,10 @@ func serveSMTP(ctx context.Context, srv *gosmtp.Server, addr string, maxConn int
 	if proxy {
 		lim = server.NewProxyListener(lim, logger, proxyTrusted)
 	}
+	// go-smtp answers an out-of-order command with 502; RFC 5321 asks for
+	// 503. Wrap before the TLS layer (an encrypted stream is passed through
+	// untouched, so this covers the plaintext and pre-STARTTLS replies).
+	lim = server.NewBadSequenceListener(lim)
 	if tlsConf != nil {
 		lim = tls.NewListener(lim, tlsConf)
 	}
