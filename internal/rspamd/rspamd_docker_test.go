@@ -3,10 +3,10 @@
 // Real-container e2e for the rspamd /checkv2 client. Run with a live rspamd:
 //
 //	docker run -d -p 11333:11333 ... # rspamd listening on 11333
-//	go test -tags docker ./internal/spam -run TestRealRspamdCheckV2 -v
+//	go test -tags docker ./internal/rspamd -run TestRealRspamdCheckV2 -v
 //
 // The URL comes from RSPAMD_TEST_URL (default http://127.0.0.1:11333/checkv2).
-package spam
+package rspamd
 
 import (
 	"context"
