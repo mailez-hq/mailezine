@@ -29,9 +29,9 @@ func TestPostmasterAddress(t *testing.T) {
 
 func TestComposeDelayDSNPostmasterDomain(t *testing.T) {
 	msg := &Message{
-		From:        "admin@mailez.cn",
-		Recipients:  []Recipient{{Address: "someone@126.com", Status: RecipientPending}},
-		CreatedAt:   time.Now().Add(-35 * time.Minute),
+		From:       "admin@mailez.cn",
+		Recipients: []Recipient{{Address: "someone@126.com", Status: RecipientPending}},
+		CreatedAt:  time.Now().Add(-35 * time.Minute),
 	}
 	raw, err := ComposeDelayDSN("admin@mailez.cn", msg, 35*time.Minute, "mail.mailez.cn")
 	if err != nil {

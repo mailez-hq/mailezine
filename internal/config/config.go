@@ -115,8 +115,8 @@ type ListenersConfig struct {
 
 // StorageConfig selects the storage backend (ARCHITECTURE.md §3).
 type StorageConfig struct {
-	Backend   string // pebble|tidb
-	KVPath string
+	Backend string // pebble|tidb
+	KVPath  string
 	// DSN is the TiDB/MySQL connection string used when Backend is "tidb".
 	DSN string
 	// S3 (MinIO/cloud) blob settings. Empty Endpoint ⇒ local FS blob

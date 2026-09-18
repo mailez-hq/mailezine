@@ -50,7 +50,7 @@ func (s *bkStorage) config() (config.StorageConfig, error) {
 		}
 		return config.StorageConfig{
 			Backend:     "pebble",
-			KVPath:   s.path,
+			KVPath:      s.path,
 			S3Endpoint:  s.s3Endpoint,
 			S3AccessKey: s.s3AccessKey,
 			S3SecretKey: s.s3SecretKey,

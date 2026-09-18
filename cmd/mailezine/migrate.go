@@ -83,7 +83,7 @@ type s3Flags struct {
 func (f s3Flags) storageConfig(backend, path string) config.StorageConfig {
 	return config.StorageConfig{
 		Backend:     backend,
-		KVPath:   path,
+		KVPath:      path,
 		S3Endpoint:  f.endpoint,
 		S3AccessKey: f.accessKey,
 		S3SecretKey: f.secretKey,
