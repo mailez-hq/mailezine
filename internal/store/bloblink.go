@@ -128,6 +128,25 @@ func (s *Store) DeleteBlobGCClaim(_ context.Context, blobID string) error {
 	return s.kv.Delete(MetaBlobGCKey(blobID))
 }
 
+// claimStillDue re-reads a blob's GC claim before the physical delete. The mark
+// scan is a point-in-time snapshot: a delivery that re-linked the content since
+// then dropped the claim in its own commit, and an unlink-then-relink re-queues
+// it with a fresh timestamp. A missing or re-timed claim means this pass must
+// not touch the file.
+func (s *Store) claimStillDue(blobID string, grace time.Duration, now time.Time) (bool, error) {
+	v, err := s.kv.Get(MetaBlobGCKey(blobID))
+	if errors.Is(err, ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if len(v) != 8 {
+		return false, nil // malformed claim: never reclaim on garbage
+	}
+	return now.Sub(time.Unix(int64(binary.BigEndian.Uint64(v)), 0)) >= grace, nil
+}
+
 // SweepBlobs runs one mark-and-sweep pass over blob storage. A claimed blob
 // is physically reclaimed only when (a) its claim is older than grace —
 // deliveries re-linking the same content drop the claim in their commit, so
@@ -181,6 +200,14 @@ func (s *Store) SweepBlobs(ctx context.Context, grace time.Duration, now time.Ti
 		}
 		if now.Sub(time.Unix(c.queued, 0)) < grace {
 			continue // still inside the grace window
+		}
+		// Re-check the live claim: the snapshot above can be seconds stale.
+		due, err := s.claimStillDue(c.blobID, grace, now)
+		if err != nil {
+			return reclaimed, err
+		}
+		if !due {
+			continue
 		}
 		if err := reclaim(ctx, c.blobID); err != nil {
 			if errors.Is(err, ErrNotFound) {

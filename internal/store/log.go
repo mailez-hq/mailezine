@@ -83,6 +83,11 @@ func (s *Store) ChangesSince(_ context.Context, accountID AccountID, collection 
 	start := ChangeLogKey(uint32(accountID), collection, after+1)
 	var out []Change
 	err := s.kv.ScanRange(start, PrefixEnd(prefix), func(k, v []byte) error {
+		if len(v) < 10 {
+			// Torn or foreign row: unreadable, and not worth failing the
+			// poller over.
+			return nil
+		}
 		out = append(out, Change{
 			ChangeID:   ChangeIDFromLogKey(k),
 			Collection: v[0],

@@ -303,7 +303,10 @@ func (k *KV) DeleteAccount(ctx context.Context, account string) error {
 	if err := collect(indexPrefix); err != nil {
 		return err
 	}
-	if err := collect(store.CounterKey(aid, 0, nil)); err != nil {
+	if err := collect(store.CounterKey(aid, store.CounterKindNextDoc, nil)); err != nil {
+		return err
+	}
+	if err := collect(store.CounterKey(aid, store.CounterKindChange, nil)); err != nil {
 		return err
 	}
 	if err := collect(store.QuotaKey(aid)); err != nil {
@@ -1014,6 +1017,10 @@ func (k *KV) mailboxEmails(ctx context.Context, acctID store.AccountID, mbID uin
 	if len(docIDs) == 0 {
 		return nil, nil
 	}
+	// The index scan yields UID order, which ListMessages promises and IMAP
+	// sequence numbers resolve against; sorting docIDs below only bounds the
+	// fetch spans.
+	indexOrder := append([]uint64(nil), docIDs...)
 	sort.Slice(docIDs, func(i, j int) bool { return docIDs[i] < docIDs[j] })
 
 	byID := make(map[uint64]*Email, len(docIDs))
@@ -1042,8 +1049,8 @@ func (k *KV) mailboxEmails(ctx context.Context, acctID store.AccountID, mbID uin
 		i = j + 1
 	}
 
-	out := make([]*Email, 0, len(docIDs))
-	for _, id := range docIDs {
+	out := make([]*Email, 0, len(indexOrder))
+	for _, id := range indexOrder {
 		if e, ok := byID[id]; ok {
 			out = append(out, e)
 		}

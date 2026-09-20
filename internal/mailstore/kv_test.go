@@ -3,6 +3,7 @@ package mailstore
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"sync"
@@ -36,8 +37,23 @@ func TestKVDeleteAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	aid, err := s.AccountByEmail(ctx, "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := ms.DeleteAccount(ctx, "alice@example.com"); err != nil {
 		t.Fatal(err)
+	}
+	// Both counter kinds must go with the account, or they stay orphaned
+	// under the dead account ID.
+	for _, kind := range []byte{store.CounterKindNextDoc, store.CounterKindChange} {
+		err := s.ScanRaw(ctx, store.CounterKey(uint32(aid), kind, nil), func(k, _ []byte) error {
+			return fmt.Errorf("counter row survived purge: %q", k)
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := s.AccountByEmail(ctx, "alice@example.com"); !errors.Is(err, store.ErrNotFound) {
 		t.Fatalf("email registry row survived purge: %v", err)
@@ -67,6 +83,45 @@ func TestKVDeleteAccount(t *testing.T) {
 	}
 	if len(msgs) != 1 {
 		t.Fatalf("re-created account inherited data: %d messages", len(msgs))
+	}
+}
+
+func TestKVListMessagesUIDOrder(t *testing.T) {
+	ms, _ := newTestKV(t)
+	ctx := context.Background()
+	body := "From: s@remote.test\r\nTo: alice@example.com\r\nSubject: hi\r\n\r\nhello\r\n"
+
+	// The Work copy has the older document ID but the newer UID: the point
+	// where docID order and UID order disagree.
+	if _, err := ms.Deliver(ctx, "alice@example.com", "Work", &Message{From: "w@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "i@remote.test", Data: []byte(body)}); err != nil {
+		t.Fatal(err)
+	}
+	moved, err := ms.Move(ctx, "alice@example.com", "Work", "INBOX", []uint32{1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newUID, ok := moved[1]
+	if !ok {
+		t.Fatalf("move result missing uid mapping: %v", moved)
+	}
+
+	msgs, err := ms.ListMessages(ctx, "alice@example.com", "INBOX")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("messages = %d, want 2", len(msgs))
+	}
+	for i := 1; i < len(msgs); i++ {
+		if msgs[i].UID <= msgs[i-1].UID {
+			t.Fatalf("listing not in UID order: %v (move map %v)", []uint32{msgs[0].UID, msgs[1].UID}, moved)
+		}
+	}
+	if msgs[1].UID != newUID {
+		t.Fatalf("last uid = %d, want moved uid %d", msgs[1].UID, newUID)
 	}
 }
 
@@ -263,6 +318,75 @@ func TestBlobGCSharedAcrossAccounts(t *testing.T) {
 	}
 	if _, err := ms.OpenMessage(ctx, "bob@example.com", "INBOX", 1); err != nil {
 		t.Fatalf("bob cannot read his message: %v", err)
+	}
+}
+
+// TestBlobGCSweepReverifiesClaim covers a claim that disappears after the
+// sweep's mark scan: the sweep re-reads the live claim before deleting, so a
+// blob it no longer claims must survive.
+func TestBlobGCSweepReverifiesClaim(t *testing.T) {
+	ms, s := newTestKV(t)
+	ctx := context.Background()
+
+	bodies := []string{
+		"From: s@remote.test\r\nSubject: keep\r\n\r\nunique-A\r\n",
+		"From: s@remote.test\r\nSubject: drop\r\n\r\nunique-B\r\n",
+	}
+	for _, body := range bodies {
+		if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &Message{From: "s@remote.test", Data: []byte(body)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e1, err := ms.EmailByUID(ctx, "alice@example.com", "INBOX", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e2, err := ms.EmailByUID(ctx, "alice@example.com", "INBOX", 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 1, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ms.SetFlags(ctx, "alice@example.com", "INBOX", 2, []string{"\\Deleted"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ms.Expunge(ctx, "alice@example.com", "INBOX", []uint32{1, 2}); err != nil {
+		t.Fatal(err)
+	}
+	// e2's blob is claimed first, so its reclaim runs first.
+	var older [8]byte
+	binary.BigEndian.PutUint64(older[:], uint64(time.Now().Add(-time.Hour).Unix()))
+	if err := s.PutRaw(ctx, store.MetaBlobGCKey(e2.BlobID), older[:]); err != nil {
+		t.Fatal(err)
+	}
+
+	reclaimed := []string{}
+	n, err := s.SweepBlobs(ctx, 0, time.Now(), func(ctx context.Context, blobID string) error {
+		if blobID == e2.BlobID {
+			// A re-link commit for the other blob, after the mark scan.
+			if err := s.DeleteBlobGCClaim(ctx, e1.BlobID); err != nil {
+				return err
+			}
+		}
+		if err := s.DeleteBlob(ctx, blobID); err != nil {
+			return err
+		}
+		reclaimed = append(reclaimed, blobID)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 || len(reclaimed) != 1 || reclaimed[0] != e2.BlobID {
+		t.Fatalf("sweep reclaimed %v (n=%d), want only %s", reclaimed, n, e2.BlobID)
+	}
+	var buf bytes.Buffer
+	if err := s.GetBlob(ctx, e1.BlobID, &buf); err != nil {
+		t.Fatalf("re-linked blob was deleted despite claim re-check: %v", err)
+	}
+	if err := s.GetBlob(ctx, e2.BlobID, &buf); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("first-queued blob survived sweep: %v", err)
 	}
 }
 

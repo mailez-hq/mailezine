@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"mailezine/internal/mailcache"
-	"mailezine/internal/store"
 )
 
 // Cached is a MailboxStore + SieveStore decorator with metadata caching.
@@ -172,7 +171,9 @@ func (c *Cached) ListMessages(ctx context.Context, account, mailbox string) ([]*
 	if err != nil {
 		return nil, err
 	}
-	c.cache.Put(key, msgs, messagesWeight(msgs))
+	// Memo a private copy: a non-PEEK FETCH sets \Seen on the messages it
+	// receives, and shared pointers would leak that into every later reader.
+	c.cache.Put(key, cloneMessages(msgs), messagesWeight(msgs))
 	return msgs, nil
 }
 
@@ -188,8 +189,10 @@ func (c *Cached) MessageByUID(ctx context.Context, account, mailbox string, uid 
 				return &msg, nil
 			}
 		}
-		return nil, store.ErrNotFound
 	}
+	// A memo lacking the UID is not proof of absence: it may predate a write
+	// that bypassed this decorator (delivery, another process). Ask the
+	// backend.
 	return c.inner.MessageByUID(ctx, account, mailbox, uid)
 }
 

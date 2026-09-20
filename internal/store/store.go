@@ -582,16 +582,18 @@ func (s *Store) DeleteEmailAtomically(
 			}
 		}
 
-		// Quota (used bytes - size).
+		// Quota (used bytes - size), clamped at zero: a counter that drifted
+		// after a crash must not make the message impossible to expunge.
 		if size != 0 {
 			cur, err := quotaValue(t.Get, quotaKey)
 			if err != nil {
 				return err
 			}
-			if cur-size < 0 {
-				return errors.New("store: quota underflow on delete")
+			nv := cur - size
+			if nv < 0 {
+				nv = 0
 			}
-			t.Append(Op{Key: quotaKey, Value: beUint64(uint64(cur - size))})
+			t.Append(Op{Key: quotaKey, Value: beUint64(uint64(nv))})
 		}
 
 		// Change log (allocate the next change ID in the same commit).
