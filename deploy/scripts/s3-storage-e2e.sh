@@ -5,7 +5,8 @@
 # the object store, restart the engine and re-read it (persistence across
 # restart via S3).
 #
-# Usage: bash deploy/scripts/s3-storage-e2e.sh [rustfs|minio]   # default rustfs
+# Usage: MAILEZINE_E2E_DOCKERFILE=<dockerfile> \
+#          bash deploy/scripts/s3-storage-e2e.sh [rustfs|minio]   # default rustfs
 set -euo pipefail
 
 export MSYS_NO_PATHCONV=1 MSYS2_ARG_CONV_EXCL="*"
@@ -32,8 +33,8 @@ STORE_VOL=mailezine-s3-data
 KV_VOL=mailezine-s3-kv
 ROOT_USER=mailezine
 ROOT_PASS=mailezine-e2e-pass
-# Host ports are overridable so concurrent stacks (customer demos, the ee
-# compose) do not collide with this script.
+# Host ports are overridable so concurrent stacks (customer demos, other
+# compose deployments) do not collide with this script.
 STORE_PORT="${S3E2E_STORE_PORT:-19000}"
 SMTP_PORT="${S3E2E_SMTP_PORT:-11025}"
 SUBMIT_PORT="${S3E2E_SUBMIT_PORT:-11587}"
@@ -49,8 +50,13 @@ trap 'rm -rf "$devdata"; docker rm -f "$ENGINE" "$STOREC" >/dev/null 2>&1 || tru
 cp internal/directory/testdata/dev-directory.json "$devdata/"
 cp internal/auth/testdata/dev-passwords.json "$devdata/"
 
-echo "== building image (ee tag: S3 blob lives in internal/ee/storeee)"
-docker build -f Dockerfile.ee -t "$IMAGE" . >/dev/null
+echo "== building image"
+if [ -z "${MAILEZINE_E2E_DOCKERFILE:-}" ]; then
+  echo "MAILEZINE_E2E_DOCKERFILE must point at a Dockerfile whose build" \
+       "compiles in the S3 blob store (plain CE builds ignore MAILEZINE_S3_*)." >&2
+  exit 1
+fi
+docker build -f "$MAILEZINE_E2E_DOCKERFILE" -t "$IMAGE" . >/dev/null
 
 docker rm -f "$ENGINE" "$STOREC" >/dev/null 2>&1 || true
 docker volume rm "$STORE_VOL" "$KV_VOL" >/dev/null 2>&1 || true

@@ -138,7 +138,8 @@ dev compose（mailezine + backend + redis + rspamd + unbound；blob 需要时
   收发 + 重启持久化）。
 - S3 兼容 blob（D29，默认 RustFS，MinIO 亦可）：`storage-smoke --s3-*` 用
   S3 客户端 ListObjects 断言 `email-*` 消息对象真实落桶；
-  `s3-storage-e2e.sh [rustfs|minio]`（独立对象存储 + Pebble KV，EE 镜像）
+  `s3-storage-e2e.sh [rustfs|minio]`（独立对象存储 + Pebble KV；需经
+  `MAILEZINE_E2E_DOCKERFILE` 指定带 S3 blob 的构建，维护者用 `make -f ee.mk s3-e2e`）
   实测：SMTP 提交 → 落桶 → IMAP/POP3 读信 → 重启 → 经对象存储恢复；
   `cmd/s3-probe`（20 项协议契约体检，含 HA 租约条件写）覆盖 RustFS/MinIO
   行为一致性。`minio-storage-e2e.sh` 保留为转发到 minio 档的历史入口。
