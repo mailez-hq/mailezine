@@ -66,6 +66,12 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 		}
 	}
 
+	// Check the state before the literal is negotiated, or a pre-auth APPEND
+	// earns a continuation and drains its payload first.
+	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
+		return err
+	}
+
 	lit, nonSync, err := dec.ExpectLiteralReader()
 	if err != nil {
 		return err
@@ -77,6 +83,9 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 	}
 
 	if lit.Size() > appendLimit {
+		// The client's pipelined bytes are still on the wire; answer NO and
+		// drop the connection rather than parse them as commands.
+		c.state = imap.ConnStateLogout
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTooBig,
@@ -89,12 +98,6 @@ func (c *Conn) handleAppend(tag string, dec *imapwire.Decoder) error {
 
 	c.setReadTimeout(literalReadTimeout)
 	defer c.setReadTimeout(cmdReadTimeout)
-
-	if err := c.checkState(imap.ConnStateAuthenticated); err != nil {
-		io.Copy(io.Discard, lit)
-		dec.CRLF()
-		return err
-	}
 
 	// EXAMINE write guard: appending into the currently examined mailbox is
 	// rejected. The literal is drained first so the wire stays in sync

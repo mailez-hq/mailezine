@@ -1,7 +1,9 @@
 package imap
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"sync/atomic"
@@ -77,5 +79,50 @@ func TestFetchServesBodySectionsFromMemo(t *testing.T) {
 	}
 	if want := "X-Marker: 42\r\n"; !strings.Contains(string(header2), want) {
 		t.Fatalf("header section missing %q: %q", want, header2)
+	}
+}
+
+// TestFetchBatchesPrefetchUnderBudget covers a FETCH whose messages overflow
+// one prefetch budget: every message still returns in order, byte-identical,
+// and each blob is opened once.
+func TestFetchBatchesPrefetchUnderBudget(t *testing.T) {
+	mem := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
+	ms := mailstore.NewKV(mem)
+	cs := &countingStore{MailboxStore: ms}
+	ctx := context.Background()
+
+	chunk := strings.Repeat("x", prefetchBudget/2+1024) // two per batch at most
+	bodies := make([][]byte, 3)
+	for i := range bodies {
+		bodies[i] = []byte(fmt.Sprintf("From: a@example.com\r\nSubject: big-%d\r\n\r\n%s", i, chunk))
+		if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &mailstore.Message{From: "a@example.com", Data: bodies[i]}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	c := startTestServerWith(t, cs)
+	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := c.Fetch(imap.UIDSetNum(1, 2, 3), &imap.FetchOptions{
+		UID:         true,
+		BodySection: []*imap.FetchItemBodySection{{Peek: true}},
+	}).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != len(bodies) {
+		t.Fatalf("batched fetch returned %d messages, want %d", len(msgs), len(bodies))
+	}
+	for i, m := range msgs {
+		if uint32(m.UID) != uint32(i+1) {
+			t.Fatalf("message %d out of order: UID %d", i, m.UID)
+		}
+		if len(m.BodySection) != 1 || !bytes.Equal(m.BodySection[0].Bytes, bodies[i]) {
+			t.Fatalf("message %d body corrupted across batches", i)
+		}
+	}
+	if got := cs.opened.Load(); got != int64(len(bodies)) {
+		t.Fatalf("prefetch opened %d blobs, want %d (one per message)", got, len(bodies))
 	}
 }

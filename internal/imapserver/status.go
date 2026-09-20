@@ -81,7 +81,13 @@ func (c *Conn) writeStatus(data *imap.StatusData, options *imap.StatusOptions) e
 		}
 	}
 	if options.DeletedStorage {
-		listEnc.Item().Atom("DELETED-STORAGE").SP().Number64(*data.DeletedStorage)
+		// DELETED-STORAGE is never tracked, so the value is absent: report
+		// NIL instead of dereferencing nil.
+		if data.DeletedStorage != nil {
+			listEnc.Item().Atom("DELETED-STORAGE").SP().Number64(*data.DeletedStorage)
+		} else {
+			listEnc.Item().Atom("DELETED-STORAGE").SP().NIL()
+		}
 	}
 	if options.NumRecent {
 		listEnc.Item().Atom("RECENT").SP().Number(*data.NumRecent)

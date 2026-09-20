@@ -458,6 +458,9 @@ func (c *Conn) handleUnsubscribe(dec *imapwire.Decoder) error {
 
 func (c *Conn) checkBufferedLiteral(size int64, nonSync bool) error {
 	if size > 4096 {
+		// Pipelined payload is still on the wire after a rejected literal;
+		// answer NO and drop the connection (RFC 7888 §4).
+		c.state = imap.ConnStateLogout
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeTooBig,
@@ -470,6 +473,7 @@ func (c *Conn) checkBufferedLiteral(size int64, nonSync bool) error {
 
 func (c *Conn) acceptLiteral(size int64, nonSync bool) error {
 	if nonSync && size > 4096 && !c.server.options.caps().Has(imap.CapLiteralPlus) {
+		c.state = imap.ConnStateLogout
 		return &imap.Error{
 			Type: imap.StatusResponseTypeBad,
 			Text: "Non-synchronizing literals are limited to 4096 bytes",

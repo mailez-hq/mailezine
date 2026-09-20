@@ -32,6 +32,10 @@ const maxCachedSectionBytes = 64 << 10
 // crowd out the messages a page actually revisits.
 const maxCachedRawBytes = 256 << 10
 
+// prefetchBudget caps the raw message buffers one FETCH prefetch batch holds
+// at once; see the batched prefetch in Fetch.
+const prefetchBudget = 8 << 20
+
 // rawKey identifies one message's buffer (immutable, like the sections).
 func rawKey(envKey string) string { return "raw\x00" + envKey }
 
@@ -178,14 +182,15 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 			(options.BodyStructure != nil && it.bs == nil && it.bsRaw == "")
 		items = append(items, it)
 	}
-	// Bounded parallel blob prefetch. Buffers are read-only once loaded, so
-	// the sequential processing loop can consume them without extra locks.
-	{
-		const prefetchWorkers = 8
+	// Bounded parallel blob prefetch, batched under a byte budget so a whole-
+	// mailbox FETCH cannot stage every message in RAM at once. Each buffer is
+	// released once its message is written; loaded buffers are read-only.
+	const prefetchWorkers = 8
+	prefetch := func(chunk []fetchItem) {
 		var wg sync.WaitGroup
 		sem := make(chan struct{}, prefetchWorkers)
-		for idx := range items {
-			if !items[idx].needBuf {
+		for idx := range chunk {
+			if !chunk[idx].needBuf {
 				continue
 			}
 			wg.Add(1)
@@ -208,126 +213,147 @@ func (s *session) Fetch(w *imapserver.FetchWriter, numSet imap.NumSet, options *
 				if err == nil && len(buf) > 0 && len(buf) <= maxCachedRawBytes {
 					s.srv.raw.Put(rawKey(it.envKey), buf, int64(len(buf)))
 				}
-			}(&items[idx])
+			}(&chunk[idx])
 		}
 		wg.Wait()
 	}
-	for _, it := range items {
-		seq := it.seq
-		msg := it.msg
-		if it.needBuf && it.err != nil {
-			// The message vanished between the snapshot and this fetch
-			// (concurrent expunge, or a dangling index entry): RFC 3501
-			// §6.4.8 — omit it from the response instead of failing the
-			// whole command and locking the client out of the mailbox.
-			if errors.Is(it.err, mailstore.ErrNotFound) {
-				continue
-			}
-			return it.err
-		}
-		envKey := it.envKey
-		bsKey := it.bsKey
-		var env *imap.Envelope = it.env
-		var envRaw string = it.envRaw
-		var bs imap.BodyStructure = it.bs
-		buf := it.buf
-		if markSeen && !mailstore.HasFlag(msg.Flags, "\\Seen") {
-			flags := append([]string(nil), msg.Flags...)
-			flags = append(flags, "\\Seen")
-			if err := s.srv.Store.SetFlags(ctx, s.user, s.mbox, msg.UID, flags); err != nil {
-				if errors.Is(err, mailstore.ErrNotFound) {
+	process := func(chunk []fetchItem) error {
+		for ci := range chunk {
+			it := &chunk[ci]
+			seq := it.seq
+			msg := it.msg
+			if it.needBuf && it.err != nil {
+				// The message vanished between the snapshot and this fetch
+				// (concurrent expunge). Omit it, as RFC 3501 §6.4.8 allows,
+				// instead of failing the whole command.
+				if errors.Is(it.err, mailstore.ErrNotFound) {
 					continue
 				}
-				return err
+				return it.err
 			}
-			msg.Flags = flags
-			changed = true
-		}
-
-		rw := w.CreateMessage(seq)
-		rw.WriteUID(imap.UID(msg.UID))
-		if options.ModSeq {
-			rw.WriteModSeq(msg.ModSeq)
-		}
-		if options.Flags {
-			rw.WriteFlags(imapFlags(msg.Flags))
-		}
-		if options.InternalDate {
-			rw.WriteInternalDate(msg.InternalDate)
-		}
-		if options.RFC822Size {
-			rw.WriteRFC822Size(msg.Size)
-		}
-		if options.Envelope {
-			if envRaw == "" {
-				if env == nil {
-					src := buf
-					if len(it.msg.Head) > 0 {
-						src = it.msg.Head
+			envKey := it.envKey
+			bsKey := it.bsKey
+			var env *imap.Envelope = it.env
+			var envRaw string = it.envRaw
+			var bs imap.BodyStructure = it.bs
+			buf := it.buf
+			if markSeen && !mailstore.HasFlag(msg.Flags, "\\Seen") {
+				flags := append([]string(nil), msg.Flags...)
+				flags = append(flags, "\\Seen")
+				if err := s.srv.Store.SetFlags(ctx, s.user, s.mbox, msg.UID, flags); err != nil {
+					if errors.Is(err, mailstore.ErrNotFound) {
+						continue
 					}
-					env = envelopeOf(src)
+					return err
 				}
-				// A message whose Date header is missing or unparseable
-				// yields the zero time, which clients render literally as
-				// year 1 (the webmail list showed "1年1月1日"). Fall back to
-				// INTERNALDATE — the arrival time every other client shows
-				// for such mail — so ENVELOPE never carries a bogus date.
-				if env.Date.IsZero() && !msg.InternalDate.IsZero() {
-					env.Date = msg.InternalDate
+				msg.Flags = flags
+				changed = true
+			}
+
+			rw := w.CreateMessage(seq)
+			rw.WriteUID(imap.UID(msg.UID))
+			if options.ModSeq {
+				rw.WriteModSeq(msg.ModSeq)
+			}
+			if options.Flags {
+				rw.WriteFlags(imapFlags(msg.Flags))
+			}
+			if options.InternalDate {
+				rw.WriteInternalDate(msg.InternalDate)
+			}
+			if options.RFC822Size {
+				rw.WriteRFC822Size(msg.Size)
+			}
+			if options.Envelope {
+				if envRaw == "" {
+					if env == nil {
+						src := buf
+						if len(it.msg.Head) > 0 {
+							src = it.msg.Head
+						}
+						env = envelopeOf(src)
+					}
+					// A missing or unparseable Date header yields the zero
+					// time, which clients render as year 1. Use INTERNALDATE,
+					// as other clients do for such mail.
+					if env.Date.IsZero() && !msg.InternalDate.IsZero() {
+						env.Date = msg.InternalDate
+					}
+					envRaw = imapserver.EncodeEnvelope(env)
+					s.srv.cache.Put(envKey, envRaw, int64(len(envRaw)))
 				}
-				envRaw = imapserver.EncodeEnvelope(env)
-				s.srv.cache.Put(envKey, envRaw, int64(len(envRaw)))
+				rw.WriteEnvelopeRaw(envRaw)
 			}
-			rw.WriteEnvelopeRaw(envRaw)
-		}
-		if options.BodyStructure != nil {
-			switch {
-			case bs != nil:
-				rw.WriteBodyStructure(bs)
-			case it.bsRaw != "":
-				rw.WriteBodyStructureRaw(it.bsRaw, true)
-			default:
-				bs = imapserver.ExtractBodyStructure(bytes.NewReader(buf))
-				s.srv.cache.Put(bsKey, bs, 2048)
-				rw.WriteBodyStructure(bs)
-			}
-		}
-		for i, bs := range options.BodySection {
-			section := it.secBuf[i]
-			if !it.secHit[i] {
-				section = imapserver.ExtractBodySection(bytes.NewReader(buf), bs)
-				if n := len(section); n > 0 && int64(n) <= maxCachedSectionBytes {
-					s.srv.cache.Put(sectionKey(it.envKey, bs), section, int64(n))
+			if options.BodyStructure != nil {
+				switch {
+				case bs != nil:
+					rw.WriteBodyStructure(bs)
+				case it.bsRaw != "":
+					rw.WriteBodyStructureRaw(it.bsRaw, true)
+				default:
+					bs = imapserver.ExtractBodyStructure(bytes.NewReader(buf))
+					s.srv.cache.Put(bsKey, bs, 2048)
+					rw.WriteBodyStructure(bs)
 				}
 			}
-			wc := rw.WriteBodySection(bs, int64(len(section)))
-			if _, err := wc.Write(section); err != nil {
-				_ = rw.Close()
+			for i, bs := range options.BodySection {
+				section := it.secBuf[i]
+				if !it.secHit[i] {
+					section = imapserver.ExtractBodySection(bytes.NewReader(buf), bs)
+					if n := len(section); n > 0 && int64(n) <= maxCachedSectionBytes {
+						s.srv.cache.Put(sectionKey(it.envKey, bs), section, int64(n))
+					}
+				}
+				wc := rw.WriteBodySection(bs, int64(len(section)))
+				if _, err := wc.Write(section); err != nil {
+					_ = rw.Close()
+					return err
+				}
+				if err := wc.Close(); err != nil {
+					_ = rw.Close()
+					return err
+				}
+			}
+			for _, bs := range options.BinarySection {
+				section := imapserver.ExtractBinarySection(bytes.NewReader(buf), bs)
+				wc := rw.WriteBinarySection(bs, int64(len(section)))
+				if _, err := wc.Write(section); err != nil {
+					_ = rw.Close()
+					return err
+				}
+				if err := wc.Close(); err != nil {
+					_ = rw.Close()
+					return err
+				}
+			}
+			for _, bss := range options.BinarySectionSize {
+				rw.WriteBinarySectionSize(bss, imapserver.ExtractBinarySectionSize(bytes.NewReader(buf), bss))
+			}
+			if err := rw.Close(); err != nil {
 				return err
 			}
-			if err := wc.Close(); err != nil {
-				_ = rw.Close()
-				return err
-			}
+			it.buf = nil // the batch budget is only held until the message is out
 		}
-		for _, bs := range options.BinarySection {
-			section := imapserver.ExtractBinarySection(bytes.NewReader(buf), bs)
-			wc := rw.WriteBinarySection(bs, int64(len(section)))
-			if _, err := wc.Write(section); err != nil {
-				_ = rw.Close()
-				return err
+		return nil
+	}
+	for start := 0; start < len(items); {
+		end, loaded := start, int64(0)
+		for end < len(items) {
+			var sz int64
+			if items[end].needBuf {
+				sz = items[end].msg.Size
 			}
-			if err := wc.Close(); err != nil {
-				_ = rw.Close()
-				return err
+			if end > start && loaded+sz > prefetchBudget {
+				break
 			}
+			loaded += sz
+			end++
 		}
-		for _, bss := range options.BinarySectionSize {
-			rw.WriteBinarySectionSize(bss, imapserver.ExtractBinarySectionSize(bytes.NewReader(buf), bss))
-		}
-		if err := rw.Close(); err != nil {
+		prefetch(items[start:end])
+		if err := process(items[start:end]); err != nil {
 			return err
 		}
+		start = end
 	}
 	if changed {
 		return s.refreshSnapshot(ctx)

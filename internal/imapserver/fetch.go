@@ -776,7 +776,10 @@ func writeBodyType1part(enc *imapwire.Encoder, bs *imap.BodyStructureSinglePart,
 
 func writeBodyTypeMpart(enc *imapwire.Encoder, bs *imap.BodyStructureMultiPart, extended bool) {
 	if len(bs.Children) == 0 {
-		panic("imapserver: imap.BodyStructureMultiPart must have at least one child")
+		// A multipart with no parts comes from mail with a missing or broken
+		// boundary. Degrade to a single empty text part: a panic here would
+		// take down every connection that touches the message.
+		writeBodyStructure(enc, &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain"}, extended)
 	}
 	for _, child := range bs.Children {
 		// ABNF for body-type-mpart doesn't have SP between body entries, and

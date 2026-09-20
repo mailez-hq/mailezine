@@ -1,4 +1,8 @@
 // Package imapserver implements an IMAP server.
+//
+// Vendored fork of github.com/emersion/go-imap/v2/imapserver. README.md has
+// the upstream anchor and local deviations; scripts/vendor-diff.sh reconciles
+// upstream fixes.
 package imapserver
 
 import (
