@@ -143,6 +143,74 @@ func TestPOP3StartTLS(t *testing.T) {
 	}
 }
 
+// TestPOP3StartTLSDiscardsPipelinedPlaintext covers bytes pipelined after
+// "STLS": they belong to the plaintext reader, so they must never run as
+// session commands and the session stays unauthenticated.
+func TestPOP3StartTLSDiscardsPipelinedPlaintext(t *testing.T) {
+	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
+	ms := mailstore.NewKV(s)
+	seedMailbox(t, ms)
+	dir := directory.NewDev(directory.DevData{
+		Users: map[string]directory.User{
+			"alice@example.com": {Email: "alice@example.com", Enabled: true},
+		},
+		Domains: []string{"example.com"},
+	})
+	srv := &Server{
+		Store:     ms,
+		Auth:      auth.NewDev(map[string]string{"alice@example.com": "s3cret"}),
+		Directory: dir,
+		TLSConfig: pop3SelfSigned(t),
+		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() { _ = srv.ServeConn(context.Background(), conn) }()
+		}
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	r := bufio.NewReader(conn)
+	if _, err := r.ReadString('\n'); err != nil {
+		t.Fatal(err)
+	}
+	// Pipeline the smuggled credentials in the same flight as STLS.
+	fmt.Fprintf(conn, "STLS\r\nUSER eve\r\nPASS stolen\r\n")
+	line, _ := r.ReadString('\n')
+	if !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("STLS: %q", line)
+	}
+	tlsConn := tls.Client(conn, &tls.Config{InsecureSkipVerify: true})
+	if err := tlsConn.Handshake(); err != nil {
+		t.Fatal(err)
+	}
+	tr := bufio.NewReader(tlsConn)
+	// Still pre-auth: the pipelined USER/PASS went with the plaintext reader.
+	fmt.Fprintf(tlsConn, "USER alice@example.com\r\n")
+	line, _ = tr.ReadString('\n')
+	if !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("USER after upgrade: %q", line)
+	}
+	fmt.Fprintf(tlsConn, "PASS s3cret\r\n")
+	line, _ = tr.ReadString('\n')
+	if !strings.HasPrefix(line, "+OK") {
+		t.Fatalf("PASS after upgrade: %q", line)
+	}
+}
+
 func TestPOP3AuthRequiresSTLSWhenConfigured(t *testing.T) {
 	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
 	dir := directory.NewDev(directory.DevData{

@@ -157,6 +157,22 @@ func TestDueIndexStaysExact(t *testing.T) {
 		t.Fatalf("deferred due entry at %d, want NextAttempt %d", retryAt, deferred.NextAttempt.Unix())
 	}
 
+	// Retry re-opens the still-deferred message and refuses the terminal one,
+	// whose body blob is already gone.
+	if err := m.Retry(ctx, id2); err != nil {
+		t.Fatal(err)
+	}
+	entries = dueEntries(t, kv)
+	if len(entries) != 1 || entries[id2] != clock.now.Unix() {
+		t.Fatalf("after retry: due entries = %v, want single entry for %d at now", entries, id2)
+	}
+	if err := m.Retry(ctx, id1); err == nil {
+		t.Fatalf("retry of delivered message %d: want refusal", id1)
+	}
+	if entries := dueEntries(t, kv); len(entries) != 1 || entries[id2] != clock.now.Unix() {
+		t.Fatalf("refused terminal retry mutated the due index: %v", entries)
+	}
+
 	// Round 2 after backoff: the deferred message delivers and its entry
 	// disappears; nothing resurrects the terminal one.
 	clock.Advance(2 * time.Hour)
@@ -168,14 +184,7 @@ func TestDueIndexStaysExact(t *testing.T) {
 		t.Fatalf("due index after full delivery = %v, want empty", entries)
 	}
 
-	// Retry re-opens a terminal message with exactly one entry at now.
-	if err := m.Retry(ctx, id1); err != nil {
-		t.Fatal(err)
-	}
-	entries = dueEntries(t, kv)
-	if len(entries) != 1 || entries[id1] != clock.now.Unix() {
-		t.Fatalf("after retry: due entries = %v, want single entry for %d at now", entries, id1)
-	}
+	// Cancel removes the terminal row; the due index stays exact (empty).
 	if err := m.Cancel(ctx, id1); err != nil {
 		t.Fatal(err)
 	}

@@ -91,8 +91,14 @@ func newSubmit(dir directory.Service, pipeline *delivery.Pipeline, qm *queue.Man
 			if err != nil {
 				return err
 			}
-			if _, err := qm.Submit(ctx, relayFrom, relay, subj, body); err != nil {
-				return err
+			// Submit reads the buffer synchronously; a file-backed buffer
+			// holds a descriptor that must not outlive the call.
+			_, serr := qm.Submit(ctx, relayFrom, relay, subj, body)
+			if cerr := body.Close(); serr == nil {
+				serr = cerr
+			}
+			if serr != nil {
+				return serr
 			}
 			logger.Info("queued outbound", "from", relayFrom, "to", relay, "bytes", clean.Len())
 		}

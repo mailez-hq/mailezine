@@ -396,6 +396,11 @@ func (m *Manager) Retry(ctx context.Context, id uint64) error {
 		if cur.State == StateActive {
 			return fmt.Errorf("queue: message %d is being delivered; retry after it completes", id)
 		}
+		if isTerminal(cur.State) {
+			// The body is gone after a terminal state: re-queuing would
+			// bounce mail the remote already accepted.
+			return fmt.Errorf("queue: message %d already %s; retry would not resend", id, cur.State)
+		}
 		oldDue := duePos(cur)
 		cur.State = StateQueued
 		cur.Attempts = 0

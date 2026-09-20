@@ -77,9 +77,9 @@ func (s *session) run(ctx context.Context) error {
 		return err
 	}
 	for {
-		line, err := s.r.ReadString('\n')
+		line, err := s.readLine()
 		if err != nil {
-			return nil // EOF or deadline: no QUIT means nothing is committed
+			return nil // EOF, deadline or over-long line: no QUIT means nothing is committed
 		}
 		cmd := strings.TrimRight(line, "\r\n")
 		if cmd == "" {
