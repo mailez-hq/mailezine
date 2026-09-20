@@ -116,7 +116,7 @@ type KV interface {
     Close() error
 }
 
-// Blob 是不可变字节对象存储。MinIO(S3)、本地 FS 实现。
+// Blob 是不可变字节对象存储。S3 兼容对象存储（RustFS 默认，MinIO 亦可）、本地 FS 实现。
 type Blob interface {
     Put(ctx context.Context, id string, r io.Reader) (int64, error)
     Get(ctx context.Context, id string, w io.Writer) error
@@ -357,7 +357,7 @@ flush 队列元数据、关闭存储（RocksDB flush + close；maildir 释放文
            mailezine（数据面，最小权限）
                 │
                 ▼
-        rspamd / macro-scanner / unbound / MinIO（按需最小暴露）
+        rspamd / macro-scanner / unbound / RustFS（按需最小暴露）
 ```
 
 ### 8.2 输入与解析安全
@@ -411,7 +411,7 @@ flush 队列元数据、关闭存储（RocksDB flush + close；maildir 释放文
 ### 10.1 配置模型
 
 - 类型化 struct + 校验（必填、范围、枚举），来源：环境变量（compose 注入）+
-  可选 TOML 覆写；敏感项（密钥、MinIO 凭据）只从环境/secret 文件读取，绝不落配置。
+  可选 TOML 覆写；敏感项（密钥、对象存储凭据）只从环境/secret 文件读取，绝不落配置。
 - 启动即校验 + 展示"将监听哪些端口/启用哪些功能"的启动摘要；配置错误拒绝启动
   并给出可操作错误信息。
 

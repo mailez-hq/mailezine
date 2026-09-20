@@ -61,9 +61,9 @@ func main() {
 	fmt.Println("[PASS] pop3 read")
 	if *s3Endpoint != "" {
 		if err := s3Check(*s3Endpoint, *s3Access, *s3Secret, *s3Bucket); err != nil {
-			fatal("minio blob check", err)
+			fatal("s3 blob check", err)
 		}
-		fmt.Println("[PASS] minio blob present")
+		fmt.Println("[PASS] s3 blob present")
 	}
 }
 

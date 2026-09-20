@@ -20,7 +20,8 @@
 
 ## 层三：backend REST 全链路（webmail 替身）
 
-dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
+dev compose（mailezine + backend + redis + rspamd + unbound；blob 需要时
+经 `MAILEZINE_S3_ENDPOINT` 挂 RustFS/MinIO），
 `MAILEZ_MAIL_ENGINE=mailezine`，然后：
 
 1. `go run ./cmd/seed` 建管理员
@@ -135,6 +136,9 @@ dev compose（mailezine + backend + redis + rspamd + unbound [+ minio]），
   send/check 两模式）；`storage-backend-e2e.sh`（Pebble：发收 + 重启持久化
   实测通过）；`tidb-dev.ps1` / `tidb-storage-e2e.ps1`（TiDB KV 契约 +
   收发 + 重启持久化）。
-- MinIO blob（D29）：`storage-smoke --s3-*` 用 minio-go ListObjects 断言
-  `email-*` 消息对象真实落桶；`minio-storage-e2e.sh`（独立 MinIO + Pebble
-  KV）实测：SMTP 提交 → 落桶 → IMAP/POP3 读信 → 重启 → 经 MinIO 恢复。
+- S3 兼容 blob（D29，默认 RustFS，MinIO 亦可）：`storage-smoke --s3-*` 用
+  S3 客户端 ListObjects 断言 `email-*` 消息对象真实落桶；
+  `s3-storage-e2e.sh [rustfs|minio]`（独立对象存储 + Pebble KV，EE 镜像）
+  实测：SMTP 提交 → 落桶 → IMAP/POP3 读信 → 重启 → 经对象存储恢复；
+  `cmd/s3-probe`（20 项协议契约体检，含 HA 租约条件写）覆盖 RustFS/MinIO
+  行为一致性。`minio-storage-e2e.sh` 保留为转发到 minio 档的历史入口。
