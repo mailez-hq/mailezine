@@ -17,6 +17,11 @@ Diff local changes with `scripts/vendor-diff.sh imapserver`.
   paths changed.
 - `message.go`: upstream struct literals rewritten to keyed form so
   `go vet` passes under this module's vet settings.
+- `append.go`, `conn.go` (literal framing): APPEND checks the session state
+  before literal negotiation, and any rejected literal announcement
+  (over-size, non-sync without LITERAL+) tears the connection down after the
+  tagged response — pipelined payload bytes must never be parsed as the next
+  command. See `internal/imap/append_framing_test.go`.
 
 Do not pull in upstream changes blindly: review against the extension hook
 when upgrading.

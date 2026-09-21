@@ -27,7 +27,8 @@ type rawIMAP struct {
 	tag int
 }
 
-func dialRawTestServer(t *testing.T) *rawIMAP {
+// startRawTestServer stops after the server greeting: no LOGIN, no SELECT.
+func startRawTestServer(t *testing.T) *rawIMAP {
 	t.Helper()
 	s := store.New(store.NewMemoryKV(), store.NewMemoryBlob())
 	ms := mailstore.NewKV(s)
@@ -58,6 +59,11 @@ func dialRawTestServer(t *testing.T) *rawIMAP {
 	t.Cleanup(func() { _ = conn.Close() })
 	r := &rawIMAP{t: t, c: conn, br: bufio.NewReader(conn)}
 	r.readLine() // server greeting
+	return r
+}
+
+func dialRawTestServer(t *testing.T) *rawIMAP {
+	r := startRawTestServer(t)
 	if resp := r.cmd("LOGIN alice@example.com s3cret"); !strings.HasPrefix(resp, "t1 OK") {
 		t.Fatalf("login failed: %s", resp)
 	}
@@ -70,12 +76,21 @@ func dialRawTestServer(t *testing.T) *rawIMAP {
 // readLine returns one untagged/continuation line.
 func (r *rawIMAP) readLine() string {
 	r.t.Helper()
-	_ = r.c.SetReadDeadline(time.Now().Add(10 * time.Second))
-	line, err := r.br.ReadString('\n')
+	line, err := r.readLineErr()
 	if err != nil {
 		r.t.Fatalf("read: %v", err)
 	}
-	return strings.TrimRight(line, "\r\n")
+	return line
+}
+
+// readLineErr returns the read error instead of failing; for EOF-expected reads.
+func (r *rawIMAP) readLineErr() (string, error) {
+	_ = r.c.SetReadDeadline(time.Now().Add(10 * time.Second))
+	line, err := r.br.ReadString('\n')
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimRight(line, "\r\n"), nil
 }
 
 // cmd sends a command and returns the tagged completion line.
