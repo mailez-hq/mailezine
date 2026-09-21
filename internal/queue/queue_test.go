@@ -3,6 +3,7 @@ package queue
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"io"
 	"log/slog"
@@ -556,4 +557,73 @@ func TestBlobReadFailureDefers(t *testing.T) {
 	}
 	_ = kv
 	_ = id
+}
+
+// Terminal rows past TerminalRetention are pruned; a live deferred row
+// survives the same sweep.
+func TestPruneTerminalRows(t *testing.T) {
+	clock := &fakeClock{now: time.Now()}
+	d := &fakeDeliverer{results: map[string]Result{
+		"done@example.com":  {To: "done@example.com", OK: true},
+		"stuck@example.com": {To: "stuck@example.com", Err: errors.New("451 temp")},
+	}}
+	m, kv, blob := newTestManager(d, DefaultOptions(), clock)
+	ctx := context.Background()
+
+	doneID, err := m.Submit(ctx, "s@example.com", []string{"done@example.com"}, "done", strings.NewReader("d"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Submit(ctx, "s@example.com", []string{"stuck@example.com"}, "stuck", strings.NewReader("s")); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	msgs, _ := m.List(ctx)
+	var doneBlob, stuckBlob string
+	for _, msg := range msgs {
+		switch msg.State {
+		case StateDelivered:
+			doneBlob = msg.BlobID
+		case StateDeferred:
+			stuckBlob = msg.BlobID
+		}
+	}
+	if doneBlob == "" || stuckBlob == "" {
+		t.Fatalf("expected one delivered and one deferred message: %+v", msgs)
+	}
+
+	retention := DefaultOptions().TerminalRetention
+	if retention <= 0 {
+		t.Fatalf("default TerminalRetention = %v", retention)
+	}
+	clock.Advance(retention + time.Minute)
+	if err := m.pruneTerminal(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	msgs, _ = m.List(ctx)
+	if len(msgs) != 1 || msgs[0].State != StateDeferred {
+		t.Fatalf("deferred row must survive prune, delivered row must go: %+v", msgs)
+	}
+	if err := blob.Get(ctx, doneBlob, io.Discard); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("delivered blob not pruned: %v", err)
+	}
+	if err := blob.Get(ctx, stuckBlob, io.Discard); err != nil {
+		t.Fatalf("deferred blob must survive prune: %v", err)
+	}
+	kv.Scan(store.QueueDuePrefix(), func(k, _ []byte) error {
+		if binary.BigEndian.Uint64(k[len(k)-8:]) == doneID {
+			t.Errorf("delivered message still indexed as due: %q", k)
+		}
+		return nil
+	})
+	// Pruning must not resurrect anything.
+	if err := m.ProcessDue(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if msgs, _ = m.List(ctx); len(msgs) != 1 {
+		t.Fatalf("process due after prune changed the queue: %+v", msgs)
+	}
 }

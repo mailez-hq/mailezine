@@ -104,6 +104,10 @@ type Options struct {
 	// under a live worker turns into an at-least-once duplicate. Default
 	// 10m.
 	ClaimLease time.Duration
+	// TerminalRetention is how long terminal rows and their blobs are kept
+	// before a background prune deletes them; 0 means the 7-day default,
+	// negative disables.
+	TerminalRetention time.Duration
 	// Now overrides time.Now for deterministic tests.
 	Now func() time.Time
 }
@@ -111,13 +115,14 @@ type Options struct {
 // DefaultOptions returns production defaults (conservative retry envelope).
 func DefaultOptions() Options {
 	return Options{
-		MaxAttempts:  10,
-		BaseRetry:    time.Minute,
-		MaxRetry:     24 * time.Hour,
-		PollInterval: 5 * time.Second,
-		Workers:      16,
-		DelayWarning: 5 * time.Minute,
-		ClaimLease:   10 * time.Minute,
+		MaxAttempts:       10,
+		BaseRetry:         time.Minute,
+		MaxRetry:          24 * time.Hour,
+		PollInterval:      5 * time.Second,
+		Workers:           16,
+		DelayWarning:      5 * time.Minute,
+		ClaimLease:        10 * time.Minute,
+		TerminalRetention: 7 * 24 * time.Hour,
 	}
 }
 
@@ -191,6 +196,9 @@ func New(kv store.KV, blob store.Blob, deliver Deliverer, opts Options, logger *
 	}
 	if opts.ClaimLease <= 0 {
 		opts.ClaimLease = DefaultOptions().ClaimLease
+	}
+	if opts.TerminalRetention == 0 {
+		opts.TerminalRetention = DefaultOptions().TerminalRetention
 	}
 	if opts.Now == nil {
 		opts.Now = time.Now
@@ -340,6 +348,8 @@ func (m *Manager) ProcessDue(ctx context.Context) error {
 func (m *Manager) Run(ctx context.Context) error {
 	ticker := time.NewTicker(m.opts.PollInterval)
 	defer ticker.Stop()
+	prune := time.NewTicker(pruneInterval)
+	defer prune.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -355,8 +365,77 @@ func (m *Manager) Run(ctx context.Context) error {
 			if err := m.ProcessDue(ctx); err != nil {
 				m.logger.Error("queue: process due", "err", err)
 			}
+		case <-prune.C:
+			if err := m.pruneTerminal(ctx); err != nil {
+				m.logger.Error("queue: prune terminal rows", "err", err)
+			}
 		}
 	}
+}
+
+// pruneInterval is how often Run sweeps expired terminal rows.
+const pruneInterval = time.Hour
+
+// pruneTerminal deletes terminal rows older than TerminalRetention together
+// with their blobs. Each delete re-checks the state inside the transaction,
+// so a row rescheduled since the scan (Retry) survives.
+func (m *Manager) pruneTerminal(ctx context.Context) error {
+	if m.opts.TerminalRetention <= 0 {
+		return nil
+	}
+	cutoff := m.opts.Now().Add(-m.opts.TerminalRetention)
+
+	var doomed []uint64
+	err := m.kv.Scan(store.QueueMetaPrefix(queueName), func(_ []byte, v []byte) error {
+		var msg Message
+		if err := json.Unmarshal(v, &msg); err != nil {
+			m.logger.Warn("queue: prune skipping unreadable row", "err", err)
+			return nil
+		}
+		if isTerminal(msg.State) && !msg.UpdatedAt.After(cutoff) {
+			doomed = append(doomed, msg.ID)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	for _, id := range doomed {
+		var blobID string
+		err := m.txn.WithTxn(ctx, func(t store.TxnOps) error {
+			v, err := t.Get(store.QueueKey(queueName, id))
+			if err != nil {
+				return err
+			}
+			var cur Message
+			if err := json.Unmarshal(v, &cur); err != nil {
+				return err
+			}
+			if !isTerminal(cur.State) || cur.UpdatedAt.After(cutoff) {
+				// Rescheduled since the scan; leave it alone.
+				return nil
+			}
+			blobID = cur.BlobID
+			t.Delete(store.QueueKey(queueName, id))
+			t.Append(store.Op{Key: store.QueueDueKey(duePos(cur).Unix(), id), Delete: true})
+			if !cur.LeaseUntil.IsZero() {
+				t.Append(store.Op{Key: store.QueueDueKey(cur.LeaseUntil.Unix(), id), Delete: true})
+			}
+			return nil
+		})
+		if err != nil {
+			m.logger.Error("queue: prune delete row", "message", id, "err", err)
+			continue
+		}
+		if blobID == "" {
+			continue
+		}
+		if err := m.blob.Delete(ctx, blobID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			m.logger.Error("queue: prune delete blob", "message", id, "blob", blobID, "err", err)
+		}
+	}
+	return nil
 }
 
 // List returns all queued messages ordered by ID.
