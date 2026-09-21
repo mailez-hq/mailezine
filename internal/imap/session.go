@@ -22,6 +22,7 @@ import (
 // mailbox name ("" when none).
 type session struct {
 	srv  *Server
+	conn *imapserver.Conn
 	user string
 	mbox string
 	// readOnly records EXAMINE (vs SELECT): FETCH must not implicitly set
@@ -69,6 +70,7 @@ func (s *session) Close() error {
 	// Only authenticated sessions were counted on login.
 	if s.user != "" {
 		s.srv.Metrics.IMAPSessionClosed()
+		s.srv.untrack(s.conn, s.user)
 	}
 	return nil
 }
@@ -88,6 +90,7 @@ func (s *session) Login(username, password string) error {
 		return imapserver.ErrAuthFailed
 	}
 	s.user = username
+	s.srv.track(s.conn, username)
 	s.srv.Metrics.IMAPSessionOpened()
 	return nil
 }

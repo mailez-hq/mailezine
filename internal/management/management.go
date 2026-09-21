@@ -46,8 +46,13 @@ type AccountLister interface {
 	ListAccounts(ctx context.Context) ([]string, error)
 }
 
+// SessionKicker drops an account's live protocol sessions (imap.Server).
+type SessionKicker interface {
+	Disconnect(account string) int
+}
+
 // NewHandler builds the management API mux.
-func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accounts AccountLister, logger *slog.Logger) http.Handler {
+func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accounts AccountLister, sessions SessionKicker, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -184,14 +189,36 @@ func NewHandler(info Info, qm QueueManager, mstore mailstore.MailboxStore, accou
 	// data. The control plane calls this on user deletion: without it the
 	// engine keeps orphaned mailboxes, and a re-created same-address account
 	// would silently inherit the previous owner's mail.
+	//
+	// POST /v1/accounts/{email}/disconnect drops the account's live IMAP
+	// sessions, so a control-plane policy change reaches them.
 	mux.HandleFunc("/v1/accounts/", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodDelete {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		email, action, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/v1/accounts/"), "/")
+		if email == "" {
+			http.Error(w, "account email required", http.StatusBadRequest)
 			return
 		}
-		email := strings.TrimPrefix(r.URL.Path, "/v1/accounts/")
-		if email == "" || strings.Contains(email, "/") {
-			http.Error(w, "account email required", http.StatusBadRequest)
+		if action != "" && action != "disconnect" {
+			http.Error(w, "unsupported action", http.StatusNotFound)
+			return
+		}
+		if action == "disconnect" {
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+				return
+			}
+			if sessions == nil {
+				http.Error(w, "session disconnect unsupported", http.StatusNotImplemented)
+				return
+			}
+			dropped := sessions.Disconnect(email)
+			logger.Info("audit: management disconnect", "account", email, "sessions", dropped, "client", r.RemoteAddr)
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "account": email, "sessions": dropped})
+			return
+		}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
 		purger, ok := mstore.(mailstore.AccountPurger)

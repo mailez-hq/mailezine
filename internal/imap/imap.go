@@ -9,6 +9,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"github.com/emersion/go-imap/v2"
 
@@ -51,6 +52,10 @@ type Server struct {
 	// cache memoizes message-derived data (envelope, body structure) across
 	// sessions. nil disables caching.
 	cache *mailcache.Cache
+
+	// live maps account -> authenticated connections, for Disconnect.
+	mu   sync.Mutex
+	live map[string]map[*imapserver.Conn]struct{}
 	// raw memoizes whole message buffers, so the second read of a message
 	// within (or soon after) one page load does not hit the blob store again:
 	// the list path reads each row for its body structure and then reads the
@@ -92,8 +97,8 @@ func New(s *Server) *imapserver.Server {
 		caps[imap.CapQuota] = struct{}{}
 	}
 	return imapserver.New(&imapserver.Options{
-		NewSession: func(*imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
-			return &session{srv: s}, nil, nil
+		NewSession: func(c *imapserver.Conn) (imapserver.Session, *imapserver.GreetingData, error) {
+			return &session{srv: s, conn: c}, nil, nil
 		},
 		Caps:      caps,
 		TLSConfig: s.TLSConfig,
@@ -103,6 +108,44 @@ func New(s *Server) *imapserver.Server {
 		InsecureAuth: s.TLSConfig == nil,
 		Logger:       slogAdapter{s.Logger},
 	})
+}
+
+func (s *Server) track(c *imapserver.Conn, account string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.live == nil {
+		s.live = make(map[string]map[*imapserver.Conn]struct{})
+	}
+	conns := s.live[account]
+	if conns == nil {
+		conns = make(map[*imapserver.Conn]struct{})
+		s.live[account] = conns
+	}
+	conns[c] = struct{}{}
+}
+
+func (s *Server) untrack(c *imapserver.Conn, account string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if conns := s.live[account]; conns != nil {
+		delete(conns, c)
+		if len(conns) == 0 {
+			delete(s.live, account)
+		}
+	}
+}
+
+// Disconnect closes every authenticated connection of account and reports
+// how many were dropped.
+func (s *Server) Disconnect(account string) int {
+	s.mu.Lock()
+	conns := s.live[account]
+	delete(s.live, account)
+	s.mu.Unlock()
+	for c := range conns {
+		_ = c.NetConn().Close()
+	}
+	return len(conns)
 }
 
 // slogAdapter adapts slog to go-imap's Logger interface.

@@ -22,7 +22,7 @@ func testHandler() http.Handler {
 		AuthMode:      "dev",
 		StartedAt:     time.Now().Add(-30 * time.Second),
 	}
-	return WithSecret(NewHandler(info, nil, nil, nil, nil), "sekret")
+	return WithSecret(NewHandler(info, nil, nil, nil, nil, nil), "sekret")
 }
 
 func TestStatusRequiresSecret(t *testing.T) {
@@ -73,7 +73,7 @@ func TestQueueEndpoints(t *testing.T) {
 		messages: []queue.Message{
 			{ID: 1, From: "a@x.test", State: queue.StateDeferred, Attempts: 2, MaxAttempts: 5},
 		},
-	}, nil, nil, nil), "sekret")
+	}, nil, nil, nil, nil), "sekret")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -110,7 +110,7 @@ func TestQueueEndpoints(t *testing.T) {
 
 func TestQueueActions(t *testing.T) {
 	fq := &fakeQueue{}
-	h := WithSecret(NewHandler(Info{}, fq, nil, nil, nil), "sekret")
+	h := WithSecret(NewHandler(Info{}, fq, nil, nil, nil, nil), "sekret")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 
@@ -164,7 +164,7 @@ func TestAccountsEndpoint(t *testing.T) {
 	if _, err := ms.Deliver(ctx, "alice@example.com", "INBOX", &mailstore.Message{Data: []byte("m1\r\n")}); err != nil {
 		t.Fatal(err)
 	}
-	h := WithSecret(NewHandler(Info{}, nil, ms, s, nil), "sekret")
+	h := WithSecret(NewHandler(Info{}, nil, ms, s, nil, nil), "sekret")
 	srv := httptest.NewServer(h)
 	t.Cleanup(srv.Close)
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/accounts", nil)
@@ -187,5 +187,66 @@ func TestAccountsEndpoint(t *testing.T) {
 	}
 	if len(out) != 1 || out[0].Account != "alice@example.com" || out[0].Messages < 1 {
 		t.Fatalf("accounts body: %+v", out)
+	}
+}
+
+// fakeKicker records the accounts the control plane asked to disconnect.
+type fakeKicker struct{ kicked []string }
+
+func (f *fakeKicker) Disconnect(account string) int {
+	f.kicked = append(f.kicked, account)
+	return 2
+}
+
+func TestAccountsDisconnect(t *testing.T) {
+	k := &fakeKicker{}
+	h := WithSecret(NewHandler(Info{}, nil, nil, nil, k, nil), "sekret")
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+
+	post := func(path string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost, srv.URL+path, nil)
+		req.Header.Set("Authorization", "Bearer sekret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp
+	}
+
+	resp := post("/v1/accounts/alice%40example.com/disconnect")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("disconnect: %d", resp.StatusCode)
+	}
+	var out struct {
+		OK       bool   `json:"ok"`
+		Account  string `json:"account"`
+		Sessions int    `json:"sessions"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if !out.OK || out.Account != "alice@example.com" || out.Sessions != 2 {
+		t.Fatalf("disconnect body: %+v", out)
+	}
+	if len(k.kicked) != 1 || k.kicked[0] != "alice@example.com" {
+		t.Fatalf("kicker: %+v", k.kicked)
+	}
+
+	// Unknown actions and the wrong method stay rejected.
+	if resp := post("/v1/accounts/alice%40example.com/purge"); resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("unknown action: %d, want 404", resp.StatusCode)
+	}
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/v1/accounts/alice%40example.com/disconnect", nil)
+	req.Header.Set("Authorization", "Bearer sekret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("GET disconnect: %d, want 405", resp.StatusCode)
 	}
 }

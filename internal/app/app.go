@@ -120,6 +120,7 @@ type App struct {
 	smtpInbound    *gosmtp.Server
 	smtpSubmission *gosmtp.Server
 	imapSrv        *imapserver.Server
+	imapCore       *imap.Server
 	sieveSrv       *sieve.Server
 	pop3Srv        *pop3.Server
 	healthSrv      *http.Server
@@ -613,6 +614,7 @@ func (a *App) wireServers() error {
 		}
 	}
 	a.imapSrv = imap.New(imapCfg)
+	a.imapCore = imapCfg
 	a.sieveSrv = &sieve.Server{
 		Auth:      a.auth,
 		Directory: a.dir,
@@ -705,7 +707,7 @@ func (a *App) serveManagement(ctx context.Context) error {
 			AuthMode:      a.cfg.Auth.Mode,
 			Extra:         extraStatus(),
 			StartedAt:     a.startedAt,
-		}, a.qm, a.st.mailbox, a.st.facade, a.logger),
+		}, a.qm, a.st.mailbox, a.st.facade, a.imapCore, a.logger),
 		a.cfg.Management.Secret,
 	)
 	a.mgmtSrv = &http.Server{Addr: a.cfg.Management.Addr, Handler: handler}

@@ -1,19 +1,29 @@
 // Cached wraps a Service with a short-TTL memo of successful authentications.
 //
+// Only webmail session tokens (token-*) are memoised: the control plane
+// re-presents one on every pooled IMAP/SMTP dial, which is the round trip
+// this exists to absorb. Passwords and app tokens always reach the control
+// plane, so one protocol's success cannot authorize another and policy
+// changes apply at the next login.
+//
 // The key is derived from the credential pair (email + password hash), so a
 // cache hit only ever replays the exact credentials that already succeeded —
 // a wrong password can never ride a prior success. Failures are never
-// cached (brute-force protection). A 30s TTL bounds password-change
-// propagation.
+// cached (brute-force protection).
 package auth
 
 import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"strings"
 
 	"mailezine/internal/mailcache"
 )
+
+// sessionTokenPrefix is the control plane's webmail session credential
+// (Manager.CreateTempToken).
+const sessionTokenPrefix = "token-"
 
 // Cached is a Service decorator with positive-result caching.
 type Cached struct {
@@ -27,6 +37,9 @@ func NewCached(inner Service, cache *mailcache.Cache) *Cached {
 }
 
 func (c *Cached) Authenticate(ctx context.Context, email, password string, opts Options) (bool, error) {
+	if !strings.HasPrefix(password, sessionTokenPrefix) {
+		return c.inner.Authenticate(ctx, email, password, opts)
+	}
 	key := credentialKey(email, password)
 	if v, ok := c.cache.Get(key); ok && v.(bool) {
 		return true, nil
